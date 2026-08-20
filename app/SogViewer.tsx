@@ -363,10 +363,21 @@ export function SogViewer() {
         if (!gamepad) continue;
         const axes = gamepad.axes;
         if (source.handedness === XRHAND_LEFT) {
-          moveX = stickAxis(axes, "x");
-          moveY = stickAxis(axes, "y");
+          moveX += stickAxis(axes, "x");
+          moveY += stickAxis(axes, "y");
         } else if (source.handedness === XRHAND_RIGHT) {
-          rotateX = stickAxis(axes, "x");
+          const rightStickX = stickAxis(axes, "x");
+          const rightStickY = stickAxis(axes, "y");
+          // Holding Grip temporarily changes the right stick from smooth turn
+          // to gaze-relative locomotion. Left-stick locomotion stays enabled.
+          const gripPressed =
+            source.squeezing || gamepadButtonPressed(gamepad.buttons, 1);
+          if (gripPressed) {
+            moveX += rightStickX;
+            moveY += rightStickY;
+          } else {
+            rotateX = rightStickX;
+          }
           // PICO 4 / PICO 4 Ultra's xr-standard layout exposes A and B at
           // indices 4 and 5. Hold A to rise and B to descend.
           heightDirection =
@@ -490,6 +501,7 @@ export function SogViewer() {
         </button>
         <p className="control-hint">
           <span>左スティック</span> 移動&nbsp;&nbsp;·&nbsp;&nbsp;<span>右スティック</span> 旋回
+          &nbsp;&nbsp;·&nbsp;&nbsp;<span>Grip＋右スティック</span> 視線方向に移動
           &nbsp;&nbsp;·&nbsp;&nbsp;<span>A 上昇 / B 下降</span>
         </p>
       </div>
