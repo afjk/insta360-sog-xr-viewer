@@ -118,7 +118,7 @@ export function SogViewer() {
       sessionInit: { optionalFeatures: ["hand-tracking"] },
       controllers: {
         moveDirection: true,
-        moveSpeed: 0.9,
+        moveSpeed: 1.8,
         rotateSpeed: 2.6,
       },
       onReady: (supported) => {
@@ -126,7 +126,8 @@ export function SogViewer() {
       },
       onEnterXr: () => {
         setInXr(true);
-        rig.position.set(0, 0, 3.9);
+        // Start at the normalized scene center instead of outside the capture.
+        rig.position.set(0, 0, -1.7);
       },
       onExitXr: () => {
         setInXr(false);
