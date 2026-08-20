@@ -31,6 +31,8 @@ export function SogViewer() {
     let yaw = 0;
     let pitch = 0.08;
     let distance = 2.8;
+    let lastFrameTime = 0;
+    const pressedKeys = new Set<string>();
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x05070a);
@@ -75,6 +77,7 @@ export function SogViewer() {
     const captureCenter = CAPTURE_MIN.clone().add(CAPTURE_MAX).multiplyScalar(0.5);
     // Desktop starts inside the room too, instead of orbiting far outside it.
     const target = new THREE.Vector3(0, 1.35, -2.8);
+    const worldTarget = new THREE.Vector3();
     const updateDesktopCamera = () => {
       const cosPitch = Math.cos(pitch);
       camera.position.set(
@@ -82,7 +85,7 @@ export function SogViewer() {
         target.y + distance * Math.sin(pitch),
         target.z + distance * Math.cos(yaw) * cosPitch,
       );
-      camera.lookAt(target);
+      camera.lookAt(worldTarget.copy(target).add(rig.position));
     };
     updateDesktopCamera();
 
@@ -90,12 +93,12 @@ export function SogViewer() {
       .then(() => {
         if (disposed) return;
 
-        // Keep the capture at its real decoded scale. Center the dense room,
-        // and put its robust floor at y=0 so a local-floor XR origin starts
-        // the viewer inside the capture at natural eye height.
+        // Keep the capture at its real decoded scale and correct Insta360's
+        // inverted vertical axis. The corrected floor sits at y=0.
+        splat.scale.set(1, -1, 1);
         splat.position.set(
           -captureCenter.x,
-          -CAPTURE_MIN.y,
+          CAPTURE_MAX.y,
           -captureCenter.z,
         );
 
@@ -181,15 +184,62 @@ export function SogViewer() {
       distance = THREE.MathUtils.clamp(distance + event.deltaY * 0.01, 2.2, 48);
       updateDesktopCamera();
     };
+    const movementCodes = new Set([
+      "KeyW",
+      "KeyA",
+      "KeyS",
+      "KeyD",
+      "KeyE",
+      "KeyQ",
+      "ShiftLeft",
+      "ShiftRight",
+    ]);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (renderer.xr.isPresenting || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (!movementCodes.has(event.code)) return;
+      pressedKeys.add(event.code);
+      event.preventDefault();
+    };
+    const onKeyUp = (event: KeyboardEvent) => {
+      if (!movementCodes.has(event.code)) return;
+      pressedKeys.delete(event.code);
+      event.preventDefault();
+    };
+    const clearPressedKeys = () => pressedKeys.clear();
+    const updateDesktopMovement = (deltaSeconds: number) => {
+      const forwardAmount = Number(pressedKeys.has("KeyW")) - Number(pressedKeys.has("KeyS"));
+      const rightAmount = Number(pressedKeys.has("KeyD")) - Number(pressedKeys.has("KeyA"));
+      const upAmount = Number(pressedKeys.has("KeyE")) - Number(pressedKeys.has("KeyQ"));
+      if (forwardAmount === 0 && rightAmount === 0 && upAmount === 0) return;
+
+      const forward = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+      const right = new THREE.Vector3().crossVectors(forward, camera.up).normalize();
+      const movement = new THREE.Vector3()
+        .addScaledVector(forward, forwardAmount)
+        .addScaledVector(right, rightAmount)
+        .addScaledVector(camera.up, upAmount)
+        .normalize();
+      const isFast = pressedKeys.has("ShiftLeft") || pressedKeys.has("ShiftRight");
+      rig.position.addScaledVector(movement, (isFast ? 6 : 2.4) * deltaSeconds);
+      updateDesktopCamera();
+    };
 
     renderer.domElement.addEventListener("pointerdown", onPointerDown);
     renderer.domElement.addEventListener("pointermove", onPointerMove);
     renderer.domElement.addEventListener("pointerup", onPointerUp);
     renderer.domElement.addEventListener("pointercancel", onPointerUp);
     renderer.domElement.addEventListener("wheel", onWheel, { passive: false });
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", clearPressedKeys);
 
-    renderer.setAnimationLoop((_time, xrFrame) => {
+    renderer.setAnimationLoop((time, xrFrame) => {
       if (xrFrame) xr.updateControllers(camera);
+      else {
+        const deltaSeconds = lastFrameTime === 0 ? 0 : Math.min((time - lastFrameTime) / 1000, 0.05);
+        updateDesktopMovement(deltaSeconds);
+      }
+      lastFrameTime = time;
       renderer.render(scene, camera);
     });
 
@@ -202,6 +252,9 @@ export function SogViewer() {
       renderer.domElement.removeEventListener("pointerup", onPointerUp);
       renderer.domElement.removeEventListener("pointercancel", onPointerUp);
       renderer.domElement.removeEventListener("wheel", onWheel);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", clearPressedKeys);
       if (xr.session) void xr.session.end();
       splat.dispose();
       renderer.dispose();
@@ -273,7 +326,7 @@ export function SogViewer() {
       <footer className="footer-bar">
         <div>
           <span className="desktop-label">DESKTOP</span>
-          ドラッグで回転 · ホイールでズーム
+          WASD 移動 · E/Q 上下 · Shift 高速 · ドラッグで回転
         </div>
         <div className="secure-label">WEBXR · SECURE SESSION</div>
       </footer>
