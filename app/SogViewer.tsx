@@ -7,6 +7,10 @@ import { SparkRenderer, SparkXr, SplatMesh } from "@sparkjsdev/spark";
 type ViewerStatus = "loading" | "ready" | "error";
 
 const SPLAT_COUNT = 1_000_000;
+// Percentile bounds (2–98%) decoded from capture.sog. The raw bounding box
+// contains a few far-away splats that would shrink the actual room to ~6%.
+const CAPTURE_MIN = new THREE.Vector3(-6.911, -1.263, -3.762);
+const CAPTURE_MAX = new THREE.Vector3(6.178, 1.654, 3.802);
 
 export function SogViewer() {
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -26,7 +30,8 @@ export function SogViewer() {
     let lastY = 0;
     let yaw = 0;
     let pitch = 0.08;
-    let distance = 6.4;
+    let distance = 11;
+    let desktopDistanceIsManual = false;
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x05070a);
@@ -68,7 +73,16 @@ export function SogViewer() {
     });
     scene.add(splat);
 
-    const target = new THREE.Vector3(0, 1.45, -1.7);
+    const captureCenter = CAPTURE_MIN.clone().add(CAPTURE_MAX).multiplyScalar(0.5);
+    const captureSize = CAPTURE_MAX.clone().sub(CAPTURE_MIN);
+    const target = new THREE.Vector3(0, captureCenter.y - CAPTURE_MIN.y, 0);
+    const fitDesktopDistance = () => {
+      const verticalFov = THREE.MathUtils.degToRad(camera.fov);
+      const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * camera.aspect);
+      const fitHeight = captureSize.y / (2 * Math.tan(verticalFov / 2));
+      const fitWidth = captureSize.x / (2 * Math.tan(horizontalFov / 2));
+      return (Math.max(fitHeight, fitWidth) + captureSize.z / 2) * 1.08;
+    };
     const updateDesktopCamera = () => {
       const cosPitch = Math.cos(pitch);
       camera.position.set(
@@ -84,17 +98,13 @@ export function SogViewer() {
       .then(() => {
         if (disposed) return;
 
-        const bounds = splat.getBoundingBox();
-        const center = bounds.getCenter(new THREE.Vector3());
-        const size = bounds.getSize(new THREE.Vector3());
-        const longestSide = Math.max(size.x, size.y, size.z, 1);
-        const sceneScale = 5.2 / longestSide;
-
-        splat.scale.setScalar(sceneScale);
+        // Keep the capture at its real decoded scale. Center the dense room,
+        // and put its robust floor at y=0 so a local-floor XR origin starts
+        // the viewer inside the capture at natural eye height.
         splat.position.set(
-          -center.x * sceneScale,
-          1.45 - center.y * sceneScale,
-          -1.7 - center.z * sceneScale,
+          -captureCenter.x,
+          -CAPTURE_MIN.y,
+          -captureCenter.z,
         );
 
         setProgress(100);
@@ -126,8 +136,8 @@ export function SogViewer() {
       },
       onEnterXr: () => {
         setInXr(true);
-        // Start at the normalized scene center instead of outside the capture.
-        rig.position.set(0, 0, -1.7);
+        // The room is centered around the XR origin with its floor at y=0.
+        rig.position.set(0, 0, 0);
       },
       onExitXr: () => {
         setInXr(false);
@@ -141,6 +151,8 @@ export function SogViewer() {
       const height = Math.max(1, viewport.clientHeight);
       camera.aspect = width / height;
       camera.updateProjectionMatrix();
+      if (!desktopDistanceIsManual) distance = fitDesktopDistance();
+      updateDesktopCamera();
       renderer.setSize(width, height, false);
     };
     const resizeObserver = new ResizeObserver(resize);
@@ -175,7 +187,8 @@ export function SogViewer() {
     const onWheel = (event: WheelEvent) => {
       if (renderer.xr.isPresenting) return;
       event.preventDefault();
-      distance = THREE.MathUtils.clamp(distance + event.deltaY * 0.005, 2.2, 16);
+      desktopDistanceIsManual = true;
+      distance = THREE.MathUtils.clamp(distance + event.deltaY * 0.01, 2.2, 48);
       updateDesktopCamera();
     };
 
