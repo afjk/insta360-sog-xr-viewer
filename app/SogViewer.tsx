@@ -30,8 +30,7 @@ export function SogViewer() {
     let lastY = 0;
     let yaw = 0;
     let pitch = 0.08;
-    let distance = 11;
-    let desktopDistanceIsManual = false;
+    let distance = 2.8;
 
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0x05070a);
@@ -74,15 +73,8 @@ export function SogViewer() {
     scene.add(splat);
 
     const captureCenter = CAPTURE_MIN.clone().add(CAPTURE_MAX).multiplyScalar(0.5);
-    const captureSize = CAPTURE_MAX.clone().sub(CAPTURE_MIN);
-    const target = new THREE.Vector3(0, captureCenter.y - CAPTURE_MIN.y, 0);
-    const fitDesktopDistance = () => {
-      const verticalFov = THREE.MathUtils.degToRad(camera.fov);
-      const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * camera.aspect);
-      const fitHeight = captureSize.y / (2 * Math.tan(verticalFov / 2));
-      const fitWidth = captureSize.x / (2 * Math.tan(horizontalFov / 2));
-      return (Math.max(fitHeight, fitWidth) + captureSize.z / 2) * 1.08;
-    };
+    // Desktop starts inside the room too, instead of orbiting far outside it.
+    const target = new THREE.Vector3(0, 1.35, -2.8);
     const updateDesktopCamera = () => {
       const cosPitch = Math.cos(pitch);
       camera.position.set(
@@ -151,7 +143,6 @@ export function SogViewer() {
       const height = Math.max(1, viewport.clientHeight);
       camera.aspect = width / height;
       camera.updateProjectionMatrix();
-      if (!desktopDistanceIsManual) distance = fitDesktopDistance();
       updateDesktopCamera();
       renderer.setSize(width, height, false);
     };
@@ -187,7 +178,6 @@ export function SogViewer() {
     const onWheel = (event: WheelEvent) => {
       if (renderer.xr.isPresenting) return;
       event.preventDefault();
-      desktopDistanceIsManual = true;
       distance = THREE.MathUtils.clamp(distance + event.deltaY * 0.01, 2.2, 48);
       updateDesktopCamera();
     };
