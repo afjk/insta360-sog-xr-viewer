@@ -8,6 +8,7 @@ import {
   Color,
   Entity,
   FILLMODE_NONE,
+  GSplatComponent,
   GSPLAT_RENDERER_RASTER_CPU_SORT,
   RESOLUTION_AUTO,
   Vec3,
@@ -18,8 +19,10 @@ import {
 } from "playcanvas";
 
 type ViewerStatus = "loading" | "ready" | "error";
+type VrQuality = "smooth" | "high";
 
-const SPLAT_COUNT = 1_000_000;
+const HIGH_SPLAT_COUNT = 1_000_000;
+const SMOOTH_SPLAT_COUNT = 500_000;
 // Percentile bounds (2–98%) decoded from capture.sog. A handful of distant
 // outliers in the raw bounds are intentionally ignored when placing the room.
 const CAPTURE_MIN = new Vec3(-6.911, -1.263, -3.762);
@@ -38,12 +41,18 @@ const stickAxis = (axes: readonly number[], axis: "x" | "y") => {
 
 export function SogViewer() {
   const viewportRef = useRef<HTMLDivElement>(null);
-  const startVrRef = useRef<() => void>(() => undefined);
+  const chooseQualityRef = useRef<(quality: VrQuality) => void>(() => undefined);
+  const startPreparedVrRef = useRef<() => void>(() => undefined);
   const [status, setStatus] = useState<ViewerStatus>("loading");
   const [progress, setProgress] = useState(0);
   const [xrAvailable, setXrAvailable] = useState(false);
   const [inXr, setInXr] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+  const [qualityOpen, setQualityOpen] = useState(false);
+  const [activeQuality, setActiveQuality] = useState<VrQuality>("high");
+  const [preparingQuality, setPreparingQuality] = useState<VrQuality | null>(null);
+  const [preparedQuality, setPreparedQuality] = useState<VrQuality | null>(null);
+  const [qualityProgress, setQualityProgress] = useState(0);
 
   useEffect(() => {
     const viewport = viewportRef.current;
@@ -115,43 +124,92 @@ export function SogViewer() {
     );
     app.root.addChild(splatEntity);
 
-    const captureAsset = new Asset("Insta360 Spatial Capture", "gsplat", {
+    const captureAsset = new Asset("Insta360 Spatial Capture — High", "gsplat", {
       url: "/capture.sog",
       filename: "capture.sog",
       size: 16_241_776,
     });
+    const smoothAsset = new Asset("Insta360 Spatial Capture — Smooth", "gsplat", {
+      url: "/capture-vr.sog",
+      filename: "capture-vr.sog",
+      size: 6_188_721,
+    });
+    const prefersSmoothInitially = /Pico|PICO|OculusBrowser|Quest/i.test(navigator.userAgent);
+    const initialAsset = prefersSmoothInitially ? smoothAsset : captureAsset;
+    const initialQuality: VrQuality = prefersSmoothInitially ? "smooth" : "high";
+    setActiveQuality(initialQuality);
+    let initialLoadComplete = false;
+    let loadingQuality: VrQuality | null = null;
+    let currentQuality: VrQuality = initialQuality;
+    let currentAsset = initialAsset;
+    let splatComponent: GSplatComponent | null = null;
+    let pendingFoveation = 0.55;
+
     captureAsset.on("progress", (receivedBytes: number, totalBytes: number) => {
       if (disposed || totalBytes <= 0) return;
-      setProgress(Math.min(99, Math.round((receivedBytes / totalBytes) * 100)));
+      const nextProgress = Math.min(99, Math.round((receivedBytes / totalBytes) * 100));
+      if (!initialLoadComplete && initialAsset === captureAsset) setProgress(nextProgress);
+      else if (loadingQuality === "high") setQualityProgress(nextProgress);
     });
-    captureAsset.on("error", (error: unknown) => {
-      if (disposed) return;
-      setStatus("error");
-      setErrorMessage(
-        error instanceof Error
-          ? error.message
-          : typeof error === "string"
-            ? error
-            : "SOGファイルを読み込めませんでした。",
-      );
+    smoothAsset.on("progress", (receivedBytes: number, totalBytes: number) => {
+      if (disposed || totalBytes <= 0) return;
+      const nextProgress = Math.min(99, Math.round((receivedBytes / totalBytes) * 100));
+      if (!initialLoadComplete && initialAsset === smoothAsset) setProgress(nextProgress);
+      else if (loadingQuality === "smooth") setQualityProgress(nextProgress);
     });
-    captureAsset.ready(() => {
+
+    const assetErrorMessage = (error: unknown) =>
+      error instanceof Error
+        ? error.message
+        : typeof error === "string"
+          ? error
+          : "SOGファイルを読み込めませんでした。";
+    const onAssetError = (error: unknown) => {
       if (disposed) return;
-      splatEntity.addComponent("gsplat", {
-        asset: captureAsset,
+      loadingQuality = null;
+      setPreparingQuality(null);
+      setPreparedQuality(null);
+      setErrorMessage(assetErrorMessage(error));
+      if (!splatComponent) setStatus("error");
+    };
+    captureAsset.on("error", onAssetError);
+    smoothAsset.on("error", onAssetError);
+
+    initialAsset.ready(() => {
+      if (disposed) return;
+      splatComponent = splatEntity.addComponent("gsplat", {
+        asset: initialAsset,
         unified: true,
-      });
+      }) as GSplatComponent;
+      initialLoadComplete = true;
+      setActiveQuality(initialQuality);
       setProgress(100);
       setStatus("ready");
     });
     app.assets.add(captureAsset);
+    app.assets.add(smoothAsset);
+
+    const activateAsset = (quality: VrQuality, asset: Asset) => {
+      if (!splatComponent) return false;
+      const previousAsset = currentAsset;
+      splatComponent.asset = asset;
+      currentAsset = asset;
+      currentQuality = quality;
+      loadingQuality = null;
+      setActiveQuality(quality);
+      setPreparingQuality(null);
+      setPreparedQuality(quality);
+      setQualityProgress(100);
+      if (previousAsset !== asset && previousAsset.loaded) previousAsset.unload();
+      return true;
+    };
 
     const onXrAvailability = (available: boolean) => {
       if (!disposed) setXrAvailable(available);
     };
     const onXrStart = () => {
       if (disposed) return;
-      xr.fixedFoveation = 0.6;
+      xr.fixedFoveation = pendingFoveation;
       setInXr(true);
     };
     const onXrEnd = () => {
@@ -171,14 +229,18 @@ export function SogViewer() {
     xr.on("end", onXrEnd);
     xr.on("error", onXrError);
 
-    startVrRef.current = () => {
-      if (disposed || !xr.isAvailable(XRTYPE_VR) || !captureAsset.loaded) return;
+    const startVr = (quality: VrQuality) => {
+      const asset = quality === "smooth" ? smoothAsset : captureAsset;
+      if (disposed || !xr.isAvailable(XRTYPE_VR) || !asset.loaded || currentAsset !== asset) return;
       setErrorMessage("");
+      setQualityOpen(false);
+      setPreparedQuality(null);
       pressedKeys.clear();
       rig.setLocalPosition(0, 0, 0);
       rig.setLocalEulerAngles(0, 0, 0);
+      pendingFoveation = quality === "smooth" ? 0.82 : 0.55;
       xr.start(camera, XRTYPE_VR, XRSPACE_LOCALFLOOR, {
-        framebufferScaleFactor: 0.72,
+        framebufferScaleFactor: quality === "smooth" ? 0.52 : 0.78,
         optionalFeatures: ["hand-tracking"],
         callback: (error) => {
           if (disposed || !error) return;
@@ -186,6 +248,29 @@ export function SogViewer() {
         },
       });
     };
+
+    chooseQualityRef.current = (quality) => {
+      if (disposed || !splatComponent) return;
+      const asset = quality === "smooth" ? smoothAsset : captureAsset;
+      setErrorMessage("");
+      setPreparedQuality(null);
+
+      if (asset.loaded) {
+        if (currentAsset !== asset && !activateAsset(quality, asset)) return;
+        startVr(quality);
+        return;
+      }
+
+      loadingQuality = quality;
+      setPreparingQuality(quality);
+      setQualityProgress(0);
+      asset.ready(() => {
+        if (disposed || loadingQuality !== quality) return;
+        activateAsset(quality, asset);
+      });
+      app.assets.load(asset);
+    };
+    startPreparedVrRef.current = () => startVr(currentQuality);
 
     const movementCodes = new Set([
       "KeyW",
@@ -322,12 +407,13 @@ export function SogViewer() {
 
     resize();
     app.start();
-    app.assets.load(captureAsset);
+    app.assets.load(initialAsset);
     setXrAvailable(xr.isAvailable(XRTYPE_VR));
 
     return () => {
       disposed = true;
-      startVrRef.current = () => undefined;
+      chooseQualityRef.current = () => undefined;
+      startPreparedVrRef.current = () => undefined;
       resizeObserver.disconnect();
       canvas.removeEventListener("pointerdown", onPointerDown);
       canvas.removeEventListener("pointermove", onPointerMove);
@@ -355,7 +441,9 @@ export function SogViewer() {
         </div>
         <div className="format-pill">
           <span className="live-dot" />
-          PLAYCANVAS · SOG v2 · {SPLAT_COUNT.toLocaleString("ja-JP")} SPLATS
+          PLAYCANVAS · SOG v2 · {(activeQuality === "smooth"
+            ? SMOOTH_SPLAT_COUNT
+            : HIGH_SPLAT_COUNT).toLocaleString("ja-JP")} SPLATS
         </div>
       </header>
 
@@ -375,7 +463,10 @@ export function SogViewer() {
           type="button"
           disabled={!xrAvailable || status !== "ready"}
           aria-label="VR表示を開始"
-          onClick={() => startVrRef.current()}
+          onClick={() => {
+            setPreparedQuality(null);
+            setQualityOpen(true);
+          }}
         >
           <span className="vr-icon" aria-hidden="true">◫</span>
           VRを開始
@@ -384,6 +475,80 @@ export function SogViewer() {
           <span>左スティック</span> 移動&nbsp;&nbsp;·&nbsp;&nbsp;<span>右スティック</span> 旋回
         </p>
       </div>
+
+      {qualityOpen && (
+        <div className="quality-backdrop">
+          <section
+            className="quality-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="quality-title"
+          >
+            <button
+              className="quality-close"
+              type="button"
+              aria-label="画質選択を閉じる"
+              disabled={preparingQuality !== null}
+              onClick={() => {
+                setQualityOpen(false);
+                setPreparedQuality(null);
+              }}
+            >
+              ×
+            </button>
+            <p className="quality-eyebrow">VR QUALITY</p>
+            <h2 id="quality-title">画質を選択</h2>
+            <p className="quality-copy">
+              PICOでは「滑らかさ優先」がおすすめです。細部を確認したいときは高画質を選べます。
+            </p>
+
+            <div className="quality-options">
+              <button
+                className={`quality-option${activeQuality === "smooth" ? " is-active" : ""}`}
+                type="button"
+                disabled={preparingQuality !== null}
+                onClick={() => chooseQualityRef.current("smooth")}
+              >
+                <span className="quality-badge">PICO推奨</span>
+                <strong>滑らかさ優先</strong>
+                <span>50万点 · 軽量カラー · VR解像度 52%</span>
+              </button>
+              <button
+                className={`quality-option${activeQuality === "high" ? " is-active" : ""}`}
+                type="button"
+                disabled={preparingQuality !== null}
+                onClick={() => chooseQualityRef.current("high")}
+              >
+                <span className="quality-badge is-neutral">DETAIL</span>
+                <strong>高画質</strong>
+                <span>100万点 · フルカラー · VR解像度 78%</span>
+              </button>
+            </div>
+
+            {preparingQuality && (
+              <div className="quality-preparing" role="status" aria-live="polite">
+                <div className="loading-row">
+                  <span>{preparingQuality === "smooth" ? "滑らかさ優先" : "高画質"}を準備中</span>
+                  <span>{qualityProgress}%</span>
+                </div>
+                <div className="progress-track">
+                  <span style={{ width: `${Math.max(4, qualityProgress)}%` }} />
+                </div>
+              </div>
+            )}
+
+            {preparedQuality && !preparingQuality && (
+              <button
+                className="quality-start"
+                type="button"
+                onClick={() => startPreparedVrRef.current()}
+              >
+                {preparedQuality === "smooth" ? "滑らかさ優先" : "高画質"}でVRを開始
+              </button>
+            )}
+          </section>
+        </div>
+      )}
 
       {status === "loading" && (
         <div className="loading-card" role="status" aria-live="polite">
@@ -394,7 +559,10 @@ export function SogViewer() {
           <div className="progress-track">
             <span style={{ width: `${Math.max(4, progress)}%` }} />
           </div>
-          <p>15.5 MB · PLAYCANVAS STANDARD SOG LOADER</p>
+          <p>
+            {activeQuality === "smooth" ? "5.9 MB · 500K" : "15.5 MB · 1M"}
+            {" · PLAYCANVAS STANDARD SOG LOADER"}
+          </p>
         </div>
       )}
 

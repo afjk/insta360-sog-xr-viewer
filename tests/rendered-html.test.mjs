@@ -38,20 +38,27 @@ test("server-renders the PlayCanvas SOG viewer shell", async () => {
   assert.match(html, /role="status"/);
 });
 
-test("uses PlayCanvas standard SOG loading and WebXR", async () => {
-  const [viewer, packageJson] = await Promise.all([
+test("uses selectable PlayCanvas SOG quality modes and WebXR", async () => {
+  const [viewer, packageJson, smoothSog] = await Promise.all([
     readFile(new URL("../app/SogViewer.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
+    readFile(new URL("../public/capture-vr.sog", import.meta.url)),
   ]);
 
   assert.match(packageJson, /"playcanvas": "\^2\.21\.0"/);
   assert.doesNotMatch(packageJson, /@sparkjsdev\/spark|"three"/);
-  assert.match(viewer, /new Asset\("Insta360 Spatial Capture", "gsplat"/);
+  assert.match(viewer, /new Asset\("Insta360 Spatial Capture — High", "gsplat"/);
   assert.match(viewer, /url: "\/capture\.sog"/);
+  assert.match(viewer, /url: "\/capture-vr\.sog"/);
+  assert.match(viewer, /滑らかさ優先/);
+  assert.match(viewer, /高画質/);
+  assert.match(viewer, /framebufferScaleFactor: quality === "smooth" \? 0\.52 : 0\.78/);
   assert.match(viewer, /GSPLAT_RENDERER_RASTER_CPU_SORT/);
-  assert.match(viewer, /app\.xr\.start\(camera, XRTYPE_VR, XRSPACE_LOCALFLOOR/);
+  assert.match(viewer, /xr\.start\(camera, XRTYPE_VR, XRSPACE_LOCALFLOOR/);
   assert.match(viewer, /"KeyW"/);
   assert.match(viewer, /"KeyE"/);
   assert.match(viewer, /XRHAND_LEFT/);
   assert.match(viewer, /XRHAND_RIGHT/);
+  assert.equal(smoothSog.subarray(0, 2).toString(), "PK");
+  assert.ok(smoothSog.byteLength < 7_000_000);
 });
