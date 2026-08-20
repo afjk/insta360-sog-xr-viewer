@@ -14,7 +14,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "SOG XR Viewer | Insta360 Spatial Capture",
-  description: "Insta360 Spatial CaptureをQuestのWebXRで体験する3D Gaussian Splatビューアー。",
+  description: "Insta360 Spatial CaptureをPICO 4 UltraやQuestのWebXRで体験する3D Gaussian Splatビューアー。",
 };
 
 export default function RootLayout({

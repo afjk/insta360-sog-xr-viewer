@@ -1,19 +1,44 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import * as THREE from "three";
-import { SparkRenderer, SparkXr, SplatMesh } from "@sparkjsdev/spark";
+import {
+  Application,
+  Asset,
+  CameraComponent,
+  Color,
+  Entity,
+  FILLMODE_NONE,
+  GSPLAT_RENDERER_RASTER_CPU_SORT,
+  RESOLUTION_AUTO,
+  Vec3,
+  XRHAND_LEFT,
+  XRHAND_RIGHT,
+  XRSPACE_LOCALFLOOR,
+  XRTYPE_VR,
+} from "playcanvas";
 
 type ViewerStatus = "loading" | "ready" | "error";
 
 const SPLAT_COUNT = 1_000_000;
-// Percentile bounds (2–98%) decoded from capture.sog. The raw bounding box
-// contains a few far-away splats that would shrink the actual room to ~6%.
-const CAPTURE_MIN = new THREE.Vector3(-6.911, -1.263, -3.762);
-const CAPTURE_MAX = new THREE.Vector3(6.178, 1.654, 3.802);
+// Percentile bounds (2–98%) decoded from capture.sog. A handful of distant
+// outliers in the raw bounds are intentionally ignored when placing the room.
+const CAPTURE_MIN = new Vec3(-6.911, -1.263, -3.762);
+const CAPTURE_MAX = new Vec3(6.178, 1.654, 3.802);
+const CAPTURE_CENTER = new Vec3().add2(CAPTURE_MIN, CAPTURE_MAX).mulScalar(0.5);
+const DESKTOP_TARGET = new Vec3(0, 1.35, -2.8);
+const UP = new Vec3(0, 1, 0);
+
+const clamp = (value: number, min: number, max: number) =>
+  Math.min(max, Math.max(min, value));
+
+const stickAxis = (axes: readonly number[], axis: "x" | "y") => {
+  const value = axes.length >= 4 ? axes[axis === "x" ? 2 : 3] : axes[axis === "x" ? 0 : 1];
+  return Math.abs(value ?? 0) < 0.16 ? 0 : (value ?? 0);
+};
 
 export function SogViewer() {
   const viewportRef = useRef<HTMLDivElement>(null);
+  const startVrRef = useRef<() => void>(() => undefined);
   const [status, setStatus] = useState<ViewerStatus>("loading");
   const [progress, setProgress] = useState(0);
   const [xrAvailable, setXrAvailable] = useState(false);
@@ -31,159 +56,137 @@ export function SogViewer() {
     let yaw = 0;
     let pitch = 0.08;
     let distance = 2.8;
-    let lastFrameTime = 0;
     const pressedKeys = new Set<string>();
 
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x05070a);
+    const canvas = document.createElement("canvas");
+    canvas.className = "sog-canvas";
+    canvas.setAttribute("aria-label", "Insta360 Spatial Capture 3D viewer");
+    viewport.appendChild(canvas);
 
-    const rig = new THREE.Group();
-    const camera = new THREE.PerspectiveCamera(58, 1, 0.01, 500);
-    rig.add(camera);
-    scene.add(rig);
-
-    const renderer = new THREE.WebGLRenderer({
-      antialias: false,
-      powerPreference: "high-performance",
-    });
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
-    renderer.domElement.className = "sog-canvas";
-    renderer.domElement.setAttribute(
-      "aria-label",
-      "Insta360 Spatial Capture 3D viewer",
-    );
-    viewport.appendChild(renderer.domElement);
-
-    const spark = new SparkRenderer({
-      renderer,
-      maxStdDev: Math.sqrt(5),
-      lodSplatScale: 0.82,
-      sortRadial: true,
-    });
-    scene.add(spark);
-
-    const splat = new SplatMesh({
-      url: "/capture.sog",
-      onProgress: (event) => {
-        if (disposed) return;
-        if (event.lengthComputable && event.total > 0) {
-          setProgress(Math.min(99, Math.round((event.loaded / event.total) * 100)));
-        }
+    const app = new Application(canvas, {
+      graphicsDeviceOptions: {
+        antialias: false,
+        alpha: false,
+        powerPreference: "high-performance",
       },
     });
-    scene.add(splat);
+    app.setCanvasFillMode(FILLMODE_NONE);
+    app.setCanvasResolution(RESOLUTION_AUTO);
+    app.graphicsDevice.maxPixelRatio = Math.min(window.devicePixelRatio, 1.5);
+    app.scene.gsplat.renderer = GSPLAT_RENDERER_RASTER_CPU_SORT;
+    app.scene.gsplat.radialSorting = true;
+    const xr = app.xr;
+    if (!xr) throw new Error("WebXR manager could not be initialized.");
 
-    const captureCenter = CAPTURE_MIN.clone().add(CAPTURE_MAX).multiplyScalar(0.5);
-    // Desktop starts inside the room too, instead of orbiting far outside it.
-    const target = new THREE.Vector3(0, 1.35, -2.8);
-    const worldTarget = new THREE.Vector3();
+    const rig = new Entity("viewer-rig");
+    app.root.addChild(rig);
+
+    const cameraEntity = new Entity("xr-camera");
+    cameraEntity.addComponent("camera", {
+      clearColor: new Color(0.0196, 0.0275, 0.0392),
+      fov: 58,
+      nearClip: 0.01,
+      farClip: 500,
+    });
+    rig.addChild(cameraEntity);
+    const camera = cameraEntity.camera as CameraComponent;
+
+    const worldTarget = new Vec3();
     const updateDesktopCamera = () => {
       const cosPitch = Math.cos(pitch);
-      camera.position.set(
-        target.x + distance * Math.sin(yaw) * cosPitch,
-        target.y + distance * Math.sin(pitch),
-        target.z + distance * Math.cos(yaw) * cosPitch,
+      cameraEntity.setLocalPosition(
+        DESKTOP_TARGET.x + distance * Math.sin(yaw) * cosPitch,
+        DESKTOP_TARGET.y + distance * Math.sin(pitch),
+        DESKTOP_TARGET.z + distance * Math.cos(yaw) * cosPitch,
       );
-      camera.lookAt(worldTarget.copy(target).add(rig.position));
+      worldTarget.add2(DESKTOP_TARGET, rig.getPosition());
+      cameraEntity.lookAt(worldTarget);
     };
     updateDesktopCamera();
 
-    void splat.initialized
-      .then(() => {
-        if (disposed) return;
+    const splatEntity = new Entity("insta360-sog");
+    // Insta360's capture axes are Y-down / Z-forward. A 180° X rotation makes
+    // the room Y-up / Z-back without using a negative scale in stereo XR.
+    splatEntity.setLocalEulerAngles(180, 0, 0);
+    splatEntity.setLocalPosition(
+      -CAPTURE_CENTER.x,
+      CAPTURE_MAX.y,
+      CAPTURE_CENTER.z,
+    );
+    app.root.addChild(splatEntity);
 
-        // Keep the capture at its real decoded scale and correct Insta360's
-        // inverted vertical axis. The corrected floor sits at y=0.
-        splat.scale.set(1, -1, 1);
-        splat.position.set(
-          -captureCenter.x,
-          CAPTURE_MAX.y,
-          -captureCenter.z,
-        );
-
-        setProgress(100);
-        setStatus("ready");
-      })
-      .catch((error: unknown) => {
-        if (disposed) return;
-        setStatus("error");
-        setErrorMessage(
-          error instanceof Error ? error.message : "SOGファイルを読み込めませんでした。",
-        );
-      });
-
-    const xr = new SparkXr({
-      renderer,
-      elementId: "enter-vr",
-      mode: "vr",
-      referenceSpaceType: "local-floor",
-      fixedFoveation: 0.6,
-      frameBufferScaleFactor: 0.72,
-      sessionInit: { optionalFeatures: ["hand-tracking"] },
-      controllers: {
-        moveDirection: true,
-        moveSpeed: 1.8,
-        rotateSpeed: 2.6,
-      },
-      onReady: (supported) => {
-        if (!disposed) setXrAvailable(supported);
-      },
-      onEnterXr: () => {
-        setInXr(true);
-        // The room is centered around the XR origin with its floor at y=0.
-        rig.position.set(0, 0, 0);
-      },
-      onExitXr: () => {
-        setInXr(false);
-        rig.position.set(0, 0, 0);
-        updateDesktopCamera();
-      },
+    const captureAsset = new Asset("Insta360 Spatial Capture", "gsplat", {
+      url: "/capture.sog",
+      filename: "capture.sog",
+      size: 16_241_776,
     });
-
-    const resize = () => {
-      const width = Math.max(1, viewport.clientWidth);
-      const height = Math.max(1, viewport.clientHeight);
-      camera.aspect = width / height;
-      camera.updateProjectionMatrix();
-      updateDesktopCamera();
-      renderer.setSize(width, height, false);
-    };
-    const resizeObserver = new ResizeObserver(resize);
-    resizeObserver.observe(viewport);
-    resize();
-
-    const onPointerDown = (event: PointerEvent) => {
-      if (renderer.xr.isPresenting) return;
-      dragging = true;
-      lastX = event.clientX;
-      lastY = event.clientY;
-      renderer.domElement.setPointerCapture(event.pointerId);
-    };
-    const onPointerMove = (event: PointerEvent) => {
-      if (!dragging || renderer.xr.isPresenting) return;
-      yaw -= (event.clientX - lastX) * 0.006;
-      pitch = THREE.MathUtils.clamp(
-        pitch + (event.clientY - lastY) * 0.004,
-        -0.75,
-        0.75,
+    captureAsset.on("progress", (receivedBytes: number, totalBytes: number) => {
+      if (disposed || totalBytes <= 0) return;
+      setProgress(Math.min(99, Math.round((receivedBytes / totalBytes) * 100)));
+    });
+    captureAsset.on("error", (error: unknown) => {
+      if (disposed) return;
+      setStatus("error");
+      setErrorMessage(
+        error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "SOGファイルを読み込めませんでした。",
       );
-      lastX = event.clientX;
-      lastY = event.clientY;
+    });
+    captureAsset.ready(() => {
+      if (disposed) return;
+      splatEntity.addComponent("gsplat", {
+        asset: captureAsset,
+        unified: true,
+      });
+      setProgress(100);
+      setStatus("ready");
+    });
+    app.assets.add(captureAsset);
+
+    const onXrAvailability = (available: boolean) => {
+      if (!disposed) setXrAvailable(available);
+    };
+    const onXrStart = () => {
+      if (disposed) return;
+      xr.fixedFoveation = 0.6;
+      setInXr(true);
+    };
+    const onXrEnd = () => {
+      if (disposed) return;
+      setInXr(false);
+      rig.setLocalPosition(0, 0, 0);
+      rig.setLocalEulerAngles(0, 0, 0);
       updateDesktopCamera();
     };
-    const onPointerUp = (event: PointerEvent) => {
-      dragging = false;
-      if (renderer.domElement.hasPointerCapture(event.pointerId)) {
-        renderer.domElement.releasePointerCapture(event.pointerId);
-      }
+    const onXrError = (error: Error) => {
+      if (disposed) return;
+      setErrorMessage(`VRを開始できませんでした: ${error.message}`);
     };
-    const onWheel = (event: WheelEvent) => {
-      if (renderer.xr.isPresenting) return;
-      event.preventDefault();
-      distance = THREE.MathUtils.clamp(distance + event.deltaY * 0.01, 2.2, 48);
-      updateDesktopCamera();
+
+    xr.on(`available:${XRTYPE_VR}`, onXrAvailability);
+    xr.on("start", onXrStart);
+    xr.on("end", onXrEnd);
+    xr.on("error", onXrError);
+
+    startVrRef.current = () => {
+      if (disposed || !xr.isAvailable(XRTYPE_VR) || !captureAsset.loaded) return;
+      setErrorMessage("");
+      pressedKeys.clear();
+      rig.setLocalPosition(0, 0, 0);
+      rig.setLocalEulerAngles(0, 0, 0);
+      xr.start(camera, XRTYPE_VR, XRSPACE_LOCALFLOOR, {
+        framebufferScaleFactor: 0.72,
+        optionalFeatures: ["hand-tracking"],
+        callback: (error) => {
+          if (disposed || !error) return;
+          setErrorMessage(`VRを開始できませんでした: ${error.message}`);
+        },
+      });
     };
+
     const movementCodes = new Set([
       "KeyW",
       "KeyA",
@@ -195,7 +198,7 @@ export function SogViewer() {
       "ShiftRight",
     ]);
     const onKeyDown = (event: KeyboardEvent) => {
-      if (renderer.xr.isPresenting || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (xr.active || event.metaKey || event.ctrlKey || event.altKey) return;
       if (!movementCodes.has(event.code)) return;
       pressedKeys.add(event.code);
       event.preventDefault();
@@ -206,58 +209,136 @@ export function SogViewer() {
       event.preventDefault();
     };
     const clearPressedKeys = () => pressedKeys.clear();
+
+    const onPointerDown = (event: PointerEvent) => {
+      if (xr.active) return;
+      dragging = true;
+      lastX = event.clientX;
+      lastY = event.clientY;
+      canvas.setPointerCapture(event.pointerId);
+    };
+    const onPointerMove = (event: PointerEvent) => {
+      if (!dragging || xr.active) return;
+      yaw -= (event.clientX - lastX) * 0.006;
+      pitch = clamp(pitch + (event.clientY - lastY) * 0.004, -0.75, 0.75);
+      lastX = event.clientX;
+      lastY = event.clientY;
+      updateDesktopCamera();
+    };
+    const onPointerUp = (event: PointerEvent) => {
+      dragging = false;
+      if (canvas.hasPointerCapture(event.pointerId)) {
+        canvas.releasePointerCapture(event.pointerId);
+      }
+    };
+    const onWheel = (event: WheelEvent) => {
+      if (xr.active) return;
+      event.preventDefault();
+      distance = clamp(distance + event.deltaY * 0.01, 2.2, 48);
+      updateDesktopCamera();
+    };
+
+    const desktopMovement = new Vec3();
+    const xrMovement = new Vec3();
+    const flatForward = new Vec3();
+    const flatRight = new Vec3();
     const updateDesktopMovement = (deltaSeconds: number) => {
       const forwardAmount = Number(pressedKeys.has("KeyW")) - Number(pressedKeys.has("KeyS"));
       const rightAmount = Number(pressedKeys.has("KeyD")) - Number(pressedKeys.has("KeyA"));
       const upAmount = Number(pressedKeys.has("KeyE")) - Number(pressedKeys.has("KeyQ"));
       if (forwardAmount === 0 && rightAmount === 0 && upAmount === 0) return;
 
-      const forward = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
-      const right = new THREE.Vector3().crossVectors(forward, camera.up).normalize();
-      const movement = new THREE.Vector3()
-        .addScaledVector(forward, forwardAmount)
-        .addScaledVector(right, rightAmount)
-        .addScaledVector(camera.up, upAmount)
+      flatForward.set(-Math.sin(yaw), 0, -Math.cos(yaw));
+      flatRight.cross(flatForward, UP).normalize();
+      desktopMovement
+        .set(0, 0, 0)
+        .addScaled(flatForward, forwardAmount)
+        .addScaled(flatRight, rightAmount)
+        .addScaled(UP, upAmount)
         .normalize();
       const isFast = pressedKeys.has("ShiftLeft") || pressedKeys.has("ShiftRight");
-      rig.position.addScaledVector(movement, (isFast ? 6 : 2.4) * deltaSeconds);
+      rig.setLocalPosition(
+        rig.getLocalPosition().addScaled(desktopMovement, (isFast ? 6 : 2.4) * deltaSeconds),
+      );
       updateDesktopCamera();
     };
 
-    renderer.domElement.addEventListener("pointerdown", onPointerDown);
-    renderer.domElement.addEventListener("pointermove", onPointerMove);
-    renderer.domElement.addEventListener("pointerup", onPointerUp);
-    renderer.domElement.addEventListener("pointercancel", onPointerUp);
-    renderer.domElement.addEventListener("wheel", onWheel, { passive: false });
+    const updateXrMovement = (deltaSeconds: number) => {
+      let moveX = 0;
+      let moveY = 0;
+      let rotateX = 0;
+      for (const source of xr.input.inputSources) {
+        const axes = source.gamepad?.axes;
+        if (!axes) continue;
+        if (source.handedness === XRHAND_LEFT) {
+          moveX = stickAxis(axes, "x");
+          moveY = stickAxis(axes, "y");
+        } else if (source.handedness === XRHAND_RIGHT) {
+          rotateX = stickAxis(axes, "x");
+        }
+      }
+
+      if (moveX !== 0 || moveY !== 0) {
+        flatForward.set(cameraEntity.forward.x, 0, cameraEntity.forward.z);
+        if (flatForward.lengthSq() > 0.0001) flatForward.normalize();
+        flatRight.set(cameraEntity.right.x, 0, cameraEntity.right.z);
+        if (flatRight.lengthSq() > 0.0001) flatRight.normalize();
+        xrMovement
+          .set(0, 0, 0)
+          .addScaled(flatRight, moveX)
+          .addScaled(flatForward, -moveY);
+        if (xrMovement.lengthSq() > 1) xrMovement.normalize();
+        rig.setLocalPosition(rig.getLocalPosition().addScaled(xrMovement, 1.8 * deltaSeconds));
+      }
+      if (rotateX !== 0) {
+        rig.rotateLocal(0, -rotateX * 105 * deltaSeconds, 0);
+      }
+    };
+
+    const onUpdate = (deltaSeconds: number) => {
+      if (xr.active) updateXrMovement(Math.min(deltaSeconds, 0.05));
+      else updateDesktopMovement(Math.min(deltaSeconds, 0.05));
+    };
+    app.on("update", onUpdate);
+
+    const resize = () => {
+      if (xr.active) return;
+      const width = Math.max(1, viewport.clientWidth);
+      const height = Math.max(1, viewport.clientHeight);
+      app.resizeCanvas(width, height);
+      updateDesktopCamera();
+    };
+    const resizeObserver = new ResizeObserver(resize);
+    resizeObserver.observe(viewport);
+
+    canvas.addEventListener("pointerdown", onPointerDown);
+    canvas.addEventListener("pointermove", onPointerMove);
+    canvas.addEventListener("pointerup", onPointerUp);
+    canvas.addEventListener("pointercancel", onPointerUp);
+    canvas.addEventListener("wheel", onWheel, { passive: false });
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
     window.addEventListener("blur", clearPressedKeys);
 
-    renderer.setAnimationLoop((time, xrFrame) => {
-      if (xrFrame) xr.updateControllers(camera);
-      else {
-        const deltaSeconds = lastFrameTime === 0 ? 0 : Math.min((time - lastFrameTime) / 1000, 0.05);
-        updateDesktopMovement(deltaSeconds);
-      }
-      lastFrameTime = time;
-      renderer.render(scene, camera);
-    });
+    resize();
+    app.start();
+    app.assets.load(captureAsset);
+    setXrAvailable(xr.isAvailable(XRTYPE_VR));
 
     return () => {
       disposed = true;
+      startVrRef.current = () => undefined;
       resizeObserver.disconnect();
-      renderer.setAnimationLoop(null);
-      renderer.domElement.removeEventListener("pointerdown", onPointerDown);
-      renderer.domElement.removeEventListener("pointermove", onPointerMove);
-      renderer.domElement.removeEventListener("pointerup", onPointerUp);
-      renderer.domElement.removeEventListener("pointercancel", onPointerUp);
-      renderer.domElement.removeEventListener("wheel", onWheel);
+      canvas.removeEventListener("pointerdown", onPointerDown);
+      canvas.removeEventListener("pointermove", onPointerMove);
+      canvas.removeEventListener("pointerup", onPointerUp);
+      canvas.removeEventListener("pointercancel", onPointerUp);
+      canvas.removeEventListener("wheel", onWheel);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", clearPressedKeys);
-      if (xr.session) void xr.session.end();
-      splat.dispose();
-      renderer.dispose();
+      if (xr.active) xr.end();
+      app.destroy();
       viewport.replaceChildren();
     };
   }, []);
@@ -274,7 +355,7 @@ export function SogViewer() {
         </div>
         <div className="format-pill">
           <span className="live-dot" />
-          SOG v2 · {SPLAT_COUNT.toLocaleString("ja-JP")} SPLATS
+          PLAYCANVAS · SOG v2 · {SPLAT_COUNT.toLocaleString("ja-JP")} SPLATS
         </div>
       </header>
 
@@ -282,7 +363,7 @@ export function SogViewer() {
         <p className="eyebrow">INSTA360 SPATIAL CAPTURE</p>
         <h1>記憶の中へ、<br />一歩踏み込む。</h1>
         <p className="intro-copy">
-          Questブラウザで開き、VRを開始してください。頭の動きと両眼視差で、
+          PICO 4 UltraやQuestのブラウザで開き、VRを開始してください。頭の動きと両眼視差で、
           空間をそのまま立体的に体験できます。
         </p>
       </section>
@@ -294,6 +375,7 @@ export function SogViewer() {
           type="button"
           disabled={!xrAvailable || status !== "ready"}
           aria-label="VR表示を開始"
+          onClick={() => startVrRef.current()}
         >
           <span className="vr-icon" aria-hidden="true">◫</span>
           VRを開始
@@ -312,7 +394,7 @@ export function SogViewer() {
           <div className="progress-track">
             <span style={{ width: `${Math.max(4, progress)}%` }} />
           </div>
-          <p>15.5 MB · SOG v2</p>
+          <p>15.5 MB · PLAYCANVAS STANDARD SOG LOADER</p>
         </div>
       )}
 
@@ -323,12 +405,19 @@ export function SogViewer() {
         </div>
       )}
 
+      {status !== "error" && errorMessage && (
+        <div className="error-card" role="alert">
+          <strong>VRを開始できませんでした</strong>
+          <span>{errorMessage}</span>
+        </div>
+      )}
+
       <footer className="footer-bar">
         <div>
           <span className="desktop-label">DESKTOP</span>
           WASD 移動 · E/Q 上下 · Shift 高速 · ドラッグで回転
         </div>
-        <div className="secure-label">WEBXR · SECURE SESSION</div>
+        <div className="secure-label">PLAYCANVAS · WEBXR · SECURE SESSION</div>
       </footer>
     </main>
   );

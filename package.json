@@ -14,11 +14,10 @@
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
-    "@sparkjsdev/spark": "^2.1.0",
     "drizzle-orm": "0.45.2",
+    "playcanvas": "^2.21.0",
     "react": "19.2.6",
-    "react-dom": "19.2.6",
-    "three": "^0.180.0"
+    "react-dom": "19.2.6"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "1.37.1",
