@@ -39,6 +39,11 @@ const stickAxis = (axes: readonly number[], axis: "x" | "y") => {
   return Math.abs(value ?? 0) < 0.16 ? 0 : (value ?? 0);
 };
 
+const gamepadButtonPressed = (buttons: readonly GamepadButton[], index: number) => {
+  const button = buttons[index];
+  return Boolean(button?.pressed || (button?.value ?? 0) > 0.5);
+};
+
 export function SogViewer() {
   const viewportRef = useRef<HTMLDivElement>(null);
   const chooseQualityRef = useRef<(quality: VrQuality) => void>(() => undefined);
@@ -352,14 +357,21 @@ export function SogViewer() {
       let moveX = 0;
       let moveY = 0;
       let rotateX = 0;
+      let heightDirection = 0;
       for (const source of xr.input.inputSources) {
-        const axes = source.gamepad?.axes;
-        if (!axes) continue;
+        const gamepad = source.gamepad;
+        if (!gamepad) continue;
+        const axes = gamepad.axes;
         if (source.handedness === XRHAND_LEFT) {
           moveX = stickAxis(axes, "x");
           moveY = stickAxis(axes, "y");
         } else if (source.handedness === XRHAND_RIGHT) {
           rotateX = stickAxis(axes, "x");
+          // PICO 4 / PICO 4 Ultra's xr-standard layout exposes A and B at
+          // indices 4 and 5. Hold A to rise and B to descend.
+          heightDirection =
+            Number(gamepadButtonPressed(gamepad.buttons, 4)) -
+            Number(gamepadButtonPressed(gamepad.buttons, 5));
         }
       }
 
@@ -377,6 +389,11 @@ export function SogViewer() {
       }
       if (rotateX !== 0) {
         rig.rotateLocal(0, -rotateX * 105 * deltaSeconds, 0);
+      }
+      if (heightDirection !== 0) {
+        rig.setLocalPosition(
+          rig.getLocalPosition().addScaled(UP, heightDirection * 1.2 * deltaSeconds),
+        );
       }
     };
 
@@ -473,6 +490,7 @@ export function SogViewer() {
         </button>
         <p className="control-hint">
           <span>左スティック</span> 移動&nbsp;&nbsp;·&nbsp;&nbsp;<span>右スティック</span> 旋回
+          &nbsp;&nbsp;·&nbsp;&nbsp;<span>A 上昇 / B 下降</span>
         </p>
       </div>
 

@@ -59,6 +59,10 @@ test("uses selectable PlayCanvas SOG quality modes and WebXR", async () => {
   assert.match(viewer, /"KeyE"/);
   assert.match(viewer, /XRHAND_LEFT/);
   assert.match(viewer, /XRHAND_RIGHT/);
+  assert.match(viewer, /gamepadButtonPressed\(gamepad\.buttons, 4\)/);
+  assert.match(viewer, /gamepadButtonPressed\(gamepad\.buttons, 5\)/);
+  assert.match(viewer, /heightDirection \* 1\.2 \* deltaSeconds/);
+  assert.match(viewer, /A 上昇 \/ B 下降/);
   assert.equal(smoothSog.subarray(0, 2).toString(), "PK");
   assert.ok(smoothSog.byteLength < 7_000_000);
 });
