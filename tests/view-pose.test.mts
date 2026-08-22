@@ -273,3 +273,50 @@ test("spawns XR at the same place and heading as the restored desktop view", () 
   close(Math.hypot(spawned.x - desktop.eye.x, spawned.y - desktop.eye.y, spawned.z - desktop.eye.z), 0, 2e-3);
   close(spawned.yaw, yawDegreesFromBasis(desktop.forward, desktop.up), 0.01);
 });
+
+test("returns to the pre-VR desktop view after XR ends", () => {
+  // WASDでrigごと移動したあとの視点。VR開始時にrigはidentityへ戻され、
+  // XR中はlocomotionがrigを好きに動かす。戻り先はrigではなくこのworld視点。
+  const before = simulateDesktopCamera({
+    target: { x: 0.4, y: 1.5, z: 0 },
+    rig: { x: -4.25, y: 0.8, z: 6.1 },
+    yaw: 148.25,
+    pitch: -8.5,
+    distance: 1.6,
+  });
+  const saved: ViewPose = {
+    x: before.eye.x,
+    y: before.eye.y,
+    z: before.eye.z,
+    yaw: yawDegreesFromBasis(before.forward, before.up),
+    pitch: pitchDegreesFromForward(before.forward),
+    distance: 1.6,
+  };
+
+  // XR終了後の復元。rigは原点、注視点はeyeから割り出し直す。
+  const after = simulateDesktopCamera({
+    target: orbitTargetOf(saved),
+    rig: { x: 0, y: 0, z: 0 },
+    yaw: saved.yaw,
+    pitch: saved.pitch,
+    distance: saved.distance,
+  });
+  close(after.eye.x, before.eye.x, 1e-9, "eye.x");
+  close(after.eye.y, before.eye.y, 1e-9, "eye.y");
+  close(after.eye.z, before.eye.z, 1e-9, "eye.z");
+  close(yawDegreesFromBasis(after.forward, after.up), saved.yaw, 1e-9, "yaw");
+  close(pitchDegreesFromForward(after.forward), saved.pitch, 1e-9, "pitch");
+
+  // rigをゼロへ戻すだけでは、WASDで入った移動量ごと視点が飛ぶ。
+  const rigOnly = simulateDesktopCamera({
+    target: { x: 0.4, y: 1.5, z: 0 },
+    rig: { x: 0, y: 0, z: 0 },
+    yaw: 148.25,
+    pitch: -8.5,
+    distance: 1.6,
+  });
+  assert.ok(
+    Math.hypot(rigOnly.eye.x - before.eye.x, rigOnly.eye.y - before.eye.y, rigOnly.eye.z - before.eye.z) > 1,
+    "rigをゼロにするだけの復帰は視点を失う",
+  );
+});

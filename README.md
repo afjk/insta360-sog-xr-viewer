@@ -122,10 +122,31 @@ spawnします。
 DesktopとQuestで同じ規則を使います。
 
 1. URLに `view=` がある … ユーザーが指定した視点
-2. Insta360共有の公式Home Viewが取れる … Insta360公式の初期視点
-   （`2_cameras.json` を使うこの経路は別実装で、`SogViewer.tsx` の `initialViewFor` に
-   差し込み口だけ用意してあります）
+2. Insta360共有の公式Home Viewが取れる … Insta360公式の初期視点（**未実装**。下記）
 3. どちらも無い … これまでどおり、読み込んだ空間の広がりから決める `frameBounds()`
+
+判定は `SogViewer.tsx` の `initialViewFor()` にまとまっていて、`null` を返すと
+呼び出し側が `frameBounds()` へ落ちます。
+
+#### 公式Home Viewの現状
+
+resolverは `2_cameras.json`（タスク詳細の `outputs` にSOGと並んでいる、撮影時のカメラ情報）の
+署名付きURLを `camerasUrl` として返すところまで実装済みです。
+
+```json
+{ "shareId": "GS3DG…", "assetUrl": "https://p2-app.insta360.com/…/1_3DGS.sog?…", "camerasUrl": "https://p2-app.insta360.com/…/2_cameras.json?…" }
+```
+
+一方、**このJSONを公式Viewerと同じ初期視点へ変換する部分は未実装**です。次の3点は実サービスを
+読まないと決められず、推測で実装すると公式Viewerと違う場所から始まってしまいます。
+
+- `2_cameras.json` のスキーマと、rotationが c2w / w2c のどちらか
+- 公式Viewer（`/_next/static/chunks/pages/3dgs/remy-*.js`、`app.3dgs.remy.back_to_origin` 周辺）が
+  Home / Reset Viewをどう決めているか（特定camera indexか、補間・計算したposeか）
+- `fx / fy / width / height` からのFOV復元と、viewport aspectに応じた公式の調整
+
+変換にはSOG側の配置（`splatEntity` のX軸180°回転＋bounds由来の平行移動）を通す必要があり、
+`2_cameras.json` の座標系がSOGと同じかどうかも実データでの確認が要ります。
 
 ### Insta360共有URLの解決について
 

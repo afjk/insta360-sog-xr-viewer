@@ -342,6 +342,23 @@ export function SogViewer() {
     };
 
     /**
+     * VRへ入る直前のDesktop視点へ戻す。
+     *
+     * XR中のlocomotionはrigを動かすので、rigをゼロに戻すだけでは足りない。
+     * VR開始前にWASDでrigへ入っていた移動量まで消えて、Desktopの視点が
+     * 空間の初期位置へ飛んでしまう。控えておいたworld視点を`applyViewPose`で
+     * 組み直せば、rigは原点に戻ったまま見え方は開始前と同じになる。
+     *
+     * XR終了と `xr.start()` 失敗の両方から呼ぶ。二度目は何もしない。
+     */
+    const restoreDesktopView = () => {
+      const view = desktopReturnView;
+      if (!view) return;
+      desktopReturnView = null;
+      applyViewPose(view);
+    };
+
+    /**
      * 開いた空間の初期視点を決める。優先順位はDesktopでもXRでも同じ。
      *
      * 1. URLの `view=` … ユーザーが指定した視点
@@ -380,6 +397,9 @@ export function SogViewer() {
     // VR開始時に合わせたいworld視点。HMDのposeが届く前は補正できないので、
     // ここへ置いて最初の有効なフレームで1回だけ適用する。
     let pendingXrSpawn: ViewPose | null = null;
+    // VRへ入る直前のDesktop視点。役割が違うので `pendingXrSpawn` とは分けてある
+    // （あちらは最初のHMD poseで消える。こちらはVRを抜けるまで持つ）。
+    let desktopReturnView: ViewPose | null = null;
     // `?debug=1` で開いたときだけ、spawn結果をconsoleへ出す。実機でDesktopと
     // Questの視点を突き合わせるための確認用で、既定では何も出さない。
     const xrDebug = new URLSearchParams(window.location.search).get("debug") === "1";
@@ -518,9 +538,7 @@ export function SogViewer() {
       pendingXrSpawn = null;
       // Desktop表示はOriginalに戻す。
       if (original) attachAsset(original.asset);
-      rig.setLocalPosition(0, 0, 0);
-      rig.setLocalEulerAngles(0, 0, 0);
-      updateDesktopCamera();
+      restoreDesktopView();
     };
     const onXrError = (error: Error) => {
       if (disposed) return;
@@ -542,7 +560,11 @@ export function SogViewer() {
       // その視点、無ければ `frameBounds()` の既定視点）。rigは一度identityへ
       // 戻し、HMDのposeが届いた最初のフレームでこの視点へ合わせ直す。ここで
       // 0のままにすると、リンクで指定された場所を見失う。
-      pendingXrSpawn = currentViewPose();
+      const desktopView = currentViewPose();
+      pendingXrSpawn = desktopView;
+      // VRを抜けたときに戻る先。rigをゼロにするので、控えておかないと
+      // WASDで移動した分がここで失われる。
+      desktopReturnView = desktopView;
       rig.setLocalPosition(0, 0, 0);
       rig.setLocalEulerAngles(0, 0, 0);
       attachAsset(entry.asset);
@@ -555,6 +577,8 @@ export function SogViewer() {
           if (disposed || !error) return;
           pendingXrSpawn = null;
           if (original) attachAsset(original.asset);
+          // 開始に失敗した場合も、rigはすでにゼロへ戻してある。
+          restoreDesktopView();
           setErrorMessage(error.message);
         },
       });

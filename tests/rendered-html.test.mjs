@@ -148,7 +148,9 @@ test("loads arbitrary SOG sources while keeping the bundled sample as default", 
   assert.match(route, /handleInsta360Request/);
   assert.match(resolver, /access-control-allow-origin/);
   assert.match(resolver, /isPubliclyRoutableHost/);
-  assert.match(resolver, /resolveSpatialAssetFromHtml/);
+  assert.match(resolver, /resolveAssetsFromHtml/);
+  // 初期視点のもとになるカメラ情報のURLも一緒に返す。取れなくてもSOGは表示できる。
+  assert.match(resolver, /camerasUrl/);
 });
 
 test("opens a shared space straight from ?id= without touching the sample", async () => {
@@ -210,7 +212,7 @@ test("restores the linked view on desktop and spawns XR from the rig", async () 
   assert.match(viewer, /const target = orbitTargetOf\(\{/);
 
   // XRはDesktopで見えている視点から始める。開始時に控え、rigは一度identityへ。
-  assert.match(viewer, /pendingXrSpawn = currentViewPose\(\);/);
+  assert.match(viewer, /const desktopView = currentViewPose\(\);\s*\n\s*pendingXrSpawn = desktopView;/);
   // HMD poseが入ったフレームで1回だけrigを補正する。camera へは書かない。
   assert.match(viewer, /logXrSpawn\(\);\s*\n\s*applyXrSpawn\(\);/);
   assert.match(viewer, /const head = cameraEntity\.getLocalPosition\(\)/);
@@ -226,6 +228,15 @@ test("restores the linked view on desktop and spawns XR from the rig", async () 
   assert.match(pose, /y: desired\.y - rotated\.y/);
   // local-floorはXRSPACE_LOCALFLOORのまま。高さは差分で入れる。
   assert.match(viewer, /XRSPACE_LOCALFLOOR/);
+  // VR開始前のDesktop視点は別に控え、XR終了・開始失敗の両方でそこへ戻す。
+  // rigをゼロにするだけだと、WASDで入っていた移動量ごと視点を失う。
+  assert.match(viewer, /let desktopReturnView: ViewPose \| null = null;/);
+  assert.match(viewer, /desktopReturnView = desktopView;/);
+  assert.match(viewer, /const restoreDesktopView = \(\) => \{/);
+  assert.match(viewer, /desktopReturnView = null;\s*\n\s*applyViewPose\(view\);/);
+  assert.equal(viewer.match(/restoreDesktopView\(\);/g)?.length, 2);
+  assert.doesNotMatch(viewer, /setInXr\(false\);[\s\S]{0,400}rig\.setLocalPosition\(0, 0, 0\)/);
+
   // 実機の突き合わせ用ログは `?debug=1` のときだけ。既定では何も出さない。
   assert.match(viewer, /const xrDebug = new URLSearchParams\(window\.location\.search\)\.get\("debug"\) === "1"/);
   assert.match(viewer, /if \(xrDebug\) \{/);

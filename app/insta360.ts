@@ -215,16 +215,44 @@ export function selectSpatialOutput(outputs: Insta360Output[]): Insta360Output |
 }
 
 /**
- * 共有ページのHTMLからSOGのURLを取り出す。
+ * 撮影時のカメラ情報（`2_cameras.json`）を選ぶ。
+ *
+ * SOGと同じ `outputs` に並んでいて、実データでは `type: "camera"` /
+ * `fileFormat: "json"` が付く。型が省かれている配信に備えて、ファイル名でも
+ * 拾えるようにしてある。`meta.json`（SOGディレクトリ形式の索引）は別物なので
+ * 取らない。
+ */
+export function selectCamerasOutput(outputs: Insta360Output[]): Insta360Output | null {
+  const isCamerasName = (output: Insta360Output) => /(^|[/_])cameras\.json$/.test(pathOf(output.url));
+  return (
+    outputs.find((output) => output.type.toLowerCase() === "camera" && isCamerasName(output)) ??
+    outputs.find(isCamerasName) ??
+    null
+  );
+}
+
+/** 共有ページ／タスク詳細から取り出した、Viewerが使うアセット一式。 */
+export type Insta360Assets = {
+  /** PlayCanvasへ渡すSOG（署名付き）。 */
+  assetUrl: string;
+  /** 撮影時のカメラ情報。公式Viewerの初期視点はここから来る。無ければ`null`。 */
+  camerasUrl: string | null;
+};
+
+/**
+ * 共有ページのHTMLからアセットのURLを取り出す。
  *
  * `__NEXT_DATA__` に署名付きURLが最初から入っているので、まずそれを読む。
- * 構造が変わった場合に備えて、従来のURL走査も残してある。
+ * 構造が変わった場合に備えて、従来のURL走査も残してある（そちらはSOGだけ）。
  */
-export function resolveSpatialAssetFromHtml(html: string, baseUrl: string): string | null {
+export function resolveAssetsFromHtml(html: string, baseUrl: string): Insta360Assets | null {
   const outputs = findTaskOutputs(extractNextData(html));
   const selected = selectSpatialOutput(outputs);
-  if (selected) return selected.url;
-  return findSpatialAssetUrl(html, baseUrl);
+  if (selected) {
+    return { assetUrl: selected.url, camerasUrl: selectCamerasOutput(outputs)?.url ?? null };
+  }
+  const scanned = findSpatialAssetUrl(html, baseUrl);
+  return scanned ? { assetUrl: scanned, camerasUrl: null } : null;
 }
 
 /** 共有ページ自身が叩くタスク詳細APIのオリジン。共有ページの `metaData` に出てくる値。 */
@@ -256,17 +284,19 @@ export function taskDetailApiUrls(shareId: string): string[] {
 }
 
 /**
- * タスク詳細APIのレスポンス（`{ code, data: { outputs } }`）からSOGのURLを取り出す。
+ * タスク詳細APIのレスポンス（`{ code, data: { outputs } }`）からアセットのURLを取り出す。
  *
  * 中身は共有ページに埋まっている `taskDetail` と同じ形なので、出力の選別は共通の
  * 処理を使う。
  */
-export function resolveSpatialAssetFromTaskDetail(body: unknown): string | null {
+export function resolveAssetsFromTaskDetail(body: unknown): Insta360Assets | null {
   const payload = body as { code?: number; data?: unknown } | null;
   if (!payload || typeof payload !== "object") return null;
   if (typeof payload.code === "number" && payload.code !== 0) return null;
   const outputs = findTaskOutputs(payload.data ?? payload);
-  return selectSpatialOutput(outputs)?.url ?? null;
+  const selected = selectSpatialOutput(outputs);
+  if (!selected) return null;
+  return { assetUrl: selected.url, camerasUrl: selectCamerasOutput(outputs)?.url ?? null };
 }
 
 /**

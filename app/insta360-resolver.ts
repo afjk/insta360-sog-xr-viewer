@@ -10,15 +10,16 @@
  * `access-control-allow-origin: *` を返すので、ブラウザが直接取りに行ける。
  * 15MB前後のSOGをWorkerに通す必要はない。
  *
- * - `GET ?url=<共有URL>` … 解決したSOGのURLをJSONで返す
+ * - `GET ?url=<共有URL>` … 解決したSOGのURLと、あればカメラ情報のURLをJSONで返す
  */
 import {
   isPubliclyRoutableHost,
   parseInsta360ShareUrl,
-  resolveSpatialAssetFromHtml,
-  resolveSpatialAssetFromTaskDetail,
+  resolveAssetsFromHtml,
+  resolveAssetsFromTaskDetail,
   taskDetailApiUrls,
   toAbsoluteUrl,
+  type Insta360Assets,
   type Insta360Share,
 } from "./insta360";
 
@@ -63,7 +64,7 @@ const NOT_FOUND_MESSAGE =
  * `access-control-allow-origin` をInsta360のオリジンにしか返さないため、
  * ブラウザから直接は呼べない。だからこの処理はサーバー側にある。
  */
-async function resolveViaApi(share: Insta360Share): Promise<string | null> {
+async function resolveViaApi(share: Insta360Share): Promise<Insta360Assets | null> {
   for (const endpoint of taskDetailApiUrls(share.shareId)) {
     let response: Response;
     try {
@@ -73,22 +74,22 @@ async function resolveViaApi(share: Insta360Share): Promise<string | null> {
     }
     if (!response.ok) continue;
     const body = await response.json().catch(() => null);
-    const assetUrl = resolveSpatialAssetFromTaskDetail(body);
-    if (assetUrl) return assetUrl;
+    const assets = resolveAssetsFromTaskDetail(body);
+    if (assets) return assets;
   }
   return null;
 }
 
-/** 共有ページのHTMLに埋まっている `__NEXT_DATA__` からSOGのURLを取り出す。 */
-async function resolveViaSharePage(share: Insta360Share): Promise<string> {
+/** 共有ページのHTMLに埋まっている `__NEXT_DATA__` からアセットのURLを取り出す。 */
+async function resolveViaSharePage(share: Insta360Share): Promise<Insta360Assets> {
   const response = await fetch(share.shareUrl, { headers: PAGE_HEADERS, redirect: "follow" });
   if (!response.ok) {
     throw new ResolveError(502, `共有ページを取得できませんでした (HTTP ${response.status})`);
   }
   const html = await response.text();
-  const assetUrl = resolveSpatialAssetFromHtml(html, response.url || share.shareUrl);
-  if (!assetUrl) throw new ResolveError(422, NOT_FOUND_MESSAGE);
-  return assetUrl;
+  const assets = resolveAssetsFromHtml(html, response.url || share.shareUrl);
+  if (!assets) throw new ResolveError(422, NOT_FOUND_MESSAGE);
+  return assets;
 }
 
 /**
@@ -100,11 +101,20 @@ async function resolveViaSharePage(share: Insta360Share): Promise<string> {
  * 署名付きURLには有効期限（`x-oss-expires`）があるため、解決結果は保存せず
  * 毎回ここで取り直す。キャッシュするのは変換済みのSOGだけ。
  */
-async function resolveAssetUrl(share: Insta360Share): Promise<string> {
+async function resolveAssets(share: Insta360Share): Promise<Insta360Assets> {
   const fromApi = await resolveViaApi(share);
   if (fromApi) return fromApi;
   return resolveViaSharePage(share);
 }
+
+/**
+ * 公開ホスト宛のURLだけを通す。共有ページから拾ったURLをブラウザへ渡すので、
+ * ここを通らないものは返さない。
+ */
+const publicUrlOrNull = (url: string | null): string | null => {
+  const target = url ? toAbsoluteUrl(url) : null;
+  return target && isPubliclyRoutableHost(target.hostname) ? target.toString() : null;
+};
 
 export function handleInsta360Options(): Response {
   return new Response(null, { status: 204, headers: CORS_HEADERS });
@@ -120,12 +130,14 @@ export async function handleInsta360Request(request: Request): Promise<Response>
   }
 
   try {
-    const assetUrl = await resolveAssetUrl(share);
-    const target = toAbsoluteUrl(assetUrl);
-    if (!target || !isPubliclyRoutableHost(target.hostname)) {
+    const assets = await resolveAssets(share);
+    const assetUrl = publicUrlOrNull(assets.assetUrl);
+    if (!assetUrl) {
       throw new ResolveError(422, "解決したSOGのURLを取得できませんでした。");
     }
-    return jsonResponse({ shareId: share.shareId, assetUrl: target.toString() }, 200);
+    // カメラ情報は初期視点にしか使わないので、取れなくてもSOGの表示は妨げない。
+    const camerasUrl = publicUrlOrNull(assets.camerasUrl);
+    return jsonResponse({ shareId: share.shareId, assetUrl, camerasUrl }, 200);
   } catch (error) {
     const status = error instanceof ResolveError ? error.status : 502;
     const message = error instanceof Error ? error.message : "共有URLを解決できませんでした。";
