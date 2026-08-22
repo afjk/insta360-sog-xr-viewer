@@ -26,7 +26,7 @@ function sharePageHtml() {
               url: `https://p2-app.insta360.com/3dgs/${SHARE_ID}/0_3DGS.ply${SIGNED_QUERY}`,
             },
             { name: "1_3DGS.sog", type: "model", fileFormat: "sog", url: SOG_URL },
-            { name: "2_cameras.json", type: "camera", fileFormat: "json", url: CAMERAS_URL },
+            { name: "2_cameras.json", type: "model", fileFormat: "json", url: CAMERAS_URL },
           ],
         },
       },
@@ -45,7 +45,7 @@ function taskDetailBody() {
       outputs: [
         { fileFormat: "ply", type: "model", url: `https://p2-app.insta360.com/3dgs/${SHARE_ID}/0_3DGS.ply?from=api` },
         { fileFormat: "sog", type: "model", url: API_SOG_URL },
-        { fileFormat: "json", type: "camera", url: API_CAMERAS_URL },
+        { fileFormat: "json", type: "model", url: API_CAMERAS_URL },
       ],
     },
   };

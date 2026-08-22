@@ -102,7 +102,8 @@ const PLY_URL = `${ASSET_BASE}/0_3DGS.ply${SIGNED_QUERY}`;
 const OUTPUTS = [
   { name: "0_3DGS.ply", type: "model", fileFormat: "ply", url: PLY_URL },
   { name: "1_3DGS.sog", type: "model", fileFormat: "sog", url: SOG_URL },
-  { name: "2_cameras.json", type: "camera", fileFormat: "json", url: `${ASSET_BASE}/2_cameras.json${SIGNED_QUERY}` },
+  // 実データの `type` はSOGやPLYと同じ `"model"`。カメラ情報は型では見分けられない。
+  { name: "2_cameras.json", type: "model", fileFormat: "json", url: `${ASSET_BASE}/2_cameras.json${SIGNED_QUERY}` },
   { name: "3_3DGS.voxel.zip", type: "voxel", fileFormat: "zip", url: `${ASSET_BASE}/3_3DGS.voxel.zip${SIGNED_QUERY}` },
   { name: "4_effect_1.mp4", type: "video", fileFormat: "mp4", url: `${ASSET_BASE}/4_effect_1.mp4${SIGNED_QUERY}` },
 ];
@@ -209,7 +210,7 @@ test("ignores a task detail response that reports an error code", () => {
 
 test("picks up the camera poses that ship next to the SOG", () => {
   // 公式Viewerの初期視点は `2_cameras.json` から来る。SOGと同じ `outputs` に
-  // 並んでいるので、解決のついでに拾っておく。
+  // 並んでいて、`type` もSOGと同じ `"model"` なので、ファイル名で拾う。
   const outputs = findTaskOutputs(extractNextData(sharePage()));
   assert.equal(selectCamerasOutput(outputs)?.name, "2_cameras.json");
   assert.equal(

@@ -217,18 +217,12 @@ export function selectSpatialOutput(outputs: Insta360Output[]): Insta360Output |
 /**
  * 撮影時のカメラ情報（`2_cameras.json`）を選ぶ。
  *
- * SOGと同じ `outputs` に並んでいて、実データでは `type: "camera"` /
- * `fileFormat: "json"` が付く。型が省かれている配信に備えて、ファイル名でも
- * 拾えるようにしてある。`meta.json`（SOGディレクトリ形式の索引）は別物なので
- * 取らない。
+ * SOGと同じ `outputs` に並んでいる。実データでは `type` が `"model"`（SOGやPLYと
+ * 同じ）だったので、型では見分けられない。判定はファイル名で行う。
+ * `meta.json`（SOGディレクトリ形式の索引）は別物なので取らない。
  */
 export function selectCamerasOutput(outputs: Insta360Output[]): Insta360Output | null {
-  const isCamerasName = (output: Insta360Output) => /(^|[/_])cameras\.json$/.test(pathOf(output.url));
-  return (
-    outputs.find((output) => output.type.toLowerCase() === "camera" && isCamerasName(output)) ??
-    outputs.find(isCamerasName) ??
-    null
-  );
+  return outputs.find((output) => /(^|[/_])cameras\.json$/.test(pathOf(output.url))) ?? null;
 }
 
 /** 共有ページ／タスク詳細から取り出した、Viewerが使うアセット一式。 */
