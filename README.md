@@ -21,7 +21,8 @@ PlayCanvasとWebXRを使い、Insta360 Spatial CaptureのSOG形式3D Gaussian Sp
   `https://app.insta360.com/3dspace/detail/GS3DG...`）を貼り付けます。解決には
   サーバー側のエンドポイントが必要です。下記を参照してください。
 - **`?id=` 付きのViewer URL**: 一度開いた空間はリンクとして配れます。
-  [空間を別の端末へ渡す](#空間を別の端末へ渡す)を参照してください。
+  [空間を別の端末へ渡す](#空間を別の端末へ渡す)を参照してください。視点ごと渡したいときは
+  [視点ごと渡す](#視点ごと渡すview)を参照してください。
 
 読み込んだ空間はDesktopでもWebXRでも閲覧でき、「サンプルに戻す」でいつでも元に戻せます。
 
@@ -46,6 +47,79 @@ localhostでも、開いているのと同じ配信先のリンクになりま�
 
 `id` の形が合わない場合はネットワークへ出さず、通常どおりサンプルを表示します。実装は
 `app/permalink.ts` にまとまっています。
+
+### 視点ごと渡す（`view=`）
+
+`?id=` だけのリンクはその空間の既定視点で開きます。**いま見えている場所と向き**ごと渡したい
+ときは、画面右下の「この視点のリンクをコピー」を使います。
+
+```
+https://afjk.github.io/insta360-sog-xr-viewer/?id=GS3DG…&view=1_-1.234_1.62_3.5_137.5_-4.58_2.8
+```
+
+`view=` は版数と6つの数値です。区切りの `_` は `URLSearchParams` がエンコードしない文字なので、
+リンクはそのまま読める長さに収まります。
+
+| 位置 | 値 | 内容 |
+| --- | --- | --- |
+| 1 | `1` | フォーマットの版数 |
+| 2–4 | `x` / `y` / `z` | world空間の視点（eye）の位置。m、小数点以下3桁 |
+| 5 | `yaw` | 水平向き。度、`-180`〜`180`。PlayCanvasのY軸オイラー角と同じ符号 |
+| 6 | `pitch` | 見下ろし角。度、正で見下ろし。Desktop表示にだけ使う |
+| 7 | `distance` | Orbitの回転半径。m |
+
+Viewer内部のカメラは `desktopTarget`（rig座標のOrbit中心）・`yaw`・`pitch`・`distance`・rigの
+位置に分かれていて、WASDでrigごと動いたあとは同じ `desktopTarget` でも別の場所を指します。
+リンクに載せるときはこれをworld空間のeyeへ畳んでから書き出すので、**panしたあとも、WASDで
+移動したあとも、実際に見えている位置**が保存されます。復元側はrigを原点へ戻し、eyeと
+`yaw` / `pitch` / `distance` から逆にOrbitの中心を割り出します。
+
+載るのはカメラの姿勢だけです。署名付きSOGのURLや認証情報は `?id=` のときと同様に入りません。
+数値が壊れている・桁が合わない・値域を外れている場合はその視点を捨て、通常の既定視点で開きます
+（空間そのものは開けます）。
+
+### Quest / WebXRでの初期視点
+
+視点リンクはDesktopだけのものではありません。同じURLをQuestで開いて「VRを開始」すると、
+**Desktopで指定したのと同じ場所・同じ水平向き**からVRが始まります。
+
+WebXRではXRセッション中のカメラのposition / rotationがHMDのtracking poseで毎フレーム
+上書きされるため、カメラへ直接視点を書いても消えます。動かせるのは親の `rig` だけなので、
+
+```
+rig * HMD pose = 目的の視点
+```
+
+を満たす `rig` を解いて入れます（`app/view-pose.ts` の `xrRigOffset`）。
+
+1. `xr.start(...)` の直前に、いまDesktopに見えている視点を控える
+2. rigは一度identityへ戻す
+3. XRセッション開始後、**最初にHMDのposeが入ったフレーム**でrigを1回だけ補正する
+   （PlayCanvasはviewer poseを取れなかったフレームでは `app.update` ごと飛ばすので、
+   `app.on("update")` が呼ばれた時点でカメラには有効なposeが入っています）
+4. 補正は水平回転 `yawOffset = desiredYaw - currentHeadYaw` をrigのY回転に入れ、
+   rigの位置は `desiredPosition - R * currentHeadPosition` にする
+
+`XRSPACE_LOCALFLOOR` のposeには、ユーザーの実際の頭の高さとroom-space原点からのずれが
+すでに入っています。そのため `rig.position = desiredPosition` のような単純代入はしません。
+高さも差分（`desiredEyeY - currentHeadY`）で入れるので、Desktopで目線1.6mの視点を指定した
+リンクは、Questでもほぼ同じ高さから始まります。その後の実際の頭の上下移動は、通常どおり
+WebXRのtrackingがそのまま反映します。
+
+合わせるのは**位置と水平yawだけ**です。VRではユーザー本人が頭を上下・左右に傾けているので、
+保存したpitch / rollでHMDの姿勢を上書きすることはありません。補正は1回きりなので、スティックの
+移動・旋回といった既存のlocomotionはそのまま動きます。VRを抜けて入り直したときも同じ規則で
+spawnします。
+
+### 初期視点の優先順位
+
+DesktopとQuestで同じ規則を使います。
+
+1. URLに `view=` がある … ユーザーが指定した視点
+2. Insta360共有の公式Home Viewが取れる … Insta360公式の初期視点
+   （`2_cameras.json` を使うこの経路は別実装で、`SogViewer.tsx` の `initialViewFor` に
+   差し込み口だけ用意してあります）
+3. どちらも無い … これまでどおり、読み込んだ空間の広がりから決める `frameBounds()`
 
 ### Insta360共有URLの解決について
 

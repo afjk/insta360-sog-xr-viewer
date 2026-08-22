@@ -170,9 +170,9 @@ test("opens a shared space straight from ?id= without touching the sample", asyn
   assert.match(viewer, /shareId = share\.shareId/);
 
   // 成功したロードのたびにアドレスバーを合わせる。Insta360由来でなければ id を消す。
-  assert.match(viewer, /const next = shareId \? permalinkFor\(href, shareId\) : hrefWithoutShareId\(href\)/);
+  assert.match(viewer, /const next = shareId \? permalinkFor\(href, shareId, pose\) : hrefWithoutShareId\(href\)/);
   assert.match(viewer, /window\.history\.replaceState\(null, "", next\)/);
-  assert.match(viewer, /syncPermalink\(next\.shareId\)/);
+  assert.match(viewer, /syncPermalink\(next\.shareId, initialView\)/);
   // 署名付きURLはアドレスバーへ出さない。載せるのは共有IDだけ。
   assert.doesNotMatch(viewer, /replaceState\([^)]*assetUrl/);
 
@@ -180,12 +180,52 @@ test("opens a shared space straight from ?id= without touching the sample", asyn
   assert.match(viewer, /return `share:\$\{share\.shareId\}`/);
   assert.match(viewer, /if \(key && \(key === loadingKey \|\| key === shownKey\)\)/);
 
-  // 共有由来のときだけ「この空間のリンクをコピー」を出す。
+  // 共有由来のときだけリンクのコピーを出す。空間そのものと、いまの視点の2種類。
   assert.match(viewer, /source\.shareId && \(/);
   assert.match(viewer, /この空間のリンクをコピー/);
+  assert.match(viewer, /この視点のリンクをコピー/);
   assert.match(viewer, /navigator\.clipboard\.writeText\(permalink\)/);
-  assert.match(viewer, /permalinkFor\(window\.location\.href, source\.shareId\)/);
+  assert.match(viewer, /permalinkFor\(window\.location\.href, shareId, pose\)/);
   assert.match(viewer, /✓ コピーしました/);
+});
+
+test("restores the linked view on desktop and spawns XR from the rig", async () => {
+  const [viewer, pose] = await Promise.all([
+    readFile(new URL("../app/SogViewer.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/view-pose.ts", import.meta.url), "utf8"),
+  ]);
+
+  // 初期視点の優先順位は `view=` → 公式Home View → bounds。Desktopもここを通る。
+  assert.match(viewer, /const initialView = initialViewFor\(next\.shareId\)/);
+  assert.match(viewer, /if \(initialView\) applyViewPose\(initialView\);\s*\n\s*else frameBounds\(framedBounds\);/);
+  // `view=` は共有IDが一致する空間にだけ効く。別の空間へ持ち越さない。
+  assert.match(viewer, /if \(readShareId\(href\) !== shareId\) return null;/);
+  assert.match(viewer, /return readViewPose\(href\);/);
+
+  // リンクに載せるのはworld空間の姿勢。rig移動やpanのあとでも同じ値になる。
+  assert.match(viewer, /const eye = cameraEntity\.getPosition\(\)/);
+  assert.match(viewer, /yaw: yawDegreesFromBasis\(forward, cameraEntity\.up\)/);
+  assert.match(viewer, /pitch: pitchDegreesFromForward\(forward\)/);
+  // 復元はrigを原点へ戻し、eyeから注視点を割り出す。
+  assert.match(viewer, /const target = orbitTargetOf\(\{/);
+
+  // XRはDesktopで見えている視点から始める。開始時に控え、rigは一度identityへ。
+  assert.match(viewer, /pendingXrSpawn = currentViewPose\(\);/);
+  // HMD poseが入ったフレームで1回だけrigを補正する。camera へは書かない。
+  assert.match(viewer, /if \(xr\.active\) \{\s*\n\s*applyXrSpawn\(\);/);
+  assert.match(viewer, /const head = cameraEntity\.getLocalPosition\(\)/);
+  assert.match(viewer, /const rigPose = xrRigOffset\(desired, \{/);
+  assert.match(viewer, /rig\.setLocalPosition\(rigPose\.x, rigPose\.y, rigPose\.z\)/);
+  assert.match(viewer, /rig\.setLocalEulerAngles\(0, rigPose\.yaw, 0\)/);
+  assert.match(viewer, /pendingXrSpawn = null;/);
+  // XR中の姿勢はXRセッションのものだけ。保存poseをcameraへ直接書かない。
+  assert.doesNotMatch(viewer, /cameraEntity\.setPosition\(/);
+  assert.doesNotMatch(viewer, /cameraEntity\.setRotation\(/);
+  // 合わせるのは水平yawだけ。pitch / roll はHMDのまま。
+  assert.match(pose, /const yaw = normalizeYawDegrees\(desired\.yaw - head\.yaw\)/);
+  assert.match(pose, /y: desired\.y - rotated\.y/);
+  // local-floorはXRSPACE_LOCALFLOORのまま。高さは差分で入れる。
+  assert.match(viewer, /XRSPACE_LOCALFLOOR/);
 });
 
 test("builds and deploys a repository-relative GitHub Pages site", async () => {
