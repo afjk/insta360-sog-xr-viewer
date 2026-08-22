@@ -30,6 +30,10 @@ canvas {
 
 .viewer-shell {
   position: relative;
+  /* 視点操作のドラッグが重なったUIの文字を選択してしまわないようにする。
+     入力欄とダイアログの本文だけは選択できるよう個別に戻す。 */
+  -webkit-user-select: none;
+  user-select: none;
   width: 100dvw;
   height: 100dvh;
   min-height: 560px;
@@ -74,6 +78,19 @@ canvas {
 .error-card {
   position: absolute;
   z-index: 2;
+}
+
+/* 表示するだけのレイヤーは視点操作を遮らない。押せるものだけ拾い直す。 */
+.topbar,
+.viewer-actions,
+.footer-bar,
+.loading-card,
+.error-card {
+  pointer-events: none;
+}
+
+.viewer-actions button {
+  pointer-events: auto;
 }
 
 
@@ -474,6 +491,9 @@ canvas {
 
 .quality-dialog {
   position: relative;
+  /* ダイアログの中は読ませる場所なので、選択できるままにしておく。 */
+  -webkit-user-select: text;
+  user-select: text;
   width: min(620px, calc(100vw - 36px));
   padding: 30px;
   border: 1px solid rgba(110, 231, 227, 0.24);
