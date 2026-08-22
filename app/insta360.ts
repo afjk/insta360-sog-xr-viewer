@@ -268,3 +268,26 @@ export function resolveSpatialAssetFromTaskDetail(body: unknown): string | null 
   const outputs = findTaskOutputs(payload.data ?? payload);
   return selectSpatialOutput(outputs)?.url ?? null;
 }
+
+/**
+ * 共有IDの形。実データは `GS3D` + リージョン1文字 + 32桁の16進で、
+ * 共有ページのスクリプトも5文字目でリージョンを判定している。
+ *
+ * Viewerのパーマリンク (`?id=`) は外から任意の文字列が入ってくるので、
+ * ネットワークへ出す前にこの形で弾く。共有URLを貼られた場合の
+ * `parseInsta360ShareUrl` より厳しいが、あちらは入力がInsta360のURLである
+ * ことが既に分かっている。
+ */
+const SHARE_ID_PATTERN = /^GS3D[A-Za-z][0-9a-f]{32}$/i;
+
+/** Insta360 Spatial Captureの共有IDとして扱える文字列か。 */
+export function isInsta360ShareId(value: string): boolean {
+  return SHARE_ID_PATTERN.test(value.trim());
+}
+
+/** 共有IDから共有ページのURLを組み立てる。IDの形が違えばnull。 */
+export function shareUrlFromShareId(value: string): string | null {
+  const shareId = value.trim();
+  if (!isInsta360ShareId(shareId)) return null;
+  return `https://app.insta360.com/3dspace/detail/${shareId}`;
+}

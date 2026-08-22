@@ -20,8 +20,32 @@ PlayCanvasとWebXRを使い、Insta360 Spatial CaptureのSOG形式3D Gaussian Sp
 - **Insta360共有URL**: Spatial Captureの共有ページURL（例:
   `https://app.insta360.com/3dspace/detail/GS3DG...`）を貼り付けます。解決には
   サーバー側のエンドポイントが必要です。下記を参照してください。
+- **`?id=` 付きのViewer URL**: 一度開いた空間はリンクとして配れます。
+  [空間を別の端末へ渡す](#空間を別の端末へ渡す)を参照してください。
 
 読み込んだ空間はDesktopでもWebXRでも閲覧でき、「サンプルに戻す」でいつでも元に戻せます。
+
+### 空間を別の端末へ渡す
+
+Insta360共有URLから読み込むと、アドレスバーが自動でViewer専用のリンクになります。
+
+```
+https://afjk.github.io/insta360-sog-xr-viewer/?id=GS3DGbfd0ddd0dd4a47ccba4d3d2c2eed8a4d
+```
+
+このURLをQuestやPICOのブラウザで開くと、**サンプルを経由せず**その空間だけを読み込みます。
+画面右下の「この空間のリンクをコピー」で同じURLをクリップボードへ入れられます。
+
+載せるのは共有ID (`GS3DG…`) だけです。解決した署名付きSOGのURLには有効期限と
+`x-oss-signature` が付いているので、アドレスバーにも共有リンクにも出しません。開くたびに
+resolverが取り直します。
+
+URLの組み立ては `URL` / `URLSearchParams` で行うので、GitHub Pagesのサブパス配信でも
+localhostでも、開いているのと同じ配信先のリンクになります。サンプル・ローカルファイル・
+`.sog` の直接URLへ切り替えると、古い `?id=` は消えます。
+
+`id` の形が合わない場合はネットワークへ出さず、通常どおりサンプルを表示します。実装は
+`app/permalink.ts` にまとまっています。
 
 ### Insta360共有URLの解決について
 
