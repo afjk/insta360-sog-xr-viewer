@@ -20,9 +20,11 @@ import {
 import {
   isSpatialAssetUrl,
   parseInsta360ShareUrl,
+  shareUrlFromShareId,
   toAbsoluteUrl,
 } from "./insta360";
 import { resolverConfig } from "./resolver-config";
+import { hrefWithoutShareId, permalinkFor, readShareId } from "./permalink";
 import { optimizationUnsupportedReason } from "./sog-image";
 import {
   DEFAULT_TARGET_SPLATS,
@@ -38,12 +40,15 @@ import { readCachedOptimization, writeCachedOptimization } from "./sog-cache";
 type ViewerStatus = "loading" | "ready" | "error";
 type VrVariant = "original" | "optimized";
 type SourceKind = "sample" | "url" | "file";
-type ViewerSource = { kind: SourceKind; label: string };
+// shareIdはInsta360共有由来のときだけ入る。「この空間のリンクをコピー」の
+// 出し分けは、ラベル文字列を読み直すのではなくこれで判断する。
+type ViewerSource = { kind: SourceKind; label: string; shareId?: string };
 type LoadRequest = { kind: "url"; value: string } | { kind: "file"; file: File };
 type Bounds = { min: Vec3; max: Vec3 };
 type OptimizedInfo = { splats: number; bytes: number; fromCache: boolean; targetSplats: number };
 
 const SAMPLE_URL = "capture.sog";
+const SAMPLE_KEY = "sample";
 const SAMPLE_LABEL = "サンプル空間 capture.sog";
 // Percentile bounds (2–98%) decoded from capture.sog. A handful of distant
 // outliers in the raw bounds are intentionally ignored when placing the room.
@@ -174,6 +179,11 @@ export function SogViewer() {
   const [source, setSource] = useState<ViewerSource>({ kind: "sample", label: SAMPLE_LABEL });
   const [openOpen, setOpenOpen] = useState(false);
   const [openInput, setOpenInput] = useState("");
+  // 読み込み中の対象名。表示中の空間 (`source`) はロードが終わってから
+  // 差し替わるので、その間の見出しはこちらを使う。
+  const [pendingLabel, setPendingLabel] = useState("");
+  const [copyState, setCopyState] = useState<"idle" | "done" | "error">("idle");
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [sourceStage, setSourceStage] = useState("");
   const [sourceProgress, setSourceProgress] = useState(0);
   const [sourceError, setSourceError] = useState("");
@@ -369,16 +379,25 @@ export function SogViewer() {
       return new Blob(chunks as BlobPart[]).arrayBuffer();
     };
 
+    /**
+     * アドレスバーを表示中の空間に合わせる。
+     *
+     * Insta360由来なら共有IDだけを載せ、それ以外なら残っている `id` を落とす。
+     * 署名付きURLはここには出さない。ページ遷移もしないので、
+     * `history.replaceState` で書き換えるだけ。
+     */
+    const syncPermalink = (shareId: string | undefined) => {
+      const href = window.location.href;
+      const next = shareId ? permalinkFor(href, shareId) : hrefWithoutShareId(href);
+      if (next && next !== href) window.history.replaceState(null, "", next);
+    };
+
     /** Original SOGを差し替える。VR最適化済みの結果は入力が変わるので捨てる。 */
-    const showOriginal = async (
-      label: string,
-      buffer: ArrayBuffer,
-      kind: SourceKind,
-      isSample: boolean,
-    ) => {
+    const showOriginal = async (next: ViewerSource, buffer: ArrayBuffer) => {
+      const isSample = next.kind === "sample";
       const hash = typeof crypto?.subtle === "undefined" ? null : await sha256Hex(buffer);
       const blob = new Blob([buffer]);
-      const loaded = await loadSplatAsset(label, blob, "space.sog");
+      const loaded = await loadSplatAsset(next.label, blob, "space.sog");
       const bounds = boundsFromResource(loaded.asset.resource) ?? { min: CAPTURE_MIN, max: CAPTURE_MAX };
       framedBounds = isSample ? { min: CAPTURE_MIN, max: CAPTURE_MAX } : bounds;
       applyPlacement(framedBounds);
@@ -389,7 +408,8 @@ export function SogViewer() {
       releaseAsset(previous);
       releaseOptimized();
       setOriginalSplats(splatCountOf(loaded.asset.resource));
-      setSource({ kind, label });
+      setSource(next);
+      syncPermalink(next.shareId);
       setStatus("ready");
     };
 
@@ -604,19 +624,61 @@ export function SogViewer() {
       return payload.assetUrl;
     };
 
-    const loadSource = async (request: LoadRequest) => {
+    /**
+     * 同じ空間を二重に読み込まないための鍵。
+     *
+     * 共有IDやSOGのURLが同じなら、解決もダウンロードもデコードもやり直す
+     * 必要がない。ファイルは同じ名前でも中身が違いうるので鍵を作らない
+     * （毎回読み直す）。
+     */
+    const sourceKeyOf = (request: LoadRequest): string => {
+      if (request.kind === "file") return "";
+      const input = request.value.trim();
+      const share = parseInsta360ShareUrl(input);
+      if (share) return `share:${share.shareId}`;
+      const direct = isSpatialAssetUrl(input) ? toAbsoluteUrl(input) : null;
+      return direct ? `sog:${direct.toString()}` : "";
+    };
+    // 表示中／読み込み中の鍵。effectの再実行や同じURLの再入力を弾く。
+    let shownKey = "";
+    let loadingKey = "";
+
+    const loadSource = async (request: LoadRequest, initial = false) => {
       if (disposed) return;
+
+      const key = sourceKeyOf(request);
+      if (key && (key === loadingKey || key === shownKey)) {
+        // すでに出ている／取りに行っている空間。何もせずダイアログだけ畳む。
+        setSourceError("");
+        setOpenOpen(false);
+        return;
+      }
+
       loadToken += 1;
       const token = loadToken;
+      loadingKey = key;
       setSourceError("");
+      // 初回はページ全体のローディングカードが出ているので、そちらへ進捗を送る。
+      const reportProgress = initial ? setProgress : setSourceProgress;
+      const reportFailure = (error: unknown) => {
+        const message = assetErrorMessage(error);
+        if (initial) {
+          setErrorMessage(message);
+          setStatus("error");
+        } else {
+          setSourceError(message);
+        }
+      };
 
       let label = "";
+      let shareId: string | undefined;
       let fetchUrl = "";
       let file: File | null = null;
 
       if (request.kind === "file") {
         if (!/\.sog$/i.test(request.file.name)) {
           setSourceError("SOGファイル (.sog) を選択してください。");
+          loadingKey = "";
           return;
         }
         file = request.file;
@@ -628,18 +690,23 @@ export function SogViewer() {
         if (share) {
           const resolver = resolverConfig();
           if (!resolver.available) {
-            setSourceError(resolver.reason);
+            reportFailure(new Error(resolver.reason));
+            loadingKey = "";
             return;
           }
+          shareId = share.shareId;
           label = `Insta360共有 ${share.shareId}`;
+          setPendingLabel(label);
           setSourceStage("共有URLを解決中");
-          setSourceProgress(-1);
+          reportProgress(-1);
           try {
             fetchUrl = await resolveShare(share.shareUrl);
           } catch (error) {
             if (disposed || token !== loadToken) return;
             setSourceStage("");
-            setSourceError(assetErrorMessage(error));
+            setPendingLabel("");
+            loadingKey = "";
+            reportFailure(error);
             return;
           }
         } else if (direct) {
@@ -647,29 +714,34 @@ export function SogViewer() {
           label = direct.pathname.split("/").pop() || "space.sog";
         } else {
           setSourceError("Insta360の共有URL、または .sog のURLを入力してください。");
+          loadingKey = "";
           return;
         }
       }
 
+      setPendingLabel(label);
       setSourceStage(`${label} を読み込み中`);
-      setSourceProgress(0);
+      reportProgress(0);
       try {
-        const buffer = file
-          ? await file.arrayBuffer()
-          : await downloadSog(fetchUrl, setSourceProgress);
+        const buffer = file ? await file.arrayBuffer() : await downloadSog(fetchUrl, reportProgress);
         if (disposed || token !== loadToken) return;
         setSourceStage(`${label} を展開中`);
-        setSourceProgress(-1);
-        await showOriginal(label, buffer, request.kind === "file" ? "file" : "url", false);
+        reportProgress(-1);
+        await showOriginal({ kind: request.kind === "file" ? "file" : "url", label, shareId }, buffer);
         if (disposed || token !== loadToken) return;
+        shownKey = key;
         setSourceStage("");
-        setSourceProgress(100);
+        setPendingLabel("");
+        reportProgress(100);
         setErrorMessage("");
         setOpenOpen(false);
       } catch (error) {
         if (disposed || token !== loadToken) return;
         setSourceStage("");
-        setSourceError(assetErrorMessage(error));
+        setPendingLabel("");
+        reportFailure(error);
+      } finally {
+        if (loadingKey === key) loadingKey = "";
       }
     };
     loadSourceRef.current = (request) => {
@@ -679,22 +751,27 @@ export function SogViewer() {
     const loadSample = async (initial: boolean) => {
       loadToken += 1;
       const token = loadToken;
+      loadingKey = SAMPLE_KEY;
       setSourceError("");
       if (!initial) {
+        setPendingLabel(SAMPLE_LABEL);
         setSourceStage(`${SAMPLE_LABEL} を読み込み中`);
         setSourceProgress(0);
       }
       try {
         const buffer = await downloadSog(SAMPLE_URL, initial ? setProgress : setSourceProgress);
         if (disposed || token !== loadToken) return;
-        await showOriginal(SAMPLE_LABEL, buffer, "sample", true);
+        await showOriginal({ kind: "sample", label: SAMPLE_LABEL }, buffer);
         if (disposed || token !== loadToken) return;
+        shownKey = SAMPLE_KEY;
+        setPendingLabel("");
         setProgress(100);
         setSourceStage("");
         setSourceProgress(100);
       } catch (error) {
         if (disposed || token !== loadToken) return;
         setSourceStage("");
+        setPendingLabel("");
         const message = assetErrorMessage(error);
         if (initial) {
           setErrorMessage(message);
@@ -702,6 +779,8 @@ export function SogViewer() {
         } else {
           setSourceError(message);
         }
+      } finally {
+        if (loadingKey === SAMPLE_KEY) loadingKey = "";
       }
     };
     restoreSampleRef.current = () => {
@@ -941,7 +1020,12 @@ export function SogViewer() {
 
     resize();
     app.start();
-    void loadSample(true);
+    // `?id=` 付きで開かれたら、サンプルには一切触れずにその空間だけを読む。
+    // サンプル→本番の二重ロード（fetch・decode・GPU転送）を起こさないため、
+    // ここで分岐してどちらか一方だけを呼ぶ。
+    const deepLinkShareUrl = shareUrlFromShareId(readShareId(window.location.href) ?? "");
+    if (deepLinkShareUrl) void loadSource({ kind: "url", value: deepLinkShareUrl }, true);
+    else void loadSample(true);
     setXrAvailable(xr.isAvailable(XRTYPE_VR));
 
     return () => {
@@ -977,6 +1061,31 @@ export function SogViewer() {
   targetSplatsRef.current = targetSplats;
   vrVariantRef.current = vrVariant;
 
+  useEffect(() => () => {
+    if (copyTimerRef.current !== null) clearTimeout(copyTimerRef.current);
+  }, []);
+
+  /**
+   * 表示中の空間のViewerリンクをクリップボードへ入れる。
+   *
+   * 共有IDから今のorigin/pathnameで組み立てるので、GitHub Pagesでも
+   * localhostでも、開いているのと同じ配信先のURLになる。
+   */
+  const copyPermalink = async () => {
+    const permalink = source.shareId ? permalinkFor(window.location.href, source.shareId) : null;
+    if (!permalink) return;
+    if (copyTimerRef.current !== null) clearTimeout(copyTimerRef.current);
+    try {
+      await navigator.clipboard.writeText(permalink);
+      setCopyState("done");
+    } catch {
+      // 非セキュアコンテキストなどでClipboard APIが使えない場合。
+      // 同じURLはアドレスバーに出ているので、そちらを案内する。
+      setCopyState("error");
+    }
+    copyTimerRef.current = setTimeout(() => setCopyState("idle"), 2400);
+  };
+
   const isSample = source.kind === "sample";
   const sourceBusy = sourceStage !== "";
   const optimizing = optimizeStage !== "";
@@ -1004,9 +1113,9 @@ export function SogViewer() {
           <span>SOG XR VIEWER</span>
         </div>
         <div className="topbar-meta">
-          <div className={`source-pill${isSample ? " is-sample" : ""}`}>
-            {isSample ? "SAMPLE" : "OPENED"}
-            <span className="source-name">{source.label}</span>
+          <div className={`source-pill${!pendingLabel && isSample ? " is-sample" : ""}`}>
+            {pendingLabel ? "OPENING" : isSample ? "SAMPLE" : "OPENED"}
+            <span className="source-name">{pendingLabel || source.label}</span>
           </div>
           <div className="format-pill">
             <span className="live-dot" />
@@ -1054,6 +1163,21 @@ export function SogViewer() {
           <span className="vr-icon" aria-hidden="true">◫</span>
           VRを開始
         </button>
+        {source.shareId && (
+          <button
+            id="copy-permalink"
+            className="copy-link-button"
+            type="button"
+            aria-label="この空間のリンクをコピー"
+            onClick={() => void copyPermalink()}
+          >
+            {copyState === "done"
+              ? "✓ コピーしました"
+              : copyState === "error"
+                ? "コピーできませんでした（アドレスバーのURLをお使いください）"
+                : "この空間のリンクをコピー"}
+          </button>
+        )}
         <p className="control-hint">
           <span>左スティック</span> 移動&nbsp;&nbsp;·&nbsp;&nbsp;<span>右スティック</span> 旋回
           &nbsp;&nbsp;·&nbsp;&nbsp;<span>Grip＋右スティック</span> 視線方向に移動

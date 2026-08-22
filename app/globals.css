@@ -252,6 +252,33 @@ canvas {
   font-size: 18px;
 }
 
+/* Insta360由来の空間のときだけ出る、Viewerリンクのコピー。
+   主操作の下に置くので、既存ボタンより一段控えめにする。 */
+.copy-link-button {
+  padding: 10px 16px;
+  border: 1px solid rgba(110, 231, 227, 0.28);
+  border-radius: 4px;
+  background: rgba(8, 16, 20, 0.66);
+  color: #b6dedd;
+  font: 500 11px var(--font-geist-mono), monospace;
+  letter-spacing: 0.08em;
+  text-align: right;
+  cursor: pointer;
+  backdrop-filter: blur(14px);
+  transition: border-color 160ms ease, color 160ms ease, background 160ms ease;
+}
+
+.copy-link-button:hover {
+  border-color: rgba(110, 231, 227, 0.55);
+  background: rgba(12, 24, 28, 0.82);
+  color: #d8f3f2;
+}
+
+.copy-link-button:focus-visible {
+  outline: 2px solid white;
+  outline-offset: 4px;
+}
+
 .control-hint {
   margin: 0;
   color: #73808a;

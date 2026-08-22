@@ -118,7 +118,7 @@ test("loads arbitrary SOG sources while keeping the bundled sample as default", 
 
   // The bundled sample stays the auto-loaded default.
   assert.match(viewer, /useState<ViewerSource>\(\{ kind: "sample", label: SAMPLE_LABEL \}\)/);
-  assert.match(viewer, /void loadSample\(true\)/);
+  assert.match(viewer, /else void loadSample\(true\);/);
 
   // One "空間を開く" panel offers URL, drag & drop and the file picker.
   assert.match(viewer, /空間を開く/);
@@ -149,6 +149,43 @@ test("loads arbitrary SOG sources while keeping the bundled sample as default", 
   assert.match(resolver, /access-control-allow-origin/);
   assert.match(resolver, /isPubliclyRoutableHost/);
   assert.match(resolver, /resolveSpatialAssetFromHtml/);
+});
+
+test("opens a shared space straight from ?id= without touching the sample", async () => {
+  const viewer = await readFile(new URL("../app/SogViewer.tsx", import.meta.url), "utf8");
+
+  // 起動時の分岐はどちらか一方だけを呼ぶ。`?id=` のときにサンプルを読むと
+  // fetch・decode・GPU転送が二重に走るので、そこを固定しておく。
+  assert.match(viewer, /const deepLinkShareUrl = shareUrlFromShareId\(readShareId\(window\.location\.href\) \?\? ""\)/);
+  assert.match(viewer, /if \(deepLinkShareUrl\) void loadSource\(\{ kind: "url", value: deepLinkShareUrl \}, true\);/);
+  assert.match(viewer, /else void loadSample\(true\);/);
+  // サンプルの取得はこの1箇所だけ。深いリンク経路からは辿り着けない。
+  assert.equal(viewer.match(/downloadSog\(SAMPLE_URL/g)?.length, 1);
+
+  // 共有IDは表示中のソースに残し、ラベルの読み直しでは判断しない。
+  assert.match(viewer, /type ViewerSource = \{ kind: SourceKind; label: string; shareId\?: string \}/);
+  assert.match(viewer, /showOriginal\(\{ kind: request\.kind === "file" \? "file" : "url", label, shareId \}, buffer\)/);
+  // サンプルは共有IDを持たない。ローカルファイルと直接URLも shareId が undefined のまま。
+  assert.match(viewer, /showOriginal\(\{ kind: "sample", label: SAMPLE_LABEL \}, buffer\)/);
+  assert.match(viewer, /shareId = share\.shareId/);
+
+  // 成功したロードのたびにアドレスバーを合わせる。Insta360由来でなければ id を消す。
+  assert.match(viewer, /const next = shareId \? permalinkFor\(href, shareId\) : hrefWithoutShareId\(href\)/);
+  assert.match(viewer, /window\.history\.replaceState\(null, "", next\)/);
+  assert.match(viewer, /syncPermalink\(next\.shareId\)/);
+  // 署名付きURLはアドレスバーへ出さない。載せるのは共有IDだけ。
+  assert.doesNotMatch(viewer, /replaceState\([^)]*assetUrl/);
+
+  // 同じ空間を二度読まない。共有IDとSOGのURLで鍵を作り、表示中／読み込み中を見る。
+  assert.match(viewer, /return `share:\$\{share\.shareId\}`/);
+  assert.match(viewer, /if \(key && \(key === loadingKey \|\| key === shownKey\)\)/);
+
+  // 共有由来のときだけ「この空間のリンクをコピー」を出す。
+  assert.match(viewer, /source\.shareId && \(/);
+  assert.match(viewer, /この空間のリンクをコピー/);
+  assert.match(viewer, /navigator\.clipboard\.writeText\(permalink\)/);
+  assert.match(viewer, /permalinkFor\(window\.location\.href, source\.shareId\)/);
+  assert.match(viewer, /✓ コピーしました/);
 });
 
 test("builds and deploys a repository-relative GitHub Pages site", async () => {
