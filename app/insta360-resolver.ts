@@ -1,13 +1,16 @@
 /**
- * Insta360共有URLをSOGに解決し、本体を中継するリクエストハンドラ。
+ * Insta360共有URLをSOGのURLへ解決するリクエストハンドラ。
  *
- * 共有ページはブラウザからのクロスオリジン取得を許可していないため、
- * この処理はサーバー側で動かす必要がある。アプリ本体のCloudflare Worker
- * (`app/api/insta360/route.ts`) と、GitHub Pages用の専用Worker
+ * 共有ページも、その裏のタスク詳細APIも、ブラウザからのクロスオリジン取得を
+ * 許可していないため、この処理はサーバー側で動かす必要がある。アプリ本体の
+ * Cloudflare Worker (`app/api/insta360/route.ts`) と、GitHub Pages用の専用Worker
  * (`resolver-worker/index.ts`) の両方から同じ実装を使う。
  *
- * - `GET ?url=<共有URL>` … 解決結果をJSONで返す
- * - `GET ?url=<共有URL>&mode=asset` … SOG本体をそのまま中継する
+ * 返すのはURLだけで、SOG本体は中継しない。解決後の署名付きURLは
+ * `access-control-allow-origin: *` を返すので、ブラウザが直接取りに行ける。
+ * 15MB前後のSOGをWorkerに通す必要はない。
+ *
+ * - `GET ?url=<共有URL>` … 解決したSOGのURLをJSONで返す
  */
 import {
   isPubliclyRoutableHost,
@@ -23,7 +26,6 @@ export const CORS_HEADERS: Record<string, string> = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, OPTIONS",
   "access-control-allow-headers": "content-type",
-  "access-control-expose-headers": "content-length, content-type",
 };
 
 const PAGE_HEADERS: Record<string, string> = {
@@ -111,7 +113,6 @@ export function handleInsta360Options(): Response {
 export async function handleInsta360Request(request: Request): Promise<Response> {
   const requestUrl = new URL(request.url);
   const input = requestUrl.searchParams.get("url") ?? "";
-  const mode = requestUrl.searchParams.get("mode") ?? "resolve";
   const share = parseInsta360ShareUrl(input);
 
   if (!share) {
@@ -124,22 +125,7 @@ export async function handleInsta360Request(request: Request): Promise<Response>
     if (!target || !isPubliclyRoutableHost(target.hostname)) {
       throw new ResolveError(422, "解決したSOGのURLを取得できませんでした。");
     }
-
-    if (mode !== "asset") {
-      return jsonResponse({ shareId: share.shareId, assetUrl: target.toString() }, 200);
-    }
-
-    const upstream = await fetch(target.toString(), { headers: { accept: "*/*" } });
-    if (!upstream.ok || !upstream.body) {
-      throw new ResolveError(502, `SOGを取得できませんでした (HTTP ${upstream.status})`);
-    }
-
-    const headers = new Headers(CORS_HEADERS);
-    headers.set("content-type", "application/octet-stream");
-    headers.set("cache-control", "public, max-age=300");
-    const length = upstream.headers.get("content-length");
-    if (length) headers.set("content-length", length);
-    return new Response(upstream.body, { status: 200, headers });
+    return jsonResponse({ shareId: share.shareId, assetUrl: target.toString() }, 200);
   } catch (error) {
     const status = error instanceof ResolveError ? error.status : 502;
     const message = error instanceof Error ? error.message : "共有URLを解決できませんでした。";

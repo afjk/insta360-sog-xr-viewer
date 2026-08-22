@@ -25,8 +25,8 @@ PlayCanvasとWebXRを使い、Insta360 Spatial CaptureのSOG形式3D Gaussian Sp
 
 ### Insta360共有URLの解決について
 
-Insta360の共有ページはブラウザからのクロスオリジン取得を許可しないため、共有URLの解決と
-SOG本体の中継はサーバー側（`GET /api/insta360`）が担当します。
+Insta360の共有ページはブラウザからのクロスオリジン取得を許可しないため、共有URLの解決だけを
+サーバー側（`GET /api/insta360`）が担当します。SOG本体は中継しません。
 
 共有ページはNext.jsで、生成済みアセットの署名付きURLが `__NEXT_DATA__` に最初から入っています。
 
@@ -67,8 +67,20 @@ IndexedDBへ載せるのは変換済みのVR向けSOGだけです。
 （詳細APIは `Origin: https://app.insta360.com` にだけCORSヘッダーを付けて応答します）。
 
 一方、**解決後の署名付きSOG URLはCORSを許可しています**（`access-control-allow-origin: *`、
-Rangeリクエストも可）。そのため署名付きURLさえ手元にあれば、resolverを経由せずに
-「`.sog` のURL」欄へ貼るだけで読み込めます。resolverを立てられない環境での抜け道になります。
+Rangeリクエストも可）。そのためresolverは解決したURLを返すだけで、ブラウザがそこから直接
+SOGを取得します。
+
+```
+ブラウザ ──共有URL──> resolver ──task/detail API──> 署名付きSOGのURL
+   │                     └──────URLを返すだけ──────┘
+   └──────────────GET──────────────> p2-app.insta360.com/…/1_3DGS.sog
+```
+
+15MB前後のSOGがWorkerを通らないので、Workerの転送量はほぼゼロで済みます。`content-length` は
+CORSセーフリストのレスポンスヘッダーなので、直接取得でも進捗表示は働きます。
+
+同じ理由で、署名付きURLさえ手元にあればresolverを経由せず「`.sog` のURL」欄へ貼るだけでも
+読み込めます。resolverを立てられない環境での抜け道になります。
 
 同じ共有ページからは `0_3DGS.ply` も取得できます。現在のビューアーはSOGのみを扱います。
 

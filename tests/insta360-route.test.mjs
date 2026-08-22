@@ -7,7 +7,6 @@ const SIGNED_QUERY = "?x-oss-date=20260822T000000Z&x-oss-expires=604800&x-oss-si
 const SOG_URL = `https://p2-app.insta360.com/3dgs/${SHARE_ID}/1_3DGS.sog${SIGNED_QUERY}`;
 const API_URL = `https://service-g.insta360.com/app-service/app/service/gs3d/task/detail?taskOrderNo=${SHARE_ID}`;
 const API_SOG_URL = `https://p2-app.insta360.com/3dgs/${SHARE_ID}/1_3DGS.sog?from=api`;
-const SOG_BYTES = new Uint8Array([0x50, 0x4b, 0x03, 0x04]);
 
 /** 実際の共有ページと同じく、署名付きURLを __NEXT_DATA__ に埋めたHTMLを作る。 */
 function sharePageHtml() {
@@ -65,12 +64,6 @@ function stubInsta360(overrides = {}) {
         new Response(sharePageHtml(), { status: 200, headers: { "content-type": "text/html" } })
       );
     }
-    if (url === SOG_URL || url === API_SOG_URL) {
-      return new Response(SOG_BYTES, {
-        status: 200,
-        headers: { "content-type": "application/zip", "content-length": String(SOG_BYTES.length) },
-      });
-    }
     return new Response("not found", { status: 404 });
   };
   return () => {
@@ -119,14 +112,16 @@ test("falls back to the share page when the task detail API fails", async () => 
   }
 });
 
-test("streams the resolved SOG with CORS headers", async () => {
-  const restore = stubInsta360();
+test("hands back the signed URL instead of proxying the SOG", async () => {
+  const seen = [];
+  const restore = stubInsta360({ record: seen });
   try {
+    // 中継していた頃の呼び方をされても、URLを返すだけで本体は取りに行かない。
     const response = await callRoute(`url=${encodeURIComponent(SHARE_URL)}&mode=asset`);
     assert.equal(response.status, 200);
-    assert.equal(response.headers.get("access-control-allow-origin"), "*");
-    assert.equal(response.headers.get("content-length"), String(SOG_BYTES.length));
-    assert.deepEqual(new Uint8Array(await response.arrayBuffer()), SOG_BYTES);
+    assert.match(response.headers.get("content-type") ?? "", /application\/json/);
+    assert.deepEqual(await response.json(), { shareId: SHARE_ID, assetUrl: API_SOG_URL });
+    assert.ok(!seen.includes(API_SOG_URL));
   } finally {
     restore();
   }
