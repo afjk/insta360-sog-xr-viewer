@@ -79,9 +79,9 @@ test("generates the VR variant in the browser instead of shipping a second SOG",
     readFile(new URL("../app/sog-image.ts", import.meta.url), "utf8"),
   ]);
 
-  // The prebuilt lightweight SOG is gone; the VR variant comes from the optimizer.
+  // capture-vr.sog stays in the repo as a reference, but the viewer no longer
+  // ships it as the VR variant — that now comes from the optimizer.
   assert.doesNotMatch(viewer, /capture-vr\.sog/);
-  await assert.rejects(readFile(new URL("../public/capture-vr.sog", import.meta.url)));
 
   // Desktop keeps the original; VR offers original or optimized.
   assert.match(viewer, /オリジナル/);

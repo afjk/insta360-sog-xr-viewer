@@ -106,8 +106,10 @@ PICO / Quest実機およびDesktop Safariでの計測は未実施です。
 ## SOG assets
 
 - `public/capture.sog`: サンプル、100万点、約15.5 MiB
+- `public/capture-vr.sog`: splat-transformが出力したVR向け軽量版、50万点、約5.9 MiB
 
-VR向けの軽量SOGは同梱せず、必要になった時点でブラウザ内で生成します。
+ビューアーが使うのは `capture.sog` だけです。`capture-vr.sog` はビューアーからは読み込まず、
+ブラウザ内で生成した軽量SOGと見比べるための参照用として残しています。
 
 ## Development
 
