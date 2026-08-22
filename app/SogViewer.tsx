@@ -559,15 +559,19 @@ export function SogViewer() {
     };
     startVrRef.current = () => startVr(vrVariantRef.current);
 
-    /** 共有URLをサーバー経由でSOGへ解決し、中継エンドポイントのURLを返す。 */
+    /**
+     * 共有URLをサーバー経由でSOGのURLへ解決する。
+     *
+     * 解決だけをサーバーに任せ、SOG本体はここから直接取りに行く。署名付きURLは
+     * `access-control-allow-origin: *` を返すので中継させる理由がない。
+     */
     const resolveShare = async (shareUrl: string) => {
       const resolver = resolverConfig();
       if (!resolver.available) throw new Error(resolver.reason);
 
-      const query = `url=${encodeURIComponent(shareUrl)}`;
       let response: Response;
       try {
-        response = await fetch(`${resolver.endpoint}?${query}`, {
+        response = await fetch(`${resolver.endpoint}?url=${encodeURIComponent(shareUrl)}`, {
           headers: { accept: "application/json" },
         });
       } catch {
@@ -579,7 +583,7 @@ export function SogViewer() {
       if (!response.ok || !payload?.assetUrl) {
         throw new Error(payload?.error ?? `共有URLを解決できませんでした (HTTP ${response.status})`);
       }
-      return `${resolver.endpoint}?mode=asset&${query}`;
+      return payload.assetUrl;
     };
 
     const loadSource = async (request: LoadRequest) => {
