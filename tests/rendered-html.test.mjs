@@ -110,9 +110,10 @@ test("generates the VR variant in the browser instead of shipping a second SOG",
 });
 
 test("loads arbitrary SOG sources while keeping the bundled sample as default", async () => {
-  const [viewer, route] = await Promise.all([
+  const [viewer, route, resolver] = await Promise.all([
     readFile(new URL("../app/SogViewer.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/api/insta360/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/insta360-resolver.ts", import.meta.url), "utf8"),
   ]);
 
   // The bundled sample stays the auto-loaded default.
@@ -142,9 +143,11 @@ test("loads arbitrary SOG sources while keeping the bundled sample as default", 
   assert.match(viewer, /parseInsta360ShareUrl/);
   assert.match(viewer, /resolverConfig\(\)/);
   assert.match(viewer, /mode=asset/);
-  assert.match(route, /export async function GET/);
-  assert.match(route, /access-control-allow-origin/);
-  assert.match(route, /isPubliclyRoutableHost/);
+  assert.match(route, /export function GET/);
+  assert.match(route, /handleInsta360Request/);
+  assert.match(resolver, /access-control-allow-origin/);
+  assert.match(resolver, /isPubliclyRoutableHost/);
+  assert.match(resolver, /resolveSpatialAssetFromHtml/);
 });
 
 test("builds and deploys a repository-relative GitHub Pages site", async () => {

@@ -17,22 +17,42 @@ PlayCanvasとWebXRを使い、Insta360 Spatial CaptureのSOG形式3D Gaussian Sp
 - **ドラッグ＆ドロップ**: `.sog` ファイルをページのどこにドロップしても読み込めます。
 - **ファイルを選択**: OSのファイル選択ダイアログからローカルの `.sog` を指定します。
 - **`.sog` のURL**: 直接ダウンロードできる `.sog` のURLを指定します（配信元がCORSを許可している必要があります）。
-- **Insta360共有URL**: 実装はありますが **実サービスでは未検証です**。下記を参照してください。
+- **Insta360共有URL**: Spatial Captureの共有ページURL（例:
+  `https://app.insta360.com/3dspace/detail/GS3DG...`）を貼り付けます。解決には
+  サーバー側のエンドポイントが必要です。下記を参照してください。
 
 読み込んだ空間はDesktopでもWebXRでも閲覧でき、「サンプルに戻す」でいつでも元に戻せます。
 
-### Insta360共有URLの解決について（実サービス未検証）
-
-**現時点でこの経路が実際のInsta360共有URLで動作することは確認できていません。**
-SOGを読み込みたい場合は、ファイルをダウンロードしてドラッグ＆ドロップしてください。
+### Insta360共有URLの解決について
 
 Insta360の共有ページはブラウザからのクロスオリジン取得を許可しないため、共有URLの解決と
-SOG本体の中継はサーバー側（`GET /api/insta360`）が担当します。現在の実装は共有ページのHTMLから
-`.sog` / `meta.json` を正規表現で探す方式ですが、実際の共有ページはSPAで、SOGのURLは初回HTMLには
-含まれず、ページ内のJavaScriptがAPIを叩いて署名付きURL（`p2-app.insta360.com/…/1_3DGS.sog?x-oss-…`）
-を取得している可能性が高いです。その場合、現在の方式では解決できません。
+SOG本体の中継はサーバー側（`GET /api/insta360`）が担当します。
 
-正しく直すには、Insta360のビューアー自身が呼んでいるAPIを特定して直接呼ぶ必要があります。
+共有ページはNext.jsで、生成済みアセットの署名付きURLが `__NEXT_DATA__` に最初から入っています。
+
+```
+props.pageProps.taskDetail.outputs
+  ├─ 0_3DGS.ply        fileFormat: "ply"
+  ├─ 1_3DGS.sog        fileFormat: "sog"   ← これを使う
+  ├─ 2_cameras.json
+  ├─ 3_3DGS.voxel.zip
+  └─ 4_effect_*.mp4
+```
+
+resolverはこのJSONを読んで `fileFormat === "sog"` のURLを返します。APIを別途叩く必要は
+ありません。`taskDetail` の位置が変わった場合に備えて、URLを持つ配列を探すフォールバックと、
+`__NEXT_DATA__` 自体が無い場合のHTML走査も残してあります。
+
+Next.jsは埋め込みJSON中の `&` を `\u0026` として書き出すため、テキストのまま正規表現で
+URLを抜くと署名クエリが壊れます。`JSON.parse` を通すことでこれを回避しています。
+
+署名付きURLには有効期限（`x-oss-expires`）があるので、解決結果は保存せず毎回取り直します。
+IndexedDBへ載せるのは変換済みのVR向けSOGだけです。
+
+> 共有ページの構造は実データで確認済みですが、**このresolverを実サービスに対して動かした
+> 検証はまだ行っていません**。ネットワーク的にInsta360へ到達できる環境での確認が残っています。
+
+同じ共有ページからは `0_3DGS.ply` も取得できます。現在のビューアーはSOGのみを扱います。
 
 #### 解決エンドポイントの配置
 
@@ -45,7 +65,19 @@ SOG本体の中継はサーバー側（`GET /api/insta360`）が担当します�
 | URL | そのオリジンの `/api/insta360` を使う（専用Workerなど） |
 
 GitHub Pagesは静的配信で `/api` を持たないため、`vite.pages.config.ts` が既定で `none` を入れます。
-専用のWorkerを用意したら、リポジトリ変数 `SOG_RESOLVER_ORIGIN` に設定すればPagesのビルドが拾います。
+
+#### GitHub Pages用のresolver Worker
+
+`resolver-worker/` に、共有URLの解決だけを行う単機能のCloudflare Workerがあります。
+解決ロジックはアプリ本体のWorkerと共有しています。
+
+```bash
+npm run resolver:dev      # ローカルで動かす
+npm run resolver:deploy   # Cloudflareへデプロイ
+```
+
+デプロイしたら、リポジトリ変数 `SOG_RESOLVER_ORIGIN` にWorkerのオリジンを設定してください。
+GitHub Pagesのビルドがそれを拾い、共有URLの入力が有効になります。
 
 共有ページからSOGのURLを探す処理は `app/insta360.ts` にまとまっています。
 

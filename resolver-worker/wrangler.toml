@@ -1,0 +1,8 @@
+# Insta360共有URLを解決するだけの単機能Worker。
+# GitHub Pages版のビューアーはここへ問い合わせる。
+name = "insta360-sog-resolver"
+main = "index.ts"
+compatibility_date = "2026-08-01"
+
+[observability]
+enabled = true

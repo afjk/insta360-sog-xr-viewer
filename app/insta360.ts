@@ -11,9 +11,6 @@ export const INSTA360_HOST_SUFFIXES = ["insta360.com", "insta360.cn", "arashivis
 /** 共有ページのHTMLから拾うアセットURLの候補パターン。 */
 const ASSET_PATTERN = /(?:https?:\/\/|\/)[^\s"'`<>\\)]+?\.(?:sog|json)(?:\?[^\s"'`<>\\)]*)?/gi;
 
-/** 解決の手掛かりとして追跡してよいJSON/APIのURLパターン。 */
-const API_PATTERN = /https?:\/\/[^\s"'`<>\\)]+/gi;
-
 export type Insta360Share = {
   shareId: string;
   shareUrl: string;
@@ -84,7 +81,7 @@ export function isSpatialAssetUrl(input: string): boolean {
  * `.sog` バンドルを優先し、無ければSOGディレクトリ形式の `meta.json` を返す。
  */
 export function findSpatialAssetUrl(text: string, baseUrl: string): string | null {
-  const unescaped = text.replace(/\\u002[fF]/g, "/").replace(/\\\//g, "/");
+  const unescaped = unescapeJsonText(text);
   const bundles: string[] = [];
   const manifests: string[] = [];
 
@@ -104,27 +101,128 @@ export function findSpatialAssetUrl(text: string, baseUrl: string): string | nul
 }
 
 /**
- * 共有ページ内で共有IDを含むAPI/JSONのURLを集める。
- * 共有ページ自体がSPAでSOGのURLを持たない場合の二段目の手掛かりに使う。
+ * JSONの中に埋まったテキストをURL抽出用にほどく。
+ *
+ * 共有ページの署名付きURLは `?a=1&b=2` のように区切りがエスケープされて
+ * いるため、`\/` だけを戻していた頃はURLが途中で切れていた。ここでは走査用の
+ * 使い捨てコピーを作るだけなので、`\uXXXX` をまとめて戻して構わない。
  */
-export function findFollowUpApiUrls(text: string, baseUrl: string, shareId: string): string[] {
-  const base = toAbsoluteUrl(baseUrl);
-  if (!base || !shareId) return [];
-  const unescaped = text.replace(/\\u002[fF]/g, "/").replace(/\\\//g, "/");
-  const found: string[] = [];
+export function unescapeJsonText(text: string): string {
+  return text
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/\\\//g, "/");
+}
 
-  for (const match of unescaped.matchAll(API_PATTERN)) {
-    let resolved: URL;
-    try {
-      resolved = new URL(match[0]);
-    } catch {
-      continue;
-    }
-    if (!isInsta360Host(resolved.hostname)) continue;
-    if (!resolved.href.includes(shareId)) continue;
-    if (!/\/api\//i.test(resolved.pathname) && !resolved.pathname.toLowerCase().endsWith(".json")) continue;
-    if (!found.includes(resolved.href)) found.push(resolved.href);
+/** 共有ページ（Next.js）が埋め込む初期データ。 */
+export function extractNextData(html: string): unknown {
+  const match = html.match(
+    /<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i,
+  );
+  if (!match) return null;
+  try {
+    return JSON.parse(match[1]);
+  } catch {
+    return null;
   }
+}
 
-  return found;
+/** `taskDetail.outputs` の1件。キー名のゆれを吸収した形。 */
+export type Insta360Output = {
+  name: string;
+  type: string;
+  fileFormat: string;
+  url: string;
+};
+
+const pickString = (record: Record<string, unknown>, keys: string[]): string => {
+  for (const key of keys) {
+    const value = record[key];
+    if (typeof value === "string" && value) return value;
+  }
+  return "";
+};
+
+const pathOf = (url: string): string => {
+  const absolute = toAbsoluteUrl(url);
+  return absolute ? absolute.pathname.toLowerCase() : url.toLowerCase();
+};
+
+const toOutput = (entry: unknown): Insta360Output | null => {
+  if (!entry || typeof entry !== "object") return null;
+  const record = entry as Record<string, unknown>;
+  const url = pickString(record, ["url", "fileUrl", "file_url", "downloadUrl", "download_url"]);
+  if (!toAbsoluteUrl(url)) return null;
+  const name = pickString(record, ["name", "fileName", "file_name"]) ||
+    pathOf(url).split("/").pop() || "";
+  const fileFormat =
+    pickString(record, ["fileFormat", "file_format", "format"]) ||
+    (name.includes(".") ? name.split(".").pop() ?? "" : "");
+  return {
+    name,
+    type: pickString(record, ["type", "fileType", "file_type"]),
+    fileFormat: fileFormat.toLowerCase(),
+    url,
+  };
+};
+
+/**
+ * 共有ページの初期データから生成済みアセットの一覧を取り出す。
+ *
+ * 素直な場所は `props.pageProps.taskDetail.outputs` だが、Next.jsのページ構造は
+ * 変わりうるので、見つからなければURLを持つオブジェクトの配列を全体から探す。
+ */
+export function findTaskOutputs(data: unknown): Insta360Output[] {
+  const documented = (data as {
+    props?: { pageProps?: { taskDetail?: { outputs?: unknown } } };
+  } | null)?.props?.pageProps?.taskDetail?.outputs;
+  const fromDocumentedPath = Array.isArray(documented)
+    ? documented.map(toOutput).filter((output): output is Insta360Output => output !== null)
+    : [];
+  if (fromDocumentedPath.length > 0) return fromDocumentedPath;
+
+  const seen = new Set<unknown>();
+  const search = (node: unknown, depth: number): Insta360Output[] => {
+    if (depth > 8 || !node || typeof node !== "object" || seen.has(node)) return [];
+    seen.add(node);
+    if (Array.isArray(node)) {
+      const outputs = node
+        .map(toOutput)
+        .filter((output): output is Insta360Output => output !== null);
+      if (outputs.length > 0) return outputs;
+      for (const item of node) {
+        const found = search(item, depth + 1);
+        if (found.length > 0) return found;
+      }
+      return [];
+    }
+    for (const value of Object.values(node as Record<string, unknown>)) {
+      const found = search(value, depth + 1);
+      if (found.length > 0) return found;
+    }
+    return [];
+  };
+  return search(data, 0);
+}
+
+/** PlayCanvasがそのまま読めるアセットを選ぶ。SOGバンドルを優先する。 */
+export function selectSpatialOutput(outputs: Insta360Output[]): Insta360Output | null {
+  return (
+    outputs.find((output) => output.fileFormat === "sog") ??
+    outputs.find((output) => pathOf(output.url).endsWith(".sog")) ??
+    outputs.find((output) => pathOf(output.url).endsWith("/meta.json")) ??
+    null
+  );
+}
+
+/**
+ * 共有ページのHTMLからSOGのURLを取り出す。
+ *
+ * `__NEXT_DATA__` に署名付きURLが最初から入っているので、まずそれを読む。
+ * 構造が変わった場合に備えて、従来のURL走査も残してある。
+ */
+export function resolveSpatialAssetFromHtml(html: string, baseUrl: string): string | null {
+  const outputs = findTaskOutputs(extractNextData(html));
+  const selected = selectSpatialOutput(outputs);
+  if (selected) return selected.url;
+  return findSpatialAssetUrl(html, baseUrl);
 }
