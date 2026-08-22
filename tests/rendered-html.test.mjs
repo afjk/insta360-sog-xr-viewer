@@ -41,28 +41,26 @@ test("server-renders the PlayCanvas SOG viewer shell", async () => {
   assert.match(html, /role="status"/);
 });
 
-test("uses selectable PlayCanvas SOG quality modes and WebXR", async () => {
-  const [viewer, packageJson, smoothSog] = await Promise.all([
+test("keeps the PlayCanvas SOG and WebXR controls wired up", async () => {
+  const [viewer, packageJson, sampleSog] = await Promise.all([
     readFile(new URL("../app/SogViewer.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
-    readFile(new URL("../public/capture-vr.sog", import.meta.url)),
+    readFile(new URL("../public/capture.sog", import.meta.url)),
   ]);
 
   assert.match(packageJson, /"playcanvas": "\^2\.21\.0"/);
   assert.doesNotMatch(packageJson, /@sparkjsdev\/spark|"three"/);
-  assert.match(viewer, /new Asset\("Insta360 Spatial Capture — High", "gsplat"/);
-  assert.match(viewer, /url: "capture\.sog"/);
-  assert.match(viewer, /url: "capture-vr\.sog"/);
-  assert.match(viewer, /滑らかさ優先/);
-  assert.match(viewer, /高画質/);
-  assert.match(viewer, /framebufferScaleFactor: quality === "smooth" \? 0\.52 : 0\.78/);
+  assert.match(viewer, /const SAMPLE_URL = "capture\.sog"/);
   assert.match(viewer, /GSPLAT_RENDERER_RASTER_CPU_SORT/);
   assert.match(viewer, /xr\.start\(camera, XRTYPE_VR, XRSPACE_LOCALFLOOR/);
+  assert.match(viewer, /framebufferScaleFactor: profile\.framebufferScaleFactor/);
+  assert.match(viewer, /optimized: \{ framebufferScaleFactor: 0\.52, foveation: 0\.82 \}/);
+  assert.match(viewer, /original: \{ framebufferScaleFactor: 0\.78, foveation: 0\.55 \}/);
   assert.match(viewer, /"KeyW"/);
   assert.match(viewer, /"KeyE"/);
   assert.match(viewer, /XRHAND_LEFT/);
   assert.match(viewer, /XRHAND_RIGHT/);
-  assert.match(viewer, /source\.squeezing \|\| gamepadButtonPressed\(gamepad\.buttons, 1\)/);
+  assert.match(viewer, /inputSource\.squeezing \|\| gamepadButtonPressed\(gamepad\.buttons, 1\)/);
   assert.match(viewer, /moveX \+= rightStickX/);
   assert.match(viewer, /moveY \+= rightStickY/);
   assert.match(viewer, /gamepadButtonPressed\(gamepad\.buttons, 4\)/);
@@ -70,8 +68,45 @@ test("uses selectable PlayCanvas SOG quality modes and WebXR", async () => {
   assert.match(viewer, /heightDirection \* 1\.2 \* deltaSeconds/);
   assert.match(viewer, /A 上昇 \/ B 下降/);
   assert.match(viewer, /Grip＋右スティック/);
-  assert.equal(smoothSog.subarray(0, 2).toString(), "PK");
-  assert.ok(smoothSog.byteLength < 7_000_000);
+  assert.equal(sampleSog.subarray(0, 2).toString(), "PK");
+});
+
+test("generates the VR variant in the browser instead of shipping a second SOG", async () => {
+  const [viewer, worker, cache, image] = await Promise.all([
+    readFile(new URL("../app/SogViewer.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/sog-optimizer.worker.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/sog-cache.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/sog-image.ts", import.meta.url), "utf8"),
+  ]);
+
+  // The prebuilt lightweight SOG is gone; the VR variant comes from the optimizer.
+  assert.doesNotMatch(viewer, /capture-vr\.sog/);
+  await assert.rejects(readFile(new URL("../public/capture-vr.sog", import.meta.url)));
+
+  // Desktop keeps the original; VR offers original or optimized.
+  assert.match(viewer, /オリジナル/);
+  assert.match(viewer, /VR向けに最適化/);
+  assert.match(viewer, /最適化してVRを開始/);
+  assert.match(viewer, /TARGET_SPLAT_PRESETS\.map/);
+
+  // Conversion runs off the UI thread and never leaves the browser.
+  assert.match(viewer, /new Worker\(new URL\("\.\/sog-optimizer\.worker\.ts", import\.meta\.url\)/);
+  assert.match(viewer, /SOGを外部へ送信することはありません/);
+  assert.match(worker, /worker\.postMessage\(result, \[result\.buffer\]\)/);
+  assert.match(worker, /SOGを解析中/);
+  assert.match(worker, /Gaussianを削減中/);
+  assert.match(worker, /SOGを圧縮中/);
+
+  // Results are cached in IndexedDB against the SOG contents, not the URL.
+  assert.match(viewer, /cacheKey\(original\.hash, settings\)/);
+  assert.match(viewer, /readCachedOptimization/);
+  assert.match(viewer, /writeCachedOptimization/);
+  assert.match(viewer, /キャッシュへ保存中/);
+  assert.match(cache, /indexedDB\.open/);
+
+  // Missing browser capabilities degrade to the original rather than breaking.
+  assert.match(image, /optimizationUnsupportedReason/);
+  assert.match(viewer, /オリジナルのままVRを開始できます/);
 });
 
 test("loads arbitrary SOG sources while keeping the bundled sample as default", async () => {
@@ -82,7 +117,7 @@ test("loads arbitrary SOG sources while keeping the bundled sample as default", 
 
   // The bundled sample stays the auto-loaded default.
   assert.match(viewer, /useState<ViewerSource>\(\{ kind: "sample", label: SAMPLE_LABEL \}\)/);
-  assert.match(viewer, /app\.assets\.load\(initialAsset\)/);
+  assert.match(viewer, /void loadSample\(true\)/);
 
   // One "空間を開く" panel offers URL, drag & drop and the file picker.
   assert.match(viewer, /空間を開く/);
@@ -92,13 +127,14 @@ test("loads arbitrary SOG sources while keeping the bundled sample as default", 
   assert.match(viewer, /accept="\.sog"/);
   assert.match(viewer, /window\.addEventListener\("drop", onDrop\)/);
   assert.match(viewer, /window\.addEventListener\("dragover", onDragOver\)/);
-  assert.match(viewer, /URL\.createObjectURL\(request\.file\)/);
+  assert.match(viewer, /await file\.arrayBuffer\(\)/);
   assert.match(viewer, /URL\.revokeObjectURL/);
   assert.match(viewer, /サンプルに戻す/);
 
   // Swapping sources replaces the GSplat and reports progress and errors.
   assert.match(viewer, /splatComponent\.asset = asset/);
   assert.match(viewer, /app\.assets\.remove\(entry\.asset\)/);
+  assert.match(viewer, /releaseAsset\(previous\)/);
   assert.match(viewer, /setSourceProgress/);
   assert.match(viewer, /setSourceError/);
 

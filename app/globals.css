@@ -581,9 +581,40 @@ canvas {
   color: var(--amber);
 }
 
+.vr-target {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 16px;
+  color: #8f9aa2;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+}
+
+.vr-target select {
+  padding: 9px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--ink);
+  font: 12px var(--font-geist-mono), monospace;
+}
+
+.vr-target select:disabled {
+  opacity: 0.45;
+}
+
 .quality-preparing {
   margin-top: 18px;
   padding: 13px 2px 0;
+}
+
+.quality-preparing p {
+  margin: 0;
+  color: #6f7b84;
+  font: 9px var(--font-geist-mono), monospace;
+  letter-spacing: 0.1em;
 }
 
 .quality-start {
