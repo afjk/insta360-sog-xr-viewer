@@ -22,6 +22,7 @@ import {
   parseInsta360ShareUrl,
   toAbsoluteUrl,
 } from "./insta360";
+import { resolverConfig } from "./resolver-config";
 import { optimizationUnsupportedReason } from "./sog-image";
 import {
   DEFAULT_TARGET_SPLATS,
@@ -52,9 +53,6 @@ const SAMPLE_DESKTOP_TARGET = new Vec3(0, 1.35, -2.8);
 const SAMPLE_DESKTOP_DISTANCE = 2.8;
 const INITIAL_PITCH = 0.08;
 const UP = new Vec3(0, 1, 0);
-// Insta360の共有ページはCORSを許可していないため、解決とSOGの中継はサーバー側で行う。
-// GitHub Pagesのような静的ホスティングには /api が無いので、Worker版へフォールバックする。
-const RESOLVER_FALLBACK_ORIGIN = "https://insta360-sog-xr-viewer.afjk01.chatgpt.site";
 // 任意SOGの床合わせに使う分位点。外れ値を無視して部屋の広がりを求める。
 const BOUNDS_PERCENTILE = 0.02;
 const BOUNDS_MAX_SAMPLES = 60_000;
@@ -63,6 +61,9 @@ const VR_RENDER_PROFILE: Record<VrVariant, { framebufferScaleFactor: number; fov
   original: { framebufferScaleFactor: 0.78, foveation: 0.55 },
   optimized: { framebufferScaleFactor: 0.52, foveation: 0.82 },
 };
+
+// 解決エンドポイントの有無はビルド時に決まるので、一度だけ読めばよい。
+const SHARE_RESOLVER = resolverConfig();
 
 const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value));
@@ -80,14 +81,6 @@ const stickAxis = (axes: readonly number[], axis: "x" | "y") => {
 const gamepadButtonPressed = (buttons: readonly GamepadButton[], index: number) => {
   const button = buttons[index];
   return Boolean(button?.pressed || (button?.value ?? 0) > 0.5);
-};
-
-const resolverOrigins = () => {
-  const origins = [""];
-  if (typeof window !== "undefined" && window.location.origin !== RESOLVER_FALLBACK_ORIGIN) {
-    origins.push(RESOLVER_FALLBACK_ORIGIN);
-  }
-  return origins;
 };
 
 /** 読み込んだSOGの重心分布から、外れ値に引きずられない配置用バウンズを求める。 */
@@ -568,25 +561,25 @@ export function SogViewer() {
 
     /** 共有URLをサーバー経由でSOGへ解決し、中継エンドポイントのURLを返す。 */
     const resolveShare = async (shareUrl: string) => {
-      let lastMessage = "";
-      for (const origin of resolverOrigins()) {
-        const query = `url=${encodeURIComponent(shareUrl)}`;
-        try {
-          const response = await fetch(`${origin}/api/insta360?${query}`, {
-            headers: { accept: "application/json" },
-          });
-          const payload = (await response.json().catch(() => null)) as
-            | { assetUrl?: string; error?: string }
-            | null;
-          if (response.ok && payload?.assetUrl) {
-            return `${origin}/api/insta360?mode=asset&${query}`;
-          }
-          lastMessage = payload?.error ?? `共有URLを解決できませんでした (HTTP ${response.status})`;
-        } catch {
-          lastMessage = "共有URLの解決サービスに接続できませんでした。";
-        }
+      const resolver = resolverConfig();
+      if (!resolver.available) throw new Error(resolver.reason);
+
+      const query = `url=${encodeURIComponent(shareUrl)}`;
+      let response: Response;
+      try {
+        response = await fetch(`${resolver.endpoint}?${query}`, {
+          headers: { accept: "application/json" },
+        });
+      } catch {
+        throw new Error("共有URLの解決サービスに接続できませんでした。");
       }
-      throw new Error(lastMessage || "共有URLを解決できませんでした。");
+      const payload = (await response.json().catch(() => null)) as
+        | { assetUrl?: string; error?: string }
+        | null;
+      if (!response.ok || !payload?.assetUrl) {
+        throw new Error(payload?.error ?? `共有URLを解決できませんでした (HTTP ${response.status})`);
+      }
+      return `${resolver.endpoint}?mode=asset&${query}`;
     };
 
     const loadSource = async (request: LoadRequest) => {
@@ -611,6 +604,11 @@ export function SogViewer() {
         const share = parseInsta360ShareUrl(input);
         const direct = isSpatialAssetUrl(input) ? toAbsoluteUrl(input) : null;
         if (share) {
+          const resolver = resolverConfig();
+          if (!resolver.available) {
+            setSourceError(resolver.reason);
+            return;
+          }
           label = `Insta360共有 ${share.shareId}`;
           setSourceStage("共有URLを解決中");
           setSourceProgress(-1);
@@ -1022,8 +1020,9 @@ export function SogViewer() {
             <p className="quality-eyebrow">OPEN SPACE</p>
             <h2 id="open-title">空間を開く</h2>
             <p className="quality-copy">
-              Insta360 Spatial Captureの共有URLを貼り付けるか、SOGファイルをドラッグ＆ドロップ、
-              またはファイル選択から読み込みます。
+              {SHARE_RESOLVER.available
+                ? "Insta360 Spatial Captureの共有URLを貼り付けるか、SOGファイルをドラッグ＆ドロップ、またはファイル選択から読み込みます。"
+                : "SOGファイルをドラッグ＆ドロップするか、.sog のURLを指定して読み込みます。"}
             </p>
 
             <form
@@ -1039,8 +1038,14 @@ export function SogViewer() {
                 inputMode="url"
                 autoComplete="off"
                 spellCheck={false}
-                placeholder="https://app.insta360.com/3dspace/detail/..."
-                aria-label="Insta360共有URLまたはSOGのURL"
+                placeholder={
+                  SHARE_RESOLVER.available
+                    ? "https://app.insta360.com/3dspace/detail/..."
+                    : "https://example.com/space.sog"
+                }
+                aria-label={
+                  SHARE_RESOLVER.available ? "Insta360共有URLまたはSOGのURL" : "SOGのURL"
+                }
                 value={openInput}
                 disabled={sourceBusy}
                 onChange={(event) => setOpenInput(event.target.value)}
@@ -1049,6 +1054,12 @@ export function SogViewer() {
                 読み込む
               </button>
             </form>
+
+            {!SHARE_RESOLVER.available && (
+              <p className="open-note" role="note">
+                {SHARE_RESOLVER.reason}
+              </p>
+            )}
 
             <div className={`open-dropzone${dragActive ? " is-active" : ""}`}>
               <strong>SOGファイルをドロップして開く</strong>

@@ -405,6 +405,13 @@ canvas {
   background: rgba(58, 46, 24, 0.85);
 }
 
+.open-note {
+  margin: 12px 0 0;
+  color: #8f9aa2;
+  font-size: 11px;
+  line-height: 1.7;
+}
+
 .open-error {
   margin: 14px 0 0;
   color: #f3beb6;

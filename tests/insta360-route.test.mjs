@@ -1,9 +1,35 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-const SHARE_URL = "https://app.insta360.com/3dspace/detail/GS3DGabc?useImmersive=1";
-const SOG_URL = "https://cdn.insta360.com/spaces/abc/capture.sog";
+const SHARE_ID = "GS3DGabc";
+const SHARE_URL = `https://app.insta360.com/3dspace/detail/${SHARE_ID}?useImmersive=1`;
+const SIGNED_QUERY = "?x-oss-date=20260822T000000Z&x-oss-expires=604800&x-oss-signature=XXX";
+const SOG_URL = `https://p2-app.insta360.com/3dgs/${SHARE_ID}/1_3DGS.sog${SIGNED_QUERY}`;
 const SOG_BYTES = new Uint8Array([0x50, 0x4b, 0x03, 0x04]);
+
+/** 実際の共有ページと同じく、署名付きURLを __NEXT_DATA__ に埋めたHTMLを作る。 */
+function sharePageHtml() {
+  const payload = {
+    props: {
+      pageProps: {
+        taskDetail: {
+          id: SHARE_ID,
+          outputs: [
+            {
+              name: "0_3DGS.ply",
+              type: "model",
+              fileFormat: "ply",
+              url: `https://p2-app.insta360.com/3dgs/${SHARE_ID}/0_3DGS.ply${SIGNED_QUERY}`,
+            },
+            { name: "1_3DGS.sog", type: "model", fileFormat: "sog", url: SOG_URL },
+          ],
+        },
+      },
+    },
+  };
+  const json = JSON.stringify(payload).replace(/&/g, "\\u0026");
+  return `<!doctype html><html><body><script id="__NEXT_DATA__" type="application/json">${json}</script></body></html>`;
+}
 
 /** 共有ページとCDNを差し替えて、Workerのルートだけを検証する。 */
 function stubInsta360(overrides = {}) {
@@ -13,10 +39,7 @@ function stubInsta360(overrides = {}) {
     if (url.startsWith(SHARE_URL)) {
       return (
         overrides.sharePage?.() ??
-        new Response(
-          `<script>window.__D__={"sog":"https:\\/\\/cdn.insta360.com\\/spaces\\/abc\\/capture.sog"}</script>`,
-          { status: 200, headers: { "content-type": "text/html" } },
-        )
+        new Response(sharePageHtml(), { status: 200, headers: { "content-type": "text/html" } })
       );
     }
     if (url === SOG_URL) {
@@ -50,7 +73,7 @@ test("resolves an Insta360 share URL to its SOG asset", async () => {
     const response = await callRoute(`url=${encodeURIComponent(SHARE_URL)}`);
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("access-control-allow-origin"), "*");
-    assert.deepEqual(await response.json(), { shareId: "GS3DGabc", assetUrl: SOG_URL });
+    assert.deepEqual(await response.json(), { shareId: SHARE_ID, assetUrl: SOG_URL });
   } finally {
     restore();
   }
@@ -90,4 +113,23 @@ test("reports a readable error when the share page has no SOG", async () => {
   } finally {
     restore();
   }
+});
+
+test("the dedicated Pages resolver Worker serves the same endpoint", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const [worker, config, packageJson] = await Promise.all([
+    readFile(new URL("../resolver-worker/index.ts", import.meta.url), "utf8"),
+    readFile(new URL("../resolver-worker/wrangler.toml", import.meta.url), "utf8"),
+    readFile(new URL("../package.json", import.meta.url), "utf8"),
+  ]);
+
+  // 解決ロジックはアプリ本体のWorkerと共有する。二重実装にしない。
+  assert.match(worker, /from "\.\.\/app\/insta360-resolver"/);
+  assert.match(worker, /url\.pathname === "\/api\/insta360"/);
+  assert.match(worker, /handleInsta360Options\(\)/);
+  assert.match(config, /name = "insta360-sog-resolver"/);
+  assert.match(packageJson, /"resolver:deploy": "wrangler deploy --config resolver-worker\/wrangler\.toml"/);
+
+  const route = await readFile(new URL("../app/api/insta360/route.ts", import.meta.url), "utf8");
+  assert.match(route, /handleInsta360Request\(request\)/);
 });
