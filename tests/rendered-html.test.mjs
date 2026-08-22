@@ -34,6 +34,9 @@ test("server-renders the PlayCanvas SOG viewer shell", async () => {
   assert.match(html, /PICO 4 UltraやQuest/);
   assert.match(html, /空間データを読み込み中/);
   assert.match(html, /VRを開始/);
+  assert.match(html, /空間を開く/);
+  assert.match(html, /SAMPLE/);
+  assert.match(html, /サンプル空間 capture\.sog/);
   assert.match(html, /WASD 移動 · E\/Q 上下/);
   assert.match(html, /role="status"/);
 });
@@ -69,6 +72,42 @@ test("uses selectable PlayCanvas SOG quality modes and WebXR", async () => {
   assert.match(viewer, /Grip＋右スティック/);
   assert.equal(smoothSog.subarray(0, 2).toString(), "PK");
   assert.ok(smoothSog.byteLength < 7_000_000);
+});
+
+test("loads arbitrary SOG sources while keeping the bundled sample as default", async () => {
+  const [viewer, route] = await Promise.all([
+    readFile(new URL("../app/SogViewer.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/insta360/route.ts", import.meta.url), "utf8"),
+  ]);
+
+  // The bundled sample stays the auto-loaded default.
+  assert.match(viewer, /useState<ViewerSource>\(\{ kind: "sample", label: SAMPLE_LABEL \}\)/);
+  assert.match(viewer, /app\.assets\.load\(initialAsset\)/);
+
+  // One "空間を開く" panel offers URL, drag & drop and the file picker.
+  assert.match(viewer, /空間を開く/);
+  assert.match(viewer, /読み込む/);
+  assert.match(viewer, /ファイルを選択/);
+  assert.match(viewer, /SOGファイルをドロップして開く/);
+  assert.match(viewer, /accept="\.sog"/);
+  assert.match(viewer, /window\.addEventListener\("drop", onDrop\)/);
+  assert.match(viewer, /window\.addEventListener\("dragover", onDragOver\)/);
+  assert.match(viewer, /URL\.createObjectURL\(request\.file\)/);
+  assert.match(viewer, /URL\.revokeObjectURL/);
+  assert.match(viewer, /サンプルに戻す/);
+
+  // Swapping sources replaces the GSplat and reports progress and errors.
+  assert.match(viewer, /splatComponent\.asset = asset/);
+  assert.match(viewer, /app\.assets\.remove\(entry\.asset\)/);
+  assert.match(viewer, /setSourceProgress/);
+  assert.match(viewer, /setSourceError/);
+
+  // Share URLs are resolved server-side because Insta360 does not send CORS headers.
+  assert.match(viewer, /parseInsta360ShareUrl/);
+  assert.match(viewer, /\/api\/insta360\?mode=asset/);
+  assert.match(route, /export async function GET/);
+  assert.match(route, /access-control-allow-origin/);
+  assert.match(route, /isPubliclyRoutableHost/);
 });
 
 test("builds and deploys a repository-relative GitHub Pages site", async () => {
