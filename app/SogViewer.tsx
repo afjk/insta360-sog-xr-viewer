@@ -22,16 +22,27 @@ import {
   parseInsta360ShareUrl,
   toAbsoluteUrl,
 } from "./insta360";
+import { optimizationUnsupportedReason } from "./sog-image";
+import {
+  DEFAULT_TARGET_SPLATS,
+  OPTIMIZER_VERSION,
+  TARGET_SPLAT_PRESETS,
+  cacheKey,
+  sha256Hex,
+  type OptimizeSettings,
+} from "./sog-optimizer";
+import type { OptimizeMessage, OptimizeRequest } from "./sog-optimizer.worker";
+import { readCachedOptimization, writeCachedOptimization } from "./sog-cache";
 
 type ViewerStatus = "loading" | "ready" | "error";
-type VrQuality = "smooth" | "high";
+type VrVariant = "original" | "optimized";
 type SourceKind = "sample" | "url" | "file";
 type ViewerSource = { kind: SourceKind; label: string };
 type LoadRequest = { kind: "url"; value: string } | { kind: "file"; file: File };
 type Bounds = { min: Vec3; max: Vec3 };
+type OptimizedInfo = { splats: number; bytes: number; fromCache: boolean; targetSplats: number };
 
-const HIGH_SPLAT_COUNT = 1_000_000;
-const SMOOTH_SPLAT_COUNT = 500_000;
+const SAMPLE_URL = "capture.sog";
 const SAMPLE_LABEL = "サンプル空間 capture.sog";
 // Percentile bounds (2–98%) decoded from capture.sog. A handful of distant
 // outliers in the raw bounds are intentionally ignored when placing the room.
@@ -47,9 +58,19 @@ const RESOLVER_FALLBACK_ORIGIN = "https://insta360-sog-xr-viewer.afjk01.chatgpt.
 // 任意SOGの床合わせに使う分位点。外れ値を無視して部屋の広がりを求める。
 const BOUNDS_PERCENTILE = 0.02;
 const BOUNDS_MAX_SAMPLES = 60_000;
+// 描画設定はVRで表示する版に合わせる。軽量版は解像度を下げてフォービエイションを強める。
+const VR_RENDER_PROFILE: Record<VrVariant, { framebufferScaleFactor: number; foveation: number }> = {
+  original: { framebufferScaleFactor: 0.78, foveation: 0.55 },
+  optimized: { framebufferScaleFactor: 0.52, foveation: 0.82 },
+};
 
 const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value));
+
+const formatSplats = (count: number | null) =>
+  count === null ? "—" : count.toLocaleString("ja-JP");
+
+const formatBytes = (bytes: number) => `${(bytes / 1_048_576).toFixed(1)} MB`;
 
 const stickAxis = (axes: readonly number[], axis: "x" | "y") => {
   const value = axes.length >= 4 ? axes[axis === "x" ? 2 : 3] : axes[axis === "x" ? 0 : 1];
@@ -125,22 +146,29 @@ const splatCountOf = (resource: unknown): number | null => {
 export function SogViewer() {
   const viewportRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const chooseQualityRef = useRef<(quality: VrQuality) => void>(() => undefined);
-  const startPreparedVrRef = useRef<() => void>(() => undefined);
+  const prepareVrRef = useRef<(variant: VrVariant) => void>(() => undefined);
+  const startVrRef = useRef<() => void>(() => undefined);
   const loadSourceRef = useRef<(request: LoadRequest) => void>(() => undefined);
   const restoreSampleRef = useRef<() => void>(() => undefined);
+  // 目標splat数とVRの選択はエフェクトを作り直さずに読みたいのでrefで渡す。
+  const targetSplatsRef = useRef(DEFAULT_TARGET_SPLATS);
+  const vrVariantRef = useRef<VrVariant>("optimized");
   const [status, setStatus] = useState<ViewerStatus>("loading");
   const [progress, setProgress] = useState(0);
   const [xrAvailable, setXrAvailable] = useState(false);
   const [inXr, setInXr] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
-  const [qualityOpen, setQualityOpen] = useState(false);
-  const [activeQuality, setActiveQuality] = useState<VrQuality>("high");
-  const [preparingQuality, setPreparingQuality] = useState<VrQuality | null>(null);
-  const [preparedQuality, setPreparedQuality] = useState<VrQuality | null>(null);
-  const [qualityProgress, setQualityProgress] = useState(0);
+  const [vrOpen, setVrOpen] = useState(false);
+  const [vrVariant, setVrVariant] = useState<VrVariant>("optimized");
+  const [vrReady, setVrReady] = useState(false);
+  const [targetSplats, setTargetSplats] = useState(DEFAULT_TARGET_SPLATS);
+  const [originalSplats, setOriginalSplats] = useState<number | null>(null);
+  const [optimized, setOptimized] = useState<OptimizedInfo | null>(null);
+  const [optimizeStage, setOptimizeStage] = useState("");
+  const [optimizeRatio, setOptimizeRatio] = useState(0);
+  const [optimizeError, setOptimizeError] = useState("");
+  const [optimizeUnsupported, setOptimizeUnsupported] = useState<string | null>(null);
   const [source, setSource] = useState<ViewerSource>({ kind: "sample", label: SAMPLE_LABEL });
-  const [sourceSplats, setSourceSplats] = useState<number | null>(null);
   const [openOpen, setOpenOpen] = useState(false);
   const [openInput, setOpenInput] = useState("");
   const [sourceStage, setSourceStage] = useState("");
@@ -249,37 +277,17 @@ export function SogViewer() {
 
     applyPlacement({ min: CAPTURE_MIN, max: CAPTURE_MAX });
 
-    const captureAsset = new Asset("Insta360 Spatial Capture — High", "gsplat", {
-      url: "capture.sog",
-      filename: "capture.sog",
-      size: 16_241_776,
-    });
-    const smoothAsset = new Asset("Insta360 Spatial Capture — Smooth", "gsplat", {
-      url: "capture-vr.sog",
-      filename: "capture-vr.sog",
-      size: 6_188_721,
-    });
-    const isSampleAsset = (asset: Asset | null) => asset === captureAsset || asset === smoothAsset;
-    const prefersSmoothInitially = /Pico|PICO|OculusBrowser|Quest/i.test(navigator.userAgent);
-    const initialAsset = prefersSmoothInitially ? smoothAsset : captureAsset;
-    const initialQuality: VrQuality = prefersSmoothInitially ? "smooth" : "high";
-    setActiveQuality(initialQuality);
     let loadToken = 0;
-    let sampleActive = true;
-    let currentQuality: VrQuality = initialQuality;
-    let currentAsset: Asset | null = null;
-    let customEntry: { asset: Asset; objectUrl: string | null } | null = null;
+    let optimizeToken = 0;
+    // 表示中のOriginal SOG。バイト列はVR最適化とハッシュ計算に使い回す。
+    let original: { asset: Asset; objectUrl: string; blob: Blob; hash: string | null } | null = null;
+    let optimizedEntry: { asset: Asset; objectUrl: string; key: string } | null = null;
     let splatComponent: GSplatComponent | null = null;
-    let pendingFoveation = 0.55;
-    // 進捗はカード・画質ダイアログ・空間パネルで表示先が変わるので一箇所で束ねる。
-    let progressSink: ((percent: number) => void) | null = setProgress;
+    let pendingFoveation = VR_RENDER_PROFILE.original.foveation;
+    let optimizeWorker: Worker | null = null;
 
-    const onAssetProgress = (receivedBytes: number, totalBytes: number) => {
-      if (disposed || !progressSink) return;
-      progressSink(totalBytes > 0 ? Math.min(99, Math.round((receivedBytes / totalBytes) * 100)) : -1);
-    };
-    captureAsset.on("progress", onAssetProgress);
-    smoothAsset.on("progress", onAssetProgress);
+    const unsupportedReason = optimizationUnsupportedReason();
+    setOptimizeUnsupported(unsupportedReason);
 
     const assetErrorMessage = (error: unknown) =>
       error instanceof Error
@@ -287,20 +295,8 @@ export function SogViewer() {
         : typeof error === "string"
           ? error
           : "SOGファイルを読み込めませんでした。";
-    const onSampleError = (error: unknown) => {
-      if (disposed) return;
-      progressSink = null;
-      setPreparingQuality(null);
-      setPreparedQuality(null);
-      setErrorMessage(assetErrorMessage(error));
-      if (!splatComponent) setStatus("error");
-    };
-    captureAsset.on("error", onSampleError);
-    smoothAsset.on("error", onSampleError);
 
-    /** GSplatを差し替える。直前がサンプルなら解放してVRAMを空ける。 */
     const attachAsset = (asset: Asset) => {
-      const previous = currentAsset;
       if (splatComponent) splatComponent.asset = asset;
       else {
         splatComponent = splatEntity.addComponent("gsplat", {
@@ -308,39 +304,82 @@ export function SogViewer() {
           unified: true,
         }) as GSplatComponent;
       }
-      currentAsset = asset;
-      if (previous && previous !== asset && previous.loaded && isSampleAsset(previous)) {
-        previous.unload();
-      }
     };
 
-    const releaseCustom = (entry: { asset: Asset; objectUrl: string | null } | null) => {
+    const releaseAsset = (entry: { asset: Asset; objectUrl: string } | null) => {
       if (!entry) return;
       app.assets.remove(entry.asset);
       entry.asset.off();
       if (entry.asset.loaded) entry.asset.unload();
-      if (entry.objectUrl) URL.revokeObjectURL(entry.objectUrl);
+      URL.revokeObjectURL(entry.objectUrl);
     };
 
-    initialAsset.ready(() => {
-      if (disposed || !sampleActive) return;
-      attachAsset(initialAsset);
-      progressSink = null;
-      setActiveQuality(initialQuality);
-      setProgress(100);
-      setStatus("ready");
-    });
-    app.assets.add(captureAsset);
-    app.assets.add(smoothAsset);
+    const releaseOptimized = () => {
+      releaseAsset(optimizedEntry);
+      optimizedEntry = null;
+      setOptimized(null);
+      setVrReady(false);
+    };
 
-    const activateSampleAsset = (quality: VrQuality, asset: Asset) => {
-      attachAsset(asset);
-      currentQuality = quality;
-      progressSink = null;
-      setActiveQuality(quality);
-      setPreparingQuality(null);
-      setPreparedQuality(quality);
-      setQualityProgress(100);
+    /** バイト列からGSplatアセットを作り、読み込み完了まで待つ。 */
+    const loadSplatAsset = (name: string, blob: Blob, filename: string) =>
+      new Promise<{ asset: Asset; objectUrl: string }>((resolve, reject) => {
+        const objectUrl = URL.createObjectURL(blob);
+        const asset = new Asset(name, "gsplat", { url: objectUrl, filename });
+        asset.once("error", (error: unknown) => {
+          URL.revokeObjectURL(objectUrl);
+          reject(new Error(assetErrorMessage(error)));
+        });
+        asset.ready(() => resolve({ asset, objectUrl }));
+        app.assets.add(asset);
+        app.assets.load(asset);
+      });
+
+    /** 進捗を出しながらSOGを丸ごと取得する。バイト列はハッシュと最適化に使う。 */
+    const downloadSog = async (url: string, onProgress: (percent: number) => void) => {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`SOGを取得できませんでした (HTTP ${response.status})`);
+      const total = Number(response.headers.get("content-length") ?? 0);
+      if (!response.body) return response.arrayBuffer();
+      const reader = response.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let received = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.byteLength;
+        onProgress(total > 0 ? Math.min(99, Math.round((received / total) * 100)) : -1);
+      }
+      return new Blob(chunks as BlobPart[]).arrayBuffer();
+    };
+
+    /** Original SOGを差し替える。VR最適化済みの結果は入力が変わるので捨てる。 */
+    const showOriginal = async (
+      label: string,
+      buffer: ArrayBuffer,
+      kind: SourceKind,
+      isSample: boolean,
+    ) => {
+      const hash = typeof crypto?.subtle === "undefined" ? null : await sha256Hex(buffer);
+      const blob = new Blob([buffer]);
+      const loaded = await loadSplatAsset(label, blob, "space.sog");
+      const bounds = boundsFromResource(loaded.asset.resource) ?? { min: CAPTURE_MIN, max: CAPTURE_MAX };
+      if (isSample) {
+        applyPlacement({ min: CAPTURE_MIN, max: CAPTURE_MAX });
+        resetView(SAMPLE_DESKTOP_TARGET, SAMPLE_DESKTOP_DISTANCE);
+      } else {
+        applyPlacement(bounds);
+        frameBounds(bounds);
+      }
+      attachAsset(loaded.asset);
+      const previous = original;
+      original = { ...loaded, blob, hash };
+      releaseAsset(previous);
+      releaseOptimized();
+      setOriginalSplats(splatCountOf(loaded.asset.resource));
+      setSource({ kind, label });
+      setStatus("ready");
     };
 
     const onXrAvailability = (available: boolean) => {
@@ -354,13 +393,15 @@ export function SogViewer() {
     const onXrEnd = () => {
       if (disposed) return;
       setInXr(false);
+      // Desktop表示はOriginalに戻す。
+      if (original) attachAsset(original.asset);
       rig.setLocalPosition(0, 0, 0);
       rig.setLocalEulerAngles(0, 0, 0);
       updateDesktopCamera();
     };
     const onXrError = (error: Error) => {
       if (disposed) return;
-      setErrorMessage(`VRを開始できませんでした: ${error.message}`);
+      setErrorMessage(error.message);
     };
 
     xr.on(`available:${XRTYPE_VR}`, onXrAvailability);
@@ -368,57 +409,162 @@ export function SogViewer() {
     xr.on("end", onXrEnd);
     xr.on("error", onXrError);
 
-    const startVr = (quality: VrQuality) => {
-      if (disposed || !xr.isAvailable(XRTYPE_VR) || !currentAsset?.loaded) return;
+    const startVr = (variant: VrVariant) => {
+      const entry = variant === "optimized" ? optimizedEntry : original;
+      if (disposed || !xr.isAvailable(XRTYPE_VR) || !entry?.asset.loaded) return;
       setErrorMessage("");
-      setQualityOpen(false);
-      setPreparedQuality(null);
+      setVrOpen(false);
       pressedKeys.clear();
       rig.setLocalPosition(0, 0, 0);
       rig.setLocalEulerAngles(0, 0, 0);
-      pendingFoveation = quality === "smooth" ? 0.82 : 0.55;
+      attachAsset(entry.asset);
+      const profile = VR_RENDER_PROFILE[variant];
+      pendingFoveation = profile.foveation;
       xr.start(camera, XRTYPE_VR, XRSPACE_LOCALFLOOR, {
-        framebufferScaleFactor: quality === "smooth" ? 0.52 : 0.78,
+        framebufferScaleFactor: profile.framebufferScaleFactor,
         optionalFeatures: ["hand-tracking"],
         callback: (error) => {
           if (disposed || !error) return;
-          setErrorMessage(`VRを開始できませんでした: ${error.message}`);
+          if (original) attachAsset(original.asset);
+          setErrorMessage(error.message);
         },
       });
     };
 
-    chooseQualityRef.current = (quality) => {
-      if (disposed || !splatComponent) return;
+    /** SOGをWorkerで軽量化する。UIスレッドは進捗を受け取るだけ。 */
+    const runOptimizer = (buffer: ArrayBuffer, settings: OptimizeSettings) =>
+      new Promise<{ buffer: ArrayBuffer; splats: number; sourceSplats: number; bytes: number }>(
+        (resolve, reject) => {
+          if (!optimizeWorker) {
+            optimizeWorker = new Worker(new URL("./sog-optimizer.worker.ts", import.meta.url), {
+              type: "module",
+            });
+          }
+          const worker = optimizeWorker;
+          const cleanup = () => {
+            worker.onmessage = null;
+            worker.onerror = null;
+          };
+          worker.onmessage = (event: MessageEvent<OptimizeMessage>) => {
+            const message = event.data;
+            if (message.type === "progress") {
+              setOptimizeStage(message.stage);
+              setOptimizeRatio(Math.round(message.ratio * 100));
+              return;
+            }
+            cleanup();
+            if (message.type === "error") reject(new Error(message.message));
+            else resolve(message);
+          };
+          worker.onerror = (event) => {
+            cleanup();
+            reject(new Error(event.message || "VR向けSOGを生成できませんでした。"));
+          };
+          worker.postMessage({ buffer, settings } satisfies OptimizeRequest, [buffer]);
+        },
+      );
+
+    /**
+     * VR最適化版を用意する。キャッシュに当たれば変換せずそのまま使う。
+     * 失敗してもOriginalの表示はそのまま維持する。
+     */
+    const prepareVariant = async (variant: VrVariant) => {
+      if (disposed || !original) return;
       setErrorMessage("");
-      setPreparedQuality(null);
+      setOptimizeError("");
 
-      // 任意のSOGでは差し替えるアセットが無いので、描画負荷だけを切り替える。
-      if (!sampleActive) {
-        currentQuality = quality;
-        setActiveQuality(quality);
-        startVr(quality);
+      if (variant === "original") {
+        setVrReady(true);
+        startVr("original");
         return;
       }
 
-      const asset = quality === "smooth" ? smoothAsset : captureAsset;
-      if (asset.loaded) {
-        if (currentAsset !== asset) activateSampleAsset(quality, asset);
-        startVr(quality);
+      const settings: OptimizeSettings = {
+        targetSplats: targetSplatsRef.current,
+        dropSphericalHarmonics: true,
+      };
+      const key = original.hash ? cacheKey(original.hash, settings) : null;
+      if (optimizedEntry && optimizedEntry.key === key) {
+        startVr("optimized");
         return;
       }
 
-      loadToken += 1;
-      const token = loadToken;
-      progressSink = setQualityProgress;
-      setPreparingQuality(quality);
-      setQualityProgress(0);
-      asset.ready(() => {
-        if (disposed || token !== loadToken || !sampleActive) return;
-        activateSampleAsset(quality, asset);
-      });
-      app.assets.load(asset);
+      optimizeToken += 1;
+      const token = optimizeToken;
+      setVrReady(false);
+      setOptimizeStage("キャッシュを確認中");
+      setOptimizeRatio(0);
+      // 変換中は描画を止める。ユーザーはモーダルを見ているので見た目の損はなく、
+      // WorkerのWebGL読み出しとPNG圧縮にCPU/GPUを回せる。
+      app.autoRender = false;
+
+      try {
+        const cached = key ? await readCachedOptimization(key) : null;
+        let blob: Blob;
+        let splats: number;
+        let bytes: number;
+
+        if (cached) {
+          blob = cached.blob;
+          splats = cached.splats;
+          bytes = cached.bytes;
+        } else {
+          const source = await original.blob.arrayBuffer();
+          if (disposed || token !== optimizeToken) return;
+          const result = await runOptimizer(source, settings);
+          if (disposed || token !== optimizeToken) return;
+          blob = new Blob([result.buffer]);
+          splats = result.splats;
+          bytes = result.bytes;
+          if (key && original.hash) {
+            setOptimizeStage("キャッシュへ保存中");
+            setOptimizeRatio(99);
+            await writeCachedOptimization({
+              key,
+              sourceHash: original.hash,
+              targetSplats: settings.targetSplats,
+              dropSphericalHarmonics: settings.dropSphericalHarmonics,
+              optimizerVersion: OPTIMIZER_VERSION,
+              splats,
+              sourceSplats: result.sourceSplats,
+              bytes,
+              createdAt: Date.now(),
+              blob,
+            });
+          }
+        }
+
+        if (disposed || token !== optimizeToken) return;
+        setOptimizeStage("VR向けSOGを読み込み中");
+        const loaded = await loadSplatAsset("VR optimized SOG", blob, "vr-optimized.sog");
+        if (disposed || token !== optimizeToken) {
+          releaseAsset(loaded);
+          return;
+        }
+        releaseAsset(optimizedEntry);
+        optimizedEntry = { ...loaded, key: key ?? `${settings.targetSplats}` };
+        setOptimized({
+          splats,
+          bytes,
+          fromCache: Boolean(cached),
+          targetSplats: settings.targetSplats,
+        });
+        setOptimizeStage("");
+        setOptimizeRatio(100);
+        setVrReady(true);
+      } catch (error) {
+        if (disposed || token !== optimizeToken) return;
+        setOptimizeStage("");
+        setOptimizeError(assetErrorMessage(error));
+      } finally {
+        app.autoRender = true;
+      }
     };
-    startPreparedVrRef.current = () => startVr(currentQuality);
+
+    prepareVrRef.current = (variant) => {
+      void prepareVariant(variant);
+    };
+    startVrRef.current = () => startVr(vrVariantRef.current);
 
     /** 共有URLをサーバー経由でSOGへ解決し、中継エンドポイントのURLを返す。 */
     const resolveShare = async (shareUrl: string) => {
@@ -449,19 +595,16 @@ export function SogViewer() {
       const token = loadToken;
       setSourceError("");
 
-      let url = "";
-      let filename = "space.sog";
       let label = "";
-      let objectUrl: string | null = null;
+      let fetchUrl = "";
+      let file: File | null = null;
 
       if (request.kind === "file") {
         if (!/\.sog$/i.test(request.file.name)) {
           setSourceError("SOGファイル (.sog) を選択してください。");
           return;
         }
-        objectUrl = URL.createObjectURL(request.file);
-        url = objectUrl;
-        filename = request.file.name;
+        file = request.file;
         label = request.file.name;
       } else {
         const input = request.value.trim();
@@ -472,108 +615,78 @@ export function SogViewer() {
           setSourceStage("共有URLを解決中");
           setSourceProgress(-1);
           try {
-            url = await resolveShare(share.shareUrl);
+            fetchUrl = await resolveShare(share.shareUrl);
           } catch (error) {
             if (disposed || token !== loadToken) return;
             setSourceStage("");
             setSourceError(assetErrorMessage(error));
             return;
           }
-          filename = "insta360-share.sog";
         } else if (direct) {
-          url = direct.toString();
-          filename = direct.pathname.split("/").pop() || "space.sog";
-          label = filename;
+          fetchUrl = direct.toString();
+          label = direct.pathname.split("/").pop() || "space.sog";
         } else {
           setSourceError("Insta360の共有URL、または .sog のURLを入力してください。");
           return;
         }
       }
 
-      if (disposed || token !== loadToken) {
-        if (objectUrl) URL.revokeObjectURL(objectUrl);
-        return;
-      }
-
-      const asset = new Asset(label, "gsplat", { url, filename });
-      const entry = { asset, objectUrl };
-      progressSink = setSourceProgress;
       setSourceStage(`${label} を読み込み中`);
       setSourceProgress(0);
-
-      asset.on("progress", onAssetProgress);
-      asset.once("error", (error: unknown) => {
+      try {
+        const buffer = file
+          ? await file.arrayBuffer()
+          : await downloadSog(fetchUrl, setSourceProgress);
         if (disposed || token !== loadToken) return;
-        progressSink = null;
-        setSourceStage("");
-        setSourceError(assetErrorMessage(error));
-        releaseCustom(entry);
-      });
-      asset.ready(() => {
-        if (disposed || token !== loadToken) {
-          releaseCustom(entry);
-          return;
-        }
-        const bounds = boundsFromResource(asset.resource) ?? { min: CAPTURE_MIN, max: CAPTURE_MAX };
-        applyPlacement(bounds);
-        frameBounds(bounds);
-        const previous = customEntry;
-        attachAsset(asset);
-        customEntry = entry;
-        sampleActive = false;
-        releaseCustom(previous);
-        progressSink = null;
-        setSourceSplats(splatCountOf(asset.resource));
+        setSourceStage(`${label} を展開中`);
+        setSourceProgress(-1);
+        await showOriginal(label, buffer, request.kind === "file" ? "file" : "url", false);
+        if (disposed || token !== loadToken) return;
         setSourceStage("");
         setSourceProgress(100);
-        setSource({ kind: request.kind === "file" ? "file" : "url", label });
-        setStatus("ready");
         setErrorMessage("");
         setOpenOpen(false);
-      });
-      app.assets.add(asset);
-      app.assets.load(asset);
+      } catch (error) {
+        if (disposed || token !== loadToken) return;
+        setSourceStage("");
+        setSourceError(assetErrorMessage(error));
+      }
     };
     loadSourceRef.current = (request) => {
       void loadSource(request);
     };
 
-    const restoreSample = () => {
-      if (disposed || sampleActive) return;
+    const loadSample = async (initial: boolean) => {
       loadToken += 1;
       const token = loadToken;
       setSourceError("");
-      const asset = currentQuality === "smooth" ? smoothAsset : captureAsset;
-      const show = () => {
-        applyPlacement({ min: CAPTURE_MIN, max: CAPTURE_MAX });
-        resetView(SAMPLE_DESKTOP_TARGET, SAMPLE_DESKTOP_DISTANCE);
-        const previous = customEntry;
-        attachAsset(asset);
-        customEntry = null;
-        sampleActive = true;
-        releaseCustom(previous);
-        progressSink = null;
-        setSourceSplats(null);
+      if (!initial) {
+        setSourceStage(`${SAMPLE_LABEL} を読み込み中`);
+        setSourceProgress(0);
+      }
+      try {
+        const buffer = await downloadSog(SAMPLE_URL, initial ? setProgress : setSourceProgress);
+        if (disposed || token !== loadToken) return;
+        await showOriginal(SAMPLE_LABEL, buffer, "sample", true);
+        if (disposed || token !== loadToken) return;
+        setProgress(100);
         setSourceStage("");
         setSourceProgress(100);
-        setSource({ kind: "sample", label: SAMPLE_LABEL });
-        setStatus("ready");
-      };
-
-      if (asset.loaded) {
-        show();
-        return;
-      }
-      progressSink = setSourceProgress;
-      setSourceStage(`${SAMPLE_LABEL} を読み込み中`);
-      setSourceProgress(0);
-      asset.ready(() => {
+      } catch (error) {
         if (disposed || token !== loadToken) return;
-        show();
-      });
-      app.assets.load(asset);
+        setSourceStage("");
+        const message = assetErrorMessage(error);
+        if (initial) {
+          setErrorMessage(message);
+          setStatus("error");
+        } else {
+          setSourceError(message);
+        }
+      }
     };
-    restoreSampleRef.current = restoreSample;
+    restoreSampleRef.current = () => {
+      void loadSample(false);
+    };
 
     const movementCodes = new Set([
       "KeyW",
@@ -687,20 +800,20 @@ export function SogViewer() {
       let moveY = 0;
       let rotateX = 0;
       let heightDirection = 0;
-      for (const source of xr.input.inputSources) {
-        const gamepad = source.gamepad;
+      for (const inputSource of xr.input.inputSources) {
+        const gamepad = inputSource.gamepad;
         if (!gamepad) continue;
         const axes = gamepad.axes;
-        if (source.handedness === XRHAND_LEFT) {
+        if (inputSource.handedness === XRHAND_LEFT) {
           moveX += stickAxis(axes, "x");
           moveY += stickAxis(axes, "y");
-        } else if (source.handedness === XRHAND_RIGHT) {
+        } else if (inputSource.handedness === XRHAND_RIGHT) {
           const rightStickX = stickAxis(axes, "x");
           const rightStickY = stickAxis(axes, "y");
           // Holding Grip temporarily changes the right stick from smooth turn
           // to gaze-relative locomotion. Left-stick locomotion stays enabled.
           const gripPressed =
-            source.squeezing || gamepadButtonPressed(gamepad.buttons, 1);
+            inputSource.squeezing || gamepadButtonPressed(gamepad.buttons, 1);
           if (gripPressed) {
             moveX += rightStickX;
             moveY += rightStickY;
@@ -768,13 +881,13 @@ export function SogViewer() {
 
     resize();
     app.start();
-    app.assets.load(initialAsset);
+    void loadSample(true);
     setXrAvailable(xr.isAvailable(XRTYPE_VR));
 
     return () => {
       disposed = true;
-      chooseQualityRef.current = () => undefined;
-      startPreparedVrRef.current = () => undefined;
+      prepareVrRef.current = () => undefined;
+      startVrRef.current = () => undefined;
       loadSourceRef.current = () => undefined;
       restoreSampleRef.current = () => undefined;
       resizeObserver.disconnect();
@@ -791,19 +904,21 @@ export function SogViewer() {
       window.removeEventListener("dragleave", onDragLeave);
       window.removeEventListener("drop", onDrop);
       if (xr.active) xr.end();
-      if (customEntry?.objectUrl) URL.revokeObjectURL(customEntry.objectUrl);
+      optimizeWorker?.terminate();
+      if (original) URL.revokeObjectURL(original.objectUrl);
+      if (optimizedEntry) URL.revokeObjectURL(optimizedEntry.objectUrl);
       app.destroy();
       viewport.replaceChildren();
     };
   }, []);
 
+  targetSplatsRef.current = targetSplats;
+  vrVariantRef.current = vrVariant;
+
   const isSample = source.kind === "sample";
-  const splatCount = isSample
-    ? activeQuality === "smooth"
-      ? SMOOTH_SPLAT_COUNT
-      : HIGH_SPLAT_COUNT
-    : sourceSplats;
   const sourceBusy = sourceStage !== "";
+  const optimizing = optimizeStage !== "";
+  const optimizedMatches = optimized !== null && optimized.targetSplats === targetSplats;
   const notice = sourceError && !openOpen
     ? { title: "空間を読み込めませんでした", body: sourceError }
     : status === "error"
@@ -834,7 +949,7 @@ export function SogViewer() {
           <div className="format-pill">
             <span className="live-dot" />
             PLAYCANVAS · SOG v2
-            {splatCount ? ` · ${splatCount.toLocaleString("ja-JP")} SPLATS` : ""}
+            {originalSplats ? ` · ${formatSplats(originalSplats)} SPLATS` : ""}
           </div>
         </div>
       </header>
@@ -843,9 +958,8 @@ export function SogViewer() {
         <p className="eyebrow">INSTA360 SPATIAL CAPTURE</p>
         <h1>記憶の中へ、<br />一歩踏み込む。</h1>
         <p className="intro-copy">
-          PICO 4 UltraやQuestのブラウザで開き、VRを開始してください。頭の動きと両眼視差で、
-          空間をそのまま立体的に体験できます。表示中はサンプルの空間です。お手持ちのSOGや
-          Insta360の共有URLは「空間を開く」から読み込めます。
+          PICO 4 UltraやQuestのブラウザで開き、VRを開始してください。VR用の軽量SOGは
+          ブラウザ内で生成してキャッシュするので、2回目からは待ち時間なく入れます。
         </p>
       </section>
 
@@ -871,8 +985,8 @@ export function SogViewer() {
           disabled={!xrAvailable || status !== "ready"}
           aria-label="VR表示を開始"
           onClick={() => {
-            setPreparedQuality(null);
-            setQualityOpen(true);
+            setOptimizeError("");
+            setVrOpen(true);
           }}
         >
           <span className="vr-icon" aria-hidden="true">◫</span>
@@ -996,75 +1110,115 @@ export function SogViewer() {
         </div>
       )}
 
-      {qualityOpen && (
+      {vrOpen && (
         <div className="quality-backdrop">
           <section
             className="quality-dialog"
             role="dialog"
             aria-modal="true"
-            aria-labelledby="quality-title"
+            aria-labelledby="vr-title"
           >
             <button
               className="quality-close"
               type="button"
-              aria-label="画質選択を閉じる"
-              disabled={preparingQuality !== null}
-              onClick={() => {
-                setQualityOpen(false);
-                setPreparedQuality(null);
-              }}
+              aria-label="VR設定を閉じる"
+              disabled={optimizing}
+              onClick={() => setVrOpen(false)}
             >
               ×
             </button>
             <p className="quality-eyebrow">VR QUALITY</p>
-            <h2 id="quality-title">画質を選択</h2>
+            <h2 id="vr-title">VRで表示</h2>
             <p className="quality-copy">
-              PICOでは「滑らかさ優先」がおすすめです。細部を確認したいときは高画質を選べます。
-              {isSample ? "" : "読み込んだ空間では描画解像度のみが変わります。"}
+              オリジナルのまま入るか、VR向けに軽量化したSOGで入るかを選べます。
+              軽量化はこのブラウザの中だけで行い、SOGを外部へ送信することはありません。
             </p>
 
             <div className="quality-options">
               <button
-                className={`quality-option${activeQuality === "smooth" ? " is-active" : ""}`}
+                className={`quality-option${vrVariant === "original" ? " is-active" : ""}`}
                 type="button"
-                disabled={preparingQuality !== null}
-                onClick={() => chooseQualityRef.current("smooth")}
+                disabled={optimizing}
+                onClick={() => setVrVariant("original")}
               >
-                <span className="quality-badge">PICO推奨</span>
-                <strong>滑らかさ優先</strong>
-                <span>{isSample ? "50万点 · 軽量カラー · VR解像度 52%" : "VR解像度 52% · 高フォービエイション"}</span>
+                <span className="quality-badge is-neutral">ORIGINAL</span>
+                <strong>オリジナル</strong>
+                <span>{formatSplats(originalSplats)} splats · VR解像度 78%</span>
               </button>
               <button
-                className={`quality-option${activeQuality === "high" ? " is-active" : ""}`}
+                className={`quality-option${vrVariant === "optimized" ? " is-active" : ""}`}
                 type="button"
-                disabled={preparingQuality !== null}
-                onClick={() => chooseQualityRef.current("high")}
+                disabled={optimizing || optimizeUnsupported !== null}
+                onClick={() => setVrVariant("optimized")}
               >
-                <span className="quality-badge is-neutral">DETAIL</span>
-                <strong>高画質</strong>
-                <span>{isSample ? "100万点 · フルカラー · VR解像度 78%" : "VR解像度 78% · 低フォービエイション"}</span>
+                <span className="quality-badge">PICO推奨</span>
+                <strong>VR向けに最適化</strong>
+                <span>
+                  {optimizedMatches
+                    ? `✓ 生成済み ${formatSplats(optimized.splats)} splats · ${formatBytes(optimized.bytes)}`
+                    : `${formatSplats(targetSplats)} splats へ削減 · VR解像度 52%`}
+                </span>
               </button>
             </div>
 
-            {preparingQuality && (
+            {vrVariant === "optimized" && optimizeUnsupported === null && (
+              <label className="vr-target">
+                <span>目標splat数</span>
+                <select
+                  value={targetSplats}
+                  disabled={optimizing}
+                  onChange={(event) => setTargetSplats(Number(event.target.value))}
+                >
+                  {TARGET_SPLAT_PRESETS.map((preset) => (
+                    <option key={preset} value={preset}>
+                      {formatSplats(preset)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+
+            {optimizeUnsupported && (
+              <p className="open-error" role="status">
+                {optimizeUnsupported}VR向けSOGの生成はできませんが、オリジナルのままVRを開始できます。
+              </p>
+            )}
+
+            {optimizing && (
               <div className="quality-preparing" role="status" aria-live="polite">
                 <div className="loading-row">
-                  <span>{preparingQuality === "smooth" ? "滑らかさ優先" : "高画質"}を準備中</span>
-                  <span>{qualityProgress}%</span>
+                  <span>
+                    VR向けに最適化しています… {optimizeStage}
+                  </span>
+                  <span>{optimizeRatio}%</span>
                 </div>
                 <div className="progress-track">
-                  <span style={{ width: `${Math.max(4, qualityProgress)}%` }} />
+                  <span style={{ width: `${Math.max(4, optimizeRatio)}%` }} />
                 </div>
+                <p>
+                  {formatSplats(originalSplats)} → {formatSplats(targetSplats)} splats
+                </p>
               </div>
             )}
 
-            {preparedQuality && !preparingQuality && (
+            {optimizeError && (
+              <p className="open-error" role="alert">
+                {optimizeError}
+              </p>
+            )}
+
+            {!optimizing && (
               <button
                 className="quality-start"
                 type="button"
-                onClick={() => startPreparedVrRef.current()}
+                onClick={() => {
+                  if (vrVariant === "optimized" && vrReady && optimizedMatches) startVrRef.current();
+                  else prepareVrRef.current(vrVariant);
+                }}
               >
-                {preparedQuality === "smooth" ? "滑らかさ優先" : "高画質"}でVRを開始
+                {vrVariant === "original" || (vrReady && optimizedMatches)
+                  ? "VRを開始"
+                  : "最適化してVRを開始"}
               </button>
             )}
           </section>
@@ -1090,10 +1244,7 @@ export function SogViewer() {
           <div className="progress-track">
             <span style={{ width: `${progress < 0 ? 100 : Math.max(4, progress)}%` }} />
           </div>
-          <p>
-            {activeQuality === "smooth" ? "5.9 MB · 500K" : "15.5 MB · 1M"}
-            {" · SAMPLE · PLAYCANVAS STANDARD SOG LOADER"}
-          </p>
+          <p>15.5 MB · 1M · SAMPLE · PLAYCANVAS STANDARD SOG LOADER</p>
         </div>
       )}
 
