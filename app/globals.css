@@ -1,11 +1,11 @@
-@import "tailwindcss";
-
 :root {
   --ink: #f4f7f8;
   --muted: #96a1aa;
   --cyan: #6ee7e3;
   --amber: #f0c77c;
   --panel: rgba(10, 14, 19, 0.7);
+  --font-geist-sans: system-ui;
+  --font-geist-mono: ui-monospace;
 }
 
 * {

@@ -130,12 +130,12 @@ export function SogViewer() {
     app.root.addChild(splatEntity);
 
     const captureAsset = new Asset("Insta360 Spatial Capture — High", "gsplat", {
-      url: "/capture.sog",
+      url: "capture.sog",
       filename: "capture.sog",
       size: 16_241_776,
     });
     const smoothAsset = new Asset("Insta360 Spatial Capture — Smooth", "gsplat", {
-      url: "/capture-vr.sog",
+      url: "capture-vr.sog",
       filename: "capture-vr.sog",
       size: 6_188_721,
     });

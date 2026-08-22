@@ -48,8 +48,8 @@ test("uses selectable PlayCanvas SOG quality modes and WebXR", async () => {
   assert.match(packageJson, /"playcanvas": "\^2\.21\.0"/);
   assert.doesNotMatch(packageJson, /@sparkjsdev\/spark|"three"/);
   assert.match(viewer, /new Asset\("Insta360 Spatial Capture — High", "gsplat"/);
-  assert.match(viewer, /url: "\/capture\.sog"/);
-  assert.match(viewer, /url: "\/capture-vr\.sog"/);
+  assert.match(viewer, /url: "capture\.sog"/);
+  assert.match(viewer, /url: "capture-vr\.sog"/);
   assert.match(viewer, /滑らかさ優先/);
   assert.match(viewer, /高画質/);
   assert.match(viewer, /framebufferScaleFactor: quality === "smooth" \? 0\.52 : 0\.78/);
@@ -69,4 +69,21 @@ test("uses selectable PlayCanvas SOG quality modes and WebXR", async () => {
   assert.match(viewer, /Grip＋右スティック/);
   assert.equal(smoothSog.subarray(0, 2).toString(), "PK");
   assert.ok(smoothSog.byteLength < 7_000_000);
+});
+
+test("builds and deploys a repository-relative GitHub Pages site", async () => {
+  const [pagesConfig, pagesEntry, workflow, packageJson] = await Promise.all([
+    readFile(new URL("../vite.pages.config.ts", import.meta.url), "utf8"),
+    readFile(new URL("../github-pages-src/main.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../.github/workflows/pages.yml", import.meta.url), "utf8"),
+    readFile(new URL("../package.json", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(pagesConfig, /base: "\/insta360-sog-xr-viewer\/"/);
+  assert.match(pagesConfig, /publicDir: resolve\(projectRoot, "public"\)/);
+  assert.match(pagesEntry, /<SogViewer \/>/);
+  assert.match(packageJson, /"build:pages": "vite build --config vite\.pages\.config\.ts"/);
+  assert.match(workflow, /actions\/configure-pages@v5/);
+  assert.match(workflow, /actions\/upload-pages-artifact@v4/);
+  assert.match(workflow, /actions\/deploy-pages@v4/);
 });
