@@ -49,10 +49,20 @@ const SAMPLE_LABEL = "サンプル空間 capture.sog";
 // outliers in the raw bounds are intentionally ignored when placing the room.
 const CAPTURE_MIN = new Vec3(-6.911, -1.263, -3.762);
 const CAPTURE_MAX = new Vec3(6.178, 1.654, 3.802);
-const SAMPLE_DESKTOP_TARGET = new Vec3(0, 1.35, -2.8);
-const SAMPLE_DESKTOP_DISTANCE = 2.8;
 const INITIAL_PITCH = 0.08;
 const UP = new Vec3(0, 1, 0);
+// Desktopの視点操作。回転の中心は部屋の中心に置き、そこから部屋の半径に対する
+// 比率だけカメラを引く。360度キャプチャの内側に留まったまま中心を軸に回れる距離。
+// サンプル（半径約6.5m）で約2mになる比率。
+const ORBIT_DISTANCE_RATIO = 0.3;
+const ORBIT_DISTANCE_RANGE = { min: 1, max: 6 };
+const DOLLY_RANGE = { min: 0.35, max: 48 };
+// 真上・真下でカメラの向きが定まらなくなるので、その手前で止める。
+const MAX_PITCH = 1.45;
+const ORBIT_SPEED = { yaw: 0.006, pitch: 0.004 };
+// ホイール1ノッチ（deltaY≈100）で距離が約13%変わる。
+const DOLLY_SPEED = 0.0012;
+const WHEEL_LINE_HEIGHT = 16;
 // 任意SOGの床合わせに使う分位点。外れ値を無視して部屋の広がりを求める。
 const BOUNDS_PERCENTILE = 0.02;
 const BOUNDS_MAX_SAMPLES = 60_000;
@@ -174,14 +184,17 @@ export function SogViewer() {
     if (!viewport) return;
 
     let disposed = false;
-    let dragging = false;
+    // 左ドラッグは回転、右／中ドラッグとShift+左ドラッグは平行移動。
+    let dragMode: "orbit" | "pan" | null = null;
+    let dragPointerId = -1;
     let lastX = 0;
     let lastY = 0;
     let yaw = 0;
     let pitch = INITIAL_PITCH;
-    let distance = SAMPLE_DESKTOP_DISTANCE;
+    let distance = 2.8;
     const pressedKeys = new Set<string>();
-    const desktopTarget = new Vec3().copy(SAMPLE_DESKTOP_TARGET);
+    // 回転の中心。rigの子であるカメラと同じ座標系なので、rig座標で持つ。
+    const desktopTarget = new Vec3(0, 1.5, 0);
 
     const canvas = document.createElement("canvas");
     canvas.className = "sog-canvas";
@@ -256,19 +269,28 @@ export function SogViewer() {
       updateDesktopCamera();
     };
 
-    // 360度キャプチャは撮影位置＝部屋の中心なので、外から回り込むのではなく
-    // 中心の目線の高さにカメラを置き、外側を向かせる。軌道中心を前方に置いた
-    // サンプルの手動調整値を、任意のSOGの高さへ一般化したもの。
+    /**
+     * 読み込んだ空間に合わせて視点を組み直す。
+     *
+     * 回転の中心は部屋の中心（目線の高さ）に置く。以前はカメラの前方に軌道中心を
+     * 取っていたため、何も無い場所を軸にカメラが振り回されていた。カメラは中心から
+     * 部屋の半径の3割ほど引いた位置に構えるので、360度キャプチャの内側に
+     * 留まったまま中心を軸に回れる。
+     */
     const frameBounds = (bounds: Bounds) => {
       const eyeHeight = clamp((bounds.max.y - bounds.min.y) * 0.54, 1, 2.2);
-      const orbit = SAMPLE_DESKTOP_DISTANCE;
+      const radius = Math.max(bounds.max.x - bounds.min.x, bounds.max.z - bounds.min.z) * 0.5;
       resetView(
-        new Vec3(0, eyeHeight - orbit * Math.sin(INITIAL_PITCH), -orbit * Math.cos(INITIAL_PITCH)),
-        orbit,
+        new Vec3(0, eyeHeight, 0),
+        clamp(radius * ORBIT_DISTANCE_RATIO, ORBIT_DISTANCE_RANGE.min, ORBIT_DISTANCE_RANGE.max),
       );
     };
 
-    applyPlacement({ min: CAPTURE_MIN, max: CAPTURE_MAX });
+    // ダブルクリックで視点を戻せるよう、いま表示している空間の広がりを覚えておく。
+    let framedBounds: Bounds = { min: CAPTURE_MIN, max: CAPTURE_MAX };
+
+    applyPlacement(framedBounds);
+    frameBounds(framedBounds);
 
     let loadToken = 0;
     let optimizeToken = 0;
@@ -358,13 +380,9 @@ export function SogViewer() {
       const blob = new Blob([buffer]);
       const loaded = await loadSplatAsset(label, blob, "space.sog");
       const bounds = boundsFromResource(loaded.asset.resource) ?? { min: CAPTURE_MIN, max: CAPTURE_MAX };
-      if (isSample) {
-        applyPlacement({ min: CAPTURE_MIN, max: CAPTURE_MAX });
-        resetView(SAMPLE_DESKTOP_TARGET, SAMPLE_DESKTOP_DISTANCE);
-      } else {
-        applyPlacement(bounds);
-        frameBounds(bounds);
-      }
+      framedBounds = isSample ? { min: CAPTURE_MIN, max: CAPTURE_MAX } : bounds;
+      applyPlacement(framedBounds);
+      frameBounds(framedBounds);
       attachAsset(loaded.asset);
       const previous = original;
       original = { ...loaded, blob, hash };
@@ -714,31 +732,69 @@ export function SogViewer() {
     };
     const clearPressedKeys = () => pressedKeys.clear();
 
+    /**
+     * 回転の中心をカメラの向いている平面に沿って動かす。
+     *
+     * 1pxあたりの移動量を注視点の距離での画角から出すので、つかんだ場所が
+     * カーソルに追従する。desktopTargetはrig座標だが、Desktopではrigを回転
+     * させないので、カメラのworld方向ベクトルをそのまま使える。
+     */
+    const panBy = (deltaX: number, deltaY: number) => {
+      const height = Math.max(1, canvas.clientHeight);
+      const perPixel = (2 * distance * Math.tan((camera.fov * Math.PI) / 360)) / height;
+      desktopTarget
+        .addScaled(cameraEntity.right, -deltaX * perPixel)
+        .addScaled(cameraEntity.up, deltaY * perPixel);
+    };
+
     const onPointerDown = (event: PointerEvent) => {
-      if (xr.active) return;
-      dragging = true;
+      if (xr.active || dragMode !== null) return;
+      // 一般的な3Dソフトに合わせる。左=回転、右/中=平行移動、Shift+左=平行移動。
+      if (event.button === 0) dragMode = event.shiftKey ? "pan" : "orbit";
+      else if (event.button === 1 || event.button === 2) dragMode = "pan";
+      else return;
+      dragPointerId = event.pointerId;
       lastX = event.clientX;
       lastY = event.clientY;
       canvas.setPointerCapture(event.pointerId);
+      event.preventDefault();
     };
     const onPointerMove = (event: PointerEvent) => {
-      if (!dragging || xr.active) return;
-      yaw -= (event.clientX - lastX) * 0.006;
-      pitch = clamp(pitch + (event.clientY - lastY) * 0.004, -0.75, 0.75);
+      if (dragMode === null || event.pointerId !== dragPointerId || xr.active) return;
+      const deltaX = event.clientX - lastX;
+      const deltaY = event.clientY - lastY;
+      if (dragMode === "orbit") {
+        yaw -= deltaX * ORBIT_SPEED.yaw;
+        pitch = clamp(pitch + deltaY * ORBIT_SPEED.pitch, -MAX_PITCH, MAX_PITCH);
+      } else {
+        panBy(deltaX, deltaY);
+      }
       lastX = event.clientX;
       lastY = event.clientY;
       updateDesktopCamera();
     };
     const onPointerUp = (event: PointerEvent) => {
-      dragging = false;
+      if (event.pointerId !== dragPointerId) return;
+      dragMode = null;
+      dragPointerId = -1;
       if (canvas.hasPointerCapture(event.pointerId)) {
         canvas.releasePointerCapture(event.pointerId);
       }
     };
+    // 右ドラッグを平行移動に使うので、コンテキストメニューは出さない。
+    const onContextMenu = (event: MouseEvent) => event.preventDefault();
+    // 平行移動で空間の外へ出てしまっても、ダブルクリックで戻れるようにする。
+    const onDoubleClick = () => {
+      if (xr.active) return;
+      frameBounds(framedBounds);
+    };
     const onWheel = (event: WheelEvent) => {
       if (xr.active) return;
       event.preventDefault();
-      distance = clamp(distance + event.deltaY * 0.01, 2.2, 48);
+      // 行単位で飛んでくるブラウザがあるので、px相当に揃えてから使う。
+      const deltaY = event.deltaMode === 1 ? event.deltaY * WHEEL_LINE_HEIGHT : event.deltaY;
+      // 近いほど細かく動くよう、加算ではなく倍率で寄せる。
+      distance = clamp(distance * Math.exp(deltaY * DOLLY_SPEED), DOLLY_RANGE.min, DOLLY_RANGE.max);
       updateDesktopCamera();
     };
 
@@ -872,6 +928,8 @@ export function SogViewer() {
     canvas.addEventListener("pointermove", onPointerMove);
     canvas.addEventListener("pointerup", onPointerUp);
     canvas.addEventListener("pointercancel", onPointerUp);
+    canvas.addEventListener("contextmenu", onContextMenu);
+    canvas.addEventListener("dblclick", onDoubleClick);
     canvas.addEventListener("wheel", onWheel, { passive: false });
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
@@ -897,6 +955,8 @@ export function SogViewer() {
       canvas.removeEventListener("pointermove", onPointerMove);
       canvas.removeEventListener("pointerup", onPointerUp);
       canvas.removeEventListener("pointercancel", onPointerUp);
+      canvas.removeEventListener("contextmenu", onContextMenu);
+      canvas.removeEventListener("dblclick", onDoubleClick);
       canvas.removeEventListener("wheel", onWheel);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
@@ -1286,7 +1346,8 @@ export function SogViewer() {
       <footer className="footer-bar">
         <div>
           <span className="desktop-label">DESKTOP</span>
-          WASD 移動 · E/Q 上下 · Shift 高速 · ドラッグで回転
+          左ドラッグ 回転 · 右ドラッグ 平行移動 · ホイール ズーム · ダブルクリック
+          視点リセット · WASD 移動 · E/Q 上下 · Shift 高速
         </div>
         <div className="secure-label">PLAYCANVAS · WEBXR · SECURE SESSION</div>
       </footer>
