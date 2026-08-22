@@ -226,3 +226,45 @@ export function resolveSpatialAssetFromHtml(html: string, baseUrl: string): stri
   if (selected) return selected.url;
   return findSpatialAssetUrl(html, baseUrl);
 }
+
+/** 共有ページ自身が叩くタスク詳細APIのオリジン。共有ページの `metaData` に出てくる値。 */
+export const INSTA360_SERVICE_ORIGINS = {
+  cn: "https://service-c.insta360.com",
+  global: "https://service-g.insta360.com",
+} as const;
+
+const TASK_DETAIL_PATH = "/app-service/app/service/gs3d/task/detail";
+
+/**
+ * 共有IDからタスク詳細APIのURLを組み立てる。
+ *
+ * 共有ページのスクリプトは共有IDの5文字目でリージョンを決めている
+ * （`C` は中国、`G` はグローバル）。判別できない場合は両方に問い合わせて、
+ * 先に成功した方を使う。
+ */
+export function taskDetailApiUrls(shareId: string): string[] {
+  const region = shareId.charAt(4).toUpperCase();
+  const origins =
+    region === "C"
+      ? [INSTA360_SERVICE_ORIGINS.cn]
+      : region === "G"
+        ? [INSTA360_SERVICE_ORIGINS.global]
+        : [INSTA360_SERVICE_ORIGINS.global, INSTA360_SERVICE_ORIGINS.cn];
+  return origins.map(
+    (origin) => `${origin}${TASK_DETAIL_PATH}?taskOrderNo=${encodeURIComponent(shareId)}`,
+  );
+}
+
+/**
+ * タスク詳細APIのレスポンス（`{ code, data: { outputs } }`）からSOGのURLを取り出す。
+ *
+ * 中身は共有ページに埋まっている `taskDetail` と同じ形なので、出力の選別は共通の
+ * 処理を使う。
+ */
+export function resolveSpatialAssetFromTaskDetail(body: unknown): string | null {
+  const payload = body as { code?: number; data?: unknown } | null;
+  if (!payload || typeof payload !== "object") return null;
+  if (typeof payload.code === "number" && payload.code !== 0) return null;
+  const outputs = findTaskOutputs(payload.data ?? payload);
+  return selectSpatialOutput(outputs)?.url ?? null;
+}

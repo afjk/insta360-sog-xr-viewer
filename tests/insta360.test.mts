@@ -9,7 +9,9 @@ import {
   isSpatialAssetUrl,
   parseInsta360ShareUrl,
   resolveSpatialAssetFromHtml,
+  resolveSpatialAssetFromTaskDetail,
   selectSpatialOutput,
+  taskDetailApiUrls,
   toAbsoluteUrl,
   unescapeJsonText,
 } from "../app/insta360.ts";
@@ -158,4 +160,43 @@ test("keeps scanning the markup when the page carries no __NEXT_DATA__", () => {
     resolveSpatialAssetFromHtml(html, SHARE_URL),
     "https://cdn.insta360.com/a/capture.sog",
   );
+});
+
+test("picks the task detail API region from the share ID", () => {
+  assert.deepEqual(taskDetailApiUrls("GS3DGabc"), [
+    "https://service-g.insta360.com/app-service/app/service/gs3d/task/detail?taskOrderNo=GS3DGabc",
+  ]);
+  assert.deepEqual(taskDetailApiUrls("GS3DCabc"), [
+    "https://service-c.insta360.com/app-service/app/service/gs3d/task/detail?taskOrderNo=GS3DCabc",
+  ]);
+});
+
+test("tries both regions when the share ID does not say which one", () => {
+  const urls = taskDetailApiUrls("abc");
+  assert.equal(urls.length, 2);
+  assert.ok(urls[0].startsWith("https://service-g.insta360.com/"));
+  assert.ok(urls[1].startsWith("https://service-c.insta360.com/"));
+});
+
+test("reads the signed SOG URL out of a task detail API response", () => {
+  const body = {
+    code: 0,
+    data: {
+      outputs: [
+        { fileFormat: "ply", type: "model", url: "https://p2-app.insta360.com/3dgs/x/0_3DGS.ply?sig=a" },
+        { fileFormat: "sog", type: "model", url: "https://p2-app.insta360.com/3dgs/x/1_3DGS.sog?sig=b" },
+      ],
+    },
+  };
+  assert.equal(
+    resolveSpatialAssetFromTaskDetail(body),
+    "https://p2-app.insta360.com/3dgs/x/1_3DGS.sog?sig=b",
+  );
+});
+
+test("ignores a task detail response that reports an error code", () => {
+  const outputs = [{ fileFormat: "sog", type: "model", url: "https://p2-app.insta360.com/a.sog" }];
+  assert.equal(resolveSpatialAssetFromTaskDetail({ code: 40000, data: { outputs } }), null);
+  assert.equal(resolveSpatialAssetFromTaskDetail(null), null);
+  assert.equal(resolveSpatialAssetFromTaskDetail({ code: 0, data: {} }), null);
 });

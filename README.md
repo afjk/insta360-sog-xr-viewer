@@ -39,9 +39,22 @@ props.pageProps.taskDetail.outputs
   └─ 4_effect_*.mp4
 ```
 
-resolverはこのJSONを読んで `fileFormat === "sog"` のURLを返します。APIを別途叩く必要は
-ありません。`taskDetail` の位置が変わった場合に備えて、URLを持つ配列を探すフォールバックと、
-`__NEXT_DATA__` 自体が無い場合のHTML走査も残してあります。
+resolverは2段構えでこの `outputs` を取りに行き、`fileFormat === "sog"` のURLを返します。
+
+1. **タスク詳細API** — 共有ページ自身が使っているエンドポイントを直接叩きます。
+
+   ```
+   GET https://service-g.insta360.com/app-service/app/service/gs3d/task/detail?taskOrderNo=<共有ID>
+   → { "code": 0, "data": { "outputs": [ ... ] } }
+   ```
+
+   リージョンは共有IDの5文字目で決まります（`C` は `service-c`、`G` は `service-g`、
+   判別できなければ両方に問い合わせて先に成功した方を使う）。HTMLより構造が安定しているので、
+   こちらを先に試します。
+
+2. **共有ページのHTML** — APIが失敗したときは `__NEXT_DATA__` を読みます。`taskDetail` の
+   位置が変わった場合に備えてURLを持つ配列を探すフォールバックと、`__NEXT_DATA__` 自体が
+   無い場合のHTML走査も残してあります。
 
 Next.jsは埋め込みJSON中の `&` を `\u0026` として書き出すため、テキストのまま正規表現で
 URLを抜くと署名クエリが壊れます。`JSON.parse` を通すことでこれを回避しています。
@@ -49,8 +62,13 @@ URLを抜くと署名クエリが壊れます。`JSON.parse` を通すことで�
 署名付きURLには有効期限（`x-oss-expires`）があるので、解決結果は保存せず毎回取り直します。
 IndexedDBへ載せるのは変換済みのVR向けSOGだけです。
 
-> 共有ページの構造は実データで確認済みですが、**このresolverを実サービスに対して動かした
-> 検証はまだ行っていません**。ネットワーク的にInsta360へ到達できる環境での確認が残っています。
+どちらの経路もサーバー側でしか使えません。共有ページも詳細APIも
+`access-control-allow-origin` をInsta360のオリジンにしか返さないためです
+（詳細APIは `Origin: https://app.insta360.com` にだけCORSヘッダーを付けて応答します）。
+
+一方、**解決後の署名付きSOG URLはCORSを許可しています**（`access-control-allow-origin: *`、
+Rangeリクエストも可）。そのため署名付きURLさえ手元にあれば、resolverを経由せずに
+「`.sog` のURL」欄へ貼るだけで読み込めます。resolverを立てられない環境での抜け道になります。
 
 同じ共有ページからは `0_3DGS.ply` も取得できます。現在のビューアーはSOGのみを扱います。
 
@@ -76,8 +94,14 @@ npm run resolver:dev      # ローカルで動かす
 npm run resolver:deploy   # Cloudflareへデプロイ
 ```
 
-デプロイしたら、リポジトリ変数 `SOG_RESOLVER_ORIGIN` にWorkerのオリジンを設定してください。
-GitHub Pagesのビルドがそれを拾い、共有URLの入力が有効になります。
+デプロイしたら、リポジトリの **Settings → Secrets and variables → Actions → Variables** で
+`SOG_RESOLVER_ORIGIN` にWorkerのオリジン（例: `https://insta360-sog-resolver.<account>.workers.dev`）を
+設定し、Pagesワークフローを再実行してください。ビルドがそれを拾い、共有URLの入力が有効になります。
+
+この変数が未設定のあいだ、GitHub Pages版は共有URLの入力を無効にしたままビルドされ、
+「この配信にはInsta360共有URLを解決するエンドポイントがありません」と表示します。
+これは設定の問題で、解決処理そのものの不具合ではありません。それまでは
+`.sog` ファイルのドロップか、署名付き `.sog` URLの直接指定で読み込めます。
 
 共有ページからSOGのURLを探す処理は `app/insta360.ts` にまとまっています。
 

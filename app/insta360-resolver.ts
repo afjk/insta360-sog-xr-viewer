@@ -13,6 +13,8 @@ import {
   isPubliclyRoutableHost,
   parseInsta360ShareUrl,
   resolveSpatialAssetFromHtml,
+  resolveSpatialAssetFromTaskDetail,
+  taskDetailApiUrls,
   toAbsoluteUrl,
   type Insta360Share,
 } from "./insta360";
@@ -31,6 +33,11 @@ const PAGE_HEADERS: Record<string, string> = {
   "accept-language": "ja,en;q=0.8",
 };
 
+const API_HEADERS: Record<string, string> = {
+  "user-agent": PAGE_HEADERS["user-agent"],
+  accept: "application/json",
+};
+
 class ResolveError extends Error {
   status: number;
 
@@ -44,26 +51,57 @@ function jsonResponse(body: unknown, status: number) {
   return Response.json(body, { status, headers: CORS_HEADERS });
 }
 
+const NOT_FOUND_MESSAGE =
+  "共有ページからSOGのURLを見つけられませんでした。共有が期限切れの可能性があります。SOGファイルをお持ちの場合はドラッグ＆ドロップで読み込めます。";
+
 /**
- * 共有ページからSOGのURLを取り出す。
+ * 共有ページ自身が使うタスク詳細APIからSOGのURLを取り出す。
  *
- * 署名付きURLには有効期限（`x-oss-expires`）があるため、解決結果は保存せず
- * 毎回ここで取り直す。キャッシュするのは変換済みのSOGだけ。
+ * ページのHTMLを読むより構造が安定しているのでこちらを先に試す。ただしこのAPIは
+ * `access-control-allow-origin` をInsta360のオリジンにしか返さないため、
+ * ブラウザから直接は呼べない。だからこの処理はサーバー側にある。
  */
-async function resolveAssetUrl(share: Insta360Share): Promise<string> {
+async function resolveViaApi(share: Insta360Share): Promise<string | null> {
+  for (const endpoint of taskDetailApiUrls(share.shareId)) {
+    let response: Response;
+    try {
+      response = await fetch(endpoint, { headers: API_HEADERS });
+    } catch {
+      continue;
+    }
+    if (!response.ok) continue;
+    const body = await response.json().catch(() => null);
+    const assetUrl = resolveSpatialAssetFromTaskDetail(body);
+    if (assetUrl) return assetUrl;
+  }
+  return null;
+}
+
+/** 共有ページのHTMLに埋まっている `__NEXT_DATA__` からSOGのURLを取り出す。 */
+async function resolveViaSharePage(share: Insta360Share): Promise<string> {
   const response = await fetch(share.shareUrl, { headers: PAGE_HEADERS, redirect: "follow" });
   if (!response.ok) {
     throw new ResolveError(502, `共有ページを取得できませんでした (HTTP ${response.status})`);
   }
   const html = await response.text();
   const assetUrl = resolveSpatialAssetFromHtml(html, response.url || share.shareUrl);
-  if (!assetUrl) {
-    throw new ResolveError(
-      422,
-      "共有ページからSOGのURLを見つけられませんでした。共有が期限切れの可能性があります。SOGファイルをお持ちの場合はドラッグ＆ドロップで読み込めます。",
-    );
-  }
+  if (!assetUrl) throw new ResolveError(422, NOT_FOUND_MESSAGE);
   return assetUrl;
+}
+
+/**
+ * 共有IDからSOGのURLを取り出す。
+ *
+ * まずタスク詳細APIを試し、駄目なら共有ページのHTMLへ落ちる。どちらも同じ
+ * `outputs` を返すので、片方の形が変わってももう片方で解決できる。
+ *
+ * 署名付きURLには有効期限（`x-oss-expires`）があるため、解決結果は保存せず
+ * 毎回ここで取り直す。キャッシュするのは変換済みのSOGだけ。
+ */
+async function resolveAssetUrl(share: Insta360Share): Promise<string> {
+  const fromApi = await resolveViaApi(share);
+  if (fromApi) return fromApi;
+  return resolveViaSharePage(share);
 }
 
 export function handleInsta360Options(): Response {
