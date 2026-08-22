@@ -26,6 +26,7 @@ import {
 import { resolverConfig } from "./resolver-config";
 import { hrefWithoutShareId, permalinkFor, readShareId, readViewPose } from "./permalink";
 import {
+  normalizeYawDegrees,
   orbitTargetOf,
   pitchDegreesFromForward,
   xrRigOffset,
@@ -379,6 +380,10 @@ export function SogViewer() {
     // VR開始時に合わせたいworld視点。HMDのposeが届く前は補正できないので、
     // ここへ置いて最初の有効なフレームで1回だけ適用する。
     let pendingXrSpawn: ViewPose | null = null;
+    // `?debug=1` で開いたときだけ、spawn結果をconsoleへ出す。実機でDesktopと
+    // Questの視点を突き合わせるための確認用で、既定では何も出さない。
+    const xrDebug = new URLSearchParams(window.location.search).get("debug") === "1";
+    let xrSpawnDebug: ViewPose | null = null;
 
     applyPlacement(framedBounds);
     frameBounds(framedBounds);
@@ -1066,7 +1071,35 @@ export function SogViewer() {
       });
       rig.setLocalPosition(rigPose.x, rigPose.y, rigPose.z);
       rig.setLocalEulerAngles(0, rigPose.yaw, 0);
+      if (xrDebug) {
+        xrSpawnDebug = pendingXrSpawn;
+        console.info("[sog-xr] spawn", {
+          desired: desired,
+          head: { x: head.x, y: head.y, z: head.z, yaw: yawDegreesFromBasis(headForward, headUp) },
+          rig: rigPose,
+        });
+      }
       pendingXrSpawn = null;
+    };
+
+    /**
+     * 補正の結果を、次のフレームの実際のカメラworld姿勢と突き合わせて出す。
+     *
+     * 見るのは `view=` に入っている値との差。位置で数cm〜10cm、yawで数度に
+     * 収まっていれば実機でも合っている。大きくずれるときは、local-floorの
+     * HMD poseをrigへ単純加算していないかを疑う。
+     */
+    const logXrSpawn = () => {
+      if (!xrSpawnDebug) return;
+      const actual = currentViewPose();
+      const desired = xrSpawnDebug;
+      xrSpawnDebug = null;
+      console.info("[sog-xr] spawned", {
+        desired,
+        actual,
+        positionDelta: Math.hypot(actual.x - desired.x, actual.y - desired.y, actual.z - desired.z),
+        yawDelta: Math.abs(normalizeYawDegrees(actual.yaw - desired.yaw)),
+      });
     };
 
     const updateXrMovement = (deltaSeconds: number) => {
@@ -1126,6 +1159,9 @@ export function SogViewer() {
 
     const onUpdate = (deltaSeconds: number) => {
       if (xr.active) {
+        // 突き合わせは補正の次のフレーム。実際のHMD poseで組み上がった
+        // world姿勢を見たいので、適用より先に置く。
+        logXrSpawn();
         applyXrSpawn();
         updateXrMovement(Math.min(deltaSeconds, 0.05));
       } else {

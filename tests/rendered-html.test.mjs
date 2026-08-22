@@ -212,7 +212,7 @@ test("restores the linked view on desktop and spawns XR from the rig", async () 
   // XRはDesktopで見えている視点から始める。開始時に控え、rigは一度identityへ。
   assert.match(viewer, /pendingXrSpawn = currentViewPose\(\);/);
   // HMD poseが入ったフレームで1回だけrigを補正する。camera へは書かない。
-  assert.match(viewer, /if \(xr\.active\) \{\s*\n\s*applyXrSpawn\(\);/);
+  assert.match(viewer, /logXrSpawn\(\);\s*\n\s*applyXrSpawn\(\);/);
   assert.match(viewer, /const head = cameraEntity\.getLocalPosition\(\)/);
   assert.match(viewer, /const rigPose = xrRigOffset\(desired, \{/);
   assert.match(viewer, /rig\.setLocalPosition\(rigPose\.x, rigPose\.y, rigPose\.z\)/);
@@ -226,6 +226,10 @@ test("restores the linked view on desktop and spawns XR from the rig", async () 
   assert.match(pose, /y: desired\.y - rotated\.y/);
   // local-floorはXRSPACE_LOCALFLOORのまま。高さは差分で入れる。
   assert.match(viewer, /XRSPACE_LOCALFLOOR/);
+  // 実機の突き合わせ用ログは `?debug=1` のときだけ。既定では何も出さない。
+  assert.match(viewer, /const xrDebug = new URLSearchParams\(window\.location\.search\)\.get\("debug"\) === "1"/);
+  assert.match(viewer, /if \(xrDebug\) \{/);
+  assert.equal(viewer.match(/console\.info/g)?.length, 2);
 });
 
 test("builds and deploys a repository-relative GitHub Pages site", async () => {

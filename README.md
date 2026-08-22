@@ -111,6 +111,12 @@ WebXRのtrackingがそのまま反映します。
 移動・旋回といった既存のlocomotionはそのまま動きます。VRを抜けて入り直したときも同じ規則で
 spawnします。
 
+実機で確かめるときは `?debug=1` を足して開きます。VRを開始した直後に、狙った視点・
+そのときのHMD pose・入れたrigの姿勢・実際に組み上がったカメラのworld姿勢が
+`[sog-xr] spawn` / `[sog-xr] spawned` としてconsoleへ1回だけ出ます。DesktopとQuestで
+同じURLを開いて、位置の差が数cm〜10cm、yawの差が数度に収まっていれば合っています
+（Desktop側の値は `view=` の数値そのものです）。付けなければ何も出ません。
+
 ### 初期視点の優先順位
 
 DesktopとQuestで同じ規則を使います。
