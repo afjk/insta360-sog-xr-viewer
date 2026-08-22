@@ -315,9 +315,15 @@ export function imageSizeFor(count: number): { width: number; height: number } {
 /**
  * 残すsplatのインデックスを選ぶ。
  *
- * 元データの並び順（splat-transformは空間的に並べる）を保ったまま等間隔の
- * バケットに切り、各バケットで最も不透明なsplatを残す。空間的な偏りが出ず、
- * 決定的なのでキャッシュとも噛み合う。
+ * 元データの並び順を保ったまま等間隔のバケットに切り、各バケットで最も
+ * 不透明なsplatを残す。決定的なのでキャッシュとも噛み合う。
+ *
+ * 前提: SOGのストリームがsplat-transformの並び順（空間的に近いsplatが
+ * 連続する）を保っていること。Insta360 Spatial Capture由来のSOGはこれを
+ * 満たす。並び順が空間的でないSOGを与えた場合、選ばれるsplat数は変わらない
+ * が、バケットが空間的にまとまらないため間引きの分布が偏りうる。あらゆる
+ * SOGへ広げるなら、meansをデコードしてMorton順に並べ直してからバケットを
+ * 切る方式へ移す必要がある。
  */
 export function chooseSplatIndices(
   opacity: Uint8Array,
