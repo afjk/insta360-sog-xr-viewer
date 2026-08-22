@@ -29,6 +29,10 @@ jobs:
         run: npm ci
       - name: Build static site
         run: npm run build:pages
+        env:
+          # 共有URLの解決を担うWorkerを用意したら、リポジトリ変数に設定する。
+          # 未設定なら共有URL入力は無効のままビルドされる。
+          VITE_SOG_RESOLVER_ORIGIN: ${{ vars.SOG_RESOLVER_ORIGIN }}
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v5
       - name: Upload GitHub Pages artifact

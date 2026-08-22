@@ -140,7 +140,8 @@ test("loads arbitrary SOG sources while keeping the bundled sample as default", 
 
   // Share URLs are resolved server-side because Insta360 does not send CORS headers.
   assert.match(viewer, /parseInsta360ShareUrl/);
-  assert.match(viewer, /\/api\/insta360\?mode=asset/);
+  assert.match(viewer, /resolverConfig\(\)/);
+  assert.match(viewer, /mode=asset/);
   assert.match(route, /export async function GET/);
   assert.match(route, /access-control-allow-origin/);
   assert.match(route, /isPubliclyRoutableHost/);
