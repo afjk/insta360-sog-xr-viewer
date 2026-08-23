@@ -8,8 +8,9 @@ import {
   isPubliclyRoutableHost,
   isSpatialAssetUrl,
   parseInsta360ShareUrl,
-  resolveSpatialAssetFromHtml,
-  resolveSpatialAssetFromTaskDetail,
+  resolveAssetsFromHtml,
+  resolveAssetsFromTaskDetail,
+  selectCamerasOutput,
   selectSpatialOutput,
   taskDetailApiUrls,
   toAbsoluteUrl,
@@ -101,7 +102,8 @@ const PLY_URL = `${ASSET_BASE}/0_3DGS.ply${SIGNED_QUERY}`;
 const OUTPUTS = [
   { name: "0_3DGS.ply", type: "model", fileFormat: "ply", url: PLY_URL },
   { name: "1_3DGS.sog", type: "model", fileFormat: "sog", url: SOG_URL },
-  { name: "2_cameras.json", type: "camera", fileFormat: "json", url: `${ASSET_BASE}/2_cameras.json${SIGNED_QUERY}` },
+  // 実データの `type` はSOGやPLYと同じ `"model"`。カメラ情報は型では見分けられない。
+  { name: "2_cameras.json", type: "model", fileFormat: "json", url: `${ASSET_BASE}/2_cameras.json${SIGNED_QUERY}` },
   { name: "3_3DGS.voxel.zip", type: "voxel", fileFormat: "zip", url: `${ASSET_BASE}/3_3DGS.voxel.zip${SIGNED_QUERY}` },
   { name: "4_effect_1.mp4", type: "video", fileFormat: "mp4", url: `${ASSET_BASE}/4_effect_1.mp4${SIGNED_QUERY}` },
 ];
@@ -116,6 +118,11 @@ function sharePageHtml(payload: unknown): string {
   ].join("");
 }
 
+// 既存のテストはSOGのURLだけを見る。カメラ情報を足したAPIの薄い読み替え。
+const assetUrlFromHtml = (html: string, baseUrl: string) =>
+  resolveAssetsFromHtml(html, baseUrl)?.assetUrl ?? null;
+const assetUrlFromTaskDetail = (body: unknown) => resolveAssetsFromTaskDetail(body)?.assetUrl ?? null;
+
 const sharePage = (outputs: unknown = OUTPUTS) =>
   sharePageHtml({ props: { pageProps: { taskDetail: { id: SHARE_ID, outputs } } } });
 
@@ -124,7 +131,7 @@ test("restores escaped ampersands so signed URLs stay intact", () => {
 });
 
 test("reads the signed SOG URL out of __NEXT_DATA__", () => {
-  const resolved = resolveSpatialAssetFromHtml(sharePage(), SHARE_URL);
+  const resolved = assetUrlFromHtml(sharePage(), SHARE_URL);
   assert.equal(resolved, SOG_URL);
   assert.match(resolved ?? "", /&x-oss-expires=604800&/, "query separators survive");
   assert.doesNotMatch(resolved ?? "", /\\u0026/);
@@ -146,18 +153,18 @@ test("falls back to the file extension when the format field is missing", () => 
 
 test("still finds the outputs when they move off the documented path", () => {
   const html = sharePageHtml({ props: { pageProps: { detail: { result: { files: OUTPUTS } } } } });
-  assert.equal(resolveSpatialAssetFromHtml(html, SHARE_URL), SOG_URL);
+  assert.equal(assetUrlFromHtml(html, SHARE_URL), SOG_URL);
 });
 
 test("reports nothing when the capture has no SOG", () => {
   const withoutSog = OUTPUTS.filter((output) => output.fileFormat !== "sog");
-  assert.equal(resolveSpatialAssetFromHtml(sharePage(withoutSog), SHARE_URL), null);
+  assert.equal(assetUrlFromHtml(sharePage(withoutSog), SHARE_URL), null);
 });
 
 test("keeps scanning the markup when the page carries no __NEXT_DATA__", () => {
   const html = `<script>window.__D__={"sog":"https:\\/\\/cdn.insta360.com\\/a\\/capture.sog"}</script>`;
   assert.equal(
-    resolveSpatialAssetFromHtml(html, SHARE_URL),
+    assetUrlFromHtml(html, SHARE_URL),
     "https://cdn.insta360.com/a/capture.sog",
   );
 });
@@ -189,14 +196,58 @@ test("reads the signed SOG URL out of a task detail API response", () => {
     },
   };
   assert.equal(
-    resolveSpatialAssetFromTaskDetail(body),
+    assetUrlFromTaskDetail(body),
     "https://p2-app.insta360.com/3dgs/x/1_3DGS.sog?sig=b",
   );
 });
 
 test("ignores a task detail response that reports an error code", () => {
   const outputs = [{ fileFormat: "sog", type: "model", url: "https://p2-app.insta360.com/a.sog" }];
-  assert.equal(resolveSpatialAssetFromTaskDetail({ code: 40000, data: { outputs } }), null);
-  assert.equal(resolveSpatialAssetFromTaskDetail(null), null);
-  assert.equal(resolveSpatialAssetFromTaskDetail({ code: 0, data: {} }), null);
+  assert.equal(assetUrlFromTaskDetail({ code: 40000, data: { outputs } }), null);
+  assert.equal(assetUrlFromTaskDetail(null), null);
+  assert.equal(assetUrlFromTaskDetail({ code: 0, data: {} }), null);
+});
+
+test("picks up the camera poses that ship next to the SOG", () => {
+  // 公式Viewerの初期視点は `2_cameras.json` から来る。SOGと同じ `outputs` に
+  // 並んでいて、`type` もSOGと同じ `"model"` なので、ファイル名で拾う。
+  const outputs = findTaskOutputs(extractNextData(sharePage()));
+  assert.equal(selectCamerasOutput(outputs)?.name, "2_cameras.json");
+  assert.equal(
+    resolveAssetsFromHtml(sharePage(), SHARE_URL)?.camerasUrl,
+    `${ASSET_BASE}/2_cameras.json${SIGNED_QUERY}`,
+  );
+  assert.equal(
+    resolveAssetsFromTaskDetail({ code: 0, data: { outputs: OUTPUTS } })?.camerasUrl,
+    `${ASSET_BASE}/2_cameras.json${SIGNED_QUERY}`,
+  );
+});
+
+test("finds the camera poses by file name when the type field is missing", () => {
+  const outputs = findTaskOutputs(
+    extractNextData(
+      sharePage([
+        { name: "1_3DGS.sog", url: SOG_URL },
+        { name: "2_cameras.json", url: `${ASSET_BASE}/2_cameras.json${SIGNED_QUERY}` },
+      ]),
+    ),
+  );
+  assert.equal(selectCamerasOutput(outputs)?.fileFormat, "json");
+});
+
+test("does not mistake a SOG directory index for the camera poses", () => {
+  // `meta.json` はSOGディレクトリ形式の索引。カメラ情報ではない。
+  const outputs = findTaskOutputs(
+    extractNextData(sharePage([{ name: "meta.json", url: `${ASSET_BASE}/sog/meta.json` }])),
+  );
+  assert.equal(selectCamerasOutput(outputs), null);
+  // カメラ情報が無くてもSOGの解決は成り立つ。
+  assert.equal(resolveAssetsFromHtml(sharePage(), SHARE_URL)?.assetUrl, SOG_URL);
+  assert.equal(
+    resolveAssetsFromTaskDetail({
+      code: 0,
+      data: { outputs: [{ fileFormat: "sog", url: SOG_URL }] },
+    })?.camerasUrl,
+    null,
+  );
 });

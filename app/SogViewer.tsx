@@ -24,7 +24,25 @@ import {
   toAbsoluteUrl,
 } from "./insta360";
 import { resolverConfig } from "./resolver-config";
-import { hrefWithoutShareId, permalinkFor, readShareId } from "./permalink";
+import { hrefWithoutShareId, permalinkFor, readShareId, readViewPose } from "./permalink";
+import {
+  normalizeYawDegrees,
+  orbitTargetOf,
+  pitchDegreesFromForward,
+  xrRigOffset,
+  yawDegreesFromBasis,
+  type HorizontalPose,
+  type ViewPose,
+} from "./view-pose";
+import {
+  captureFovOf,
+  captureHomeView,
+  parseCaptureCameras,
+  responsiveFovDegrees,
+  splatPlacement,
+  type CaptureCamera,
+  type CaptureFov,
+} from "./capture-view";
 import { optimizationUnsupportedReason } from "./sog-image";
 import {
   DEFAULT_TARGET_SPLATS,
@@ -45,6 +63,10 @@ type SourceKind = "sample" | "url" | "file";
 type ViewerSource = { kind: SourceKind; label: string; shareId?: string };
 type LoadRequest = { kind: "url"; value: string } | { kind: "file"; file: File };
 type Bounds = { min: Vec3; max: Vec3 };
+// コピーできるリンクは2種類。「この空間のリンク」(`?id=`) と
+// 「この視点のリンク」(`?id=…&view=`)。結果の表示はボタンごとに出し分ける。
+type CopyTarget = "space" | "view";
+type CopyState = { target: CopyTarget; state: "done" | "error" } | null;
 type OptimizedInfo = { splats: number; bytes: number; fromCache: boolean; targetSplats: number };
 
 const SAMPLE_URL = "capture.sog";
@@ -55,7 +77,12 @@ const SAMPLE_LABEL = "サンプル空間 capture.sog";
 const CAPTURE_MIN = new Vec3(-6.911, -1.263, -3.762);
 const CAPTURE_MAX = new Vec3(6.178, 1.654, 3.802);
 const INITIAL_PITCH = 0.08;
+// 撮影画角が分からない空間で使う既定の垂直画角。Insta360共有から
+// `cameras.json` が取れたときは、そちらの画角へ置き換える。
+const DEFAULT_FOV = 58;
 const UP = new Vec3(0, 1, 0);
+const RAD_TO_DEG = 180 / Math.PI;
+const DEG_TO_RAD = Math.PI / 180;
 // Desktopの視点操作。回転の中心は部屋の中心に置き、そこから部屋の半径に対する
 // 比率だけカメラを引く。360度キャプチャの内側に留まったまま中心を軸に回れる距離。
 // サンプル（半径約6.5m）で約2mになる比率。
@@ -154,6 +181,8 @@ const splatCountOf = (resource: unknown): number | null => {
 export function SogViewer() {
   const viewportRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // 「この視点のリンクをコピー」から、いま見えている視点を読むための橋渡し。
+  const currentViewRef = useRef<() => ViewPose | null>(() => null);
   const prepareVrRef = useRef<(variant: VrVariant) => void>(() => undefined);
   const startVrRef = useRef<() => void>(() => undefined);
   const loadSourceRef = useRef<(request: LoadRequest) => void>(() => undefined);
@@ -182,7 +211,7 @@ export function SogViewer() {
   // 読み込み中の対象名。表示中の空間 (`source`) はロードが終わってから
   // 差し替わるので、その間の見出しはこちらを使う。
   const [pendingLabel, setPendingLabel] = useState("");
-  const [copyState, setCopyState] = useState<"idle" | "done" | "error">("idle");
+  const [copyState, setCopyState] = useState<CopyState>(null);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [sourceStage, setSourceStage] = useState("");
   const [sourceProgress, setSourceProgress] = useState(0);
@@ -232,12 +261,31 @@ export function SogViewer() {
     const cameraEntity = new Entity("xr-camera");
     cameraEntity.addComponent("camera", {
       clearColor: new Color(0.0196, 0.0275, 0.0392),
-      fov: 58,
+      fov: DEFAULT_FOV,
       nearClip: 0.01,
       farClip: 500,
     });
     rig.addChild(cameraEntity);
     const camera = cameraEntity.camera as CameraComponent;
+    // 表示中の空間の撮影画角。`cameras.json` が取れたときだけ入る。
+    let captureFov: CaptureFov | null = null;
+
+    /**
+     * 表示領域に合わせて垂直画角を決め直す。
+     *
+     * 撮影画角は水平・垂直の組で来るので、画面の縦横比によってどちらを
+     * 基準にするかが変わる。撮影画角が無い空間では既定値のまま。
+     * XR中は画角をHMDが決めるので、ここでは触らない。
+     */
+    const applyFov = (width: number, height: number) => {
+      camera.fov = captureFov ? responsiveFovDegrees(captureFov, width, height) : DEFAULT_FOV;
+    };
+
+    /** 読み込んだ空間の撮影画角へ切り替える。無ければ既定値へ戻す。 */
+    const applyCaptureFov = (fov: CaptureFov | null) => {
+      captureFov = fov;
+      applyFov(Math.max(1, viewport.clientWidth), Math.max(1, viewport.clientHeight));
+    };
 
     const worldTarget = new Vec3();
     const updateDesktopCamera = () => {
@@ -252,6 +300,27 @@ export function SogViewer() {
     };
     updateDesktopCamera();
 
+    /**
+     * いま見えている視点を、リンクにもXRにも使える一意な形で取り出す。
+     *
+     * Viewerの内部状態は `desktopTarget`（rig座標）と rig の位置に分かれていて、
+     * WASDで移動したあとは同じ `desktopTarget` でも別の場所を指す。ここでは
+     * カメラのworld姿勢そのものから読むので、どう動かしたあとでも
+     * 「実際に見えている場所」が取れる。
+     */
+    const currentViewPose = (): ViewPose => {
+      const eye = cameraEntity.getPosition();
+      const forward = cameraEntity.forward;
+      return {
+        x: eye.x,
+        y: eye.y,
+        z: eye.z,
+        yaw: yawDegreesFromBasis(forward, cameraEntity.up),
+        pitch: pitchDegreesFromForward(forward),
+        distance,
+      };
+    };
+
     const splatEntity = new Entity("insta360-sog");
     // Insta360's capture axes are Y-down / Z-forward. A 180° X rotation makes
     // the room Y-up / Z-back without using a negative scale in stereo XR.
@@ -260,12 +329,9 @@ export function SogViewer() {
 
     /** 180°回転後に部屋が原点に中心し、床がy=0に来るよう配置する。 */
     const applyPlacement = (bounds: Bounds) => {
+      const placement = splatPlacement(bounds);
       splatEntity.setLocalEulerAngles(180, 0, 0);
-      splatEntity.setLocalPosition(
-        -(bounds.min.x + bounds.max.x) * 0.5,
-        bounds.max.y,
-        (bounds.min.z + bounds.max.z) * 0.5,
-      );
+      splatEntity.setLocalPosition(placement.x, placement.y, placement.z);
     };
 
     const resetView = (target: Vec3, nextDistance: number) => {
@@ -278,6 +344,72 @@ export function SogViewer() {
       rig.setLocalEulerAngles(0, 0, 0);
       updateDesktopCamera();
     };
+
+    /**
+     * 保存されたworld空間の視点をDesktopのカメラへ戻す。
+     *
+     * rigを原点へ戻したうえで、rig座標＝world座標として組み直す。カメラは
+     * 注視点からの相対で置かれているので、保存したeyeとyaw/pitch/distanceから
+     * 逆に注視点を割り出して `desktopTarget` に入れる。こうすると復元直後の
+     * Orbit操作も、リンクを作った側と同じ中心を回る。
+     */
+    const applyViewPose = (pose: ViewPose) => {
+      yaw = pose.yaw * DEG_TO_RAD;
+      pitch = clamp(pose.pitch * DEG_TO_RAD, -MAX_PITCH, MAX_PITCH);
+      distance = clamp(pose.distance, DOLLY_RANGE.min, DOLLY_RANGE.max);
+      pressedKeys.clear();
+      rig.setLocalPosition(0, 0, 0);
+      rig.setLocalEulerAngles(0, 0, 0);
+      const target = orbitTargetOf({
+        ...pose,
+        pitch: pitch * RAD_TO_DEG,
+        distance,
+      });
+      desktopTarget.set(target.x, target.y, target.z);
+      updateDesktopCamera();
+    };
+
+    /**
+     * VRへ入る直前のDesktop視点へ戻す。
+     *
+     * XR中のlocomotionはrigを動かすので、rigをゼロに戻すだけでは足りない。
+     * VR開始前にWASDでrigへ入っていた移動量まで消えて、Desktopの視点が
+     * 空間の初期位置へ飛んでしまう。控えておいたworld視点を`applyViewPose`で
+     * 組み直せば、rigは原点に戻ったまま見え方は開始前と同じになる。
+     *
+     * XR終了と `xr.start()` 失敗の両方から呼ぶ。二度目は何もしない。
+     */
+    const restoreDesktopView = () => {
+      const view = desktopReturnView;
+      if (!view) return;
+      desktopReturnView = null;
+      applyViewPose(view);
+    };
+
+    /**
+     * URLの `view=` に入っている視点。初期視点の第一優先。
+     *
+     * `view=` は空間に紐づくので、アドレスバーが指している共有IDといま読み込んだ
+     * 空間が一致するときだけ使う。別の空間へ切り替えたときに前の視点を持ち込まない。
+     */
+    const linkedViewFor = (shareId: string | undefined): ViewPose | null => {
+      if (!shareId) return null;
+      const href = window.location.href;
+      if (readShareId(href) !== shareId) return null;
+      return readViewPose(href);
+    };
+
+    /**
+     * `cameras.json` から組み立てた、公式Viewerと同じ初期視点。第二優先。
+     *
+     * 撮影を始めた地点から軌跡の中心を見る構図で、公式の共有ページを開いた
+     * 直後と同じ場所・同じ向きになる。Insta360共有のときだけ入る。
+     *
+     * 初期視点の優先順位はDesktopでもXRでも同じで、
+     * 1. URLの `view=`（`linkedViewFor`）→ 2. これ → 3. `frameBounds()` の既定視点。
+     */
+    const homeViewFor = (cameras: CaptureCamera[] | null, bounds: Bounds): ViewPose | null =>
+      cameras ? captureHomeView(cameras, splatPlacement(bounds)) : null;
 
     /**
      * 読み込んだ空間に合わせて視点を組み直す。
@@ -298,6 +430,16 @@ export function SogViewer() {
 
     // ダブルクリックで視点を戻せるよう、いま表示している空間の広がりを覚えておく。
     let framedBounds: Bounds = { min: CAPTURE_MIN, max: CAPTURE_MAX };
+    // VR開始時に合わせたいworld視点。HMDのposeが届く前は補正できないので、
+    // ここへ置いて最初の有効なフレームで1回だけ適用する。
+    let pendingXrSpawn: ViewPose | null = null;
+    // VRへ入る直前のDesktop視点。役割が違うので `pendingXrSpawn` とは分けてある
+    // （あちらは最初のHMD poseで消える。こちらはVRを抜けるまで持つ）。
+    let desktopReturnView: ViewPose | null = null;
+    // `?debug=1` で開いたときだけ、spawn結果をconsoleへ出す。実機でDesktopと
+    // Questの視点を突き合わせるための確認用で、既定では何も出さない。
+    const xrDebug = new URLSearchParams(window.location.search).get("debug") === "1";
+    let xrSpawnDebug: ViewPose | null = null;
 
     applyPlacement(framedBounds);
     frameBounds(framedBounds);
@@ -380,20 +522,44 @@ export function SogViewer() {
     };
 
     /**
+     * 撮影時のカメラ情報（`cameras.json`）を取りに行く。取れなければ `null`。
+     *
+     * 署名付きURLは `access-control-allow-origin: *` を返すので、SOGと同じく
+     * ブラウザから直接取れる。使い道は初期視点と画角だけなので、失敗しても
+     * 空間の表示は止めない（既定の視点へ落ちる）。
+     */
+    const downloadCaptureCameras = async (url: string): Promise<CaptureCamera[] | null> => {
+      try {
+        const response = await fetch(url);
+        if (!response.ok) return null;
+        return parseCaptureCameras(await response.json());
+      } catch {
+        return null;
+      }
+    };
+
+    /**
      * アドレスバーを表示中の空間に合わせる。
      *
      * Insta360由来なら共有IDだけを載せ、それ以外なら残っている `id` を落とす。
      * 署名付きURLはここには出さない。ページ遷移もしないので、
      * `history.replaceState` で書き換えるだけ。
+     *
+     * `pose` は復元に使った視点。`view=` 付きで開かれたときはそのまま残すので、
+     * リロードしても同じ画角に戻る。視点を使わなかった空間では落とす。
      */
-    const syncPermalink = (shareId: string | undefined) => {
+    const syncPermalink = (shareId: string | undefined, pose: ViewPose | null) => {
       const href = window.location.href;
-      const next = shareId ? permalinkFor(href, shareId) : hrefWithoutShareId(href);
+      const next = shareId ? permalinkFor(href, shareId, pose) : hrefWithoutShareId(href);
       if (next && next !== href) window.history.replaceState(null, "", next);
     };
 
     /** Original SOGを差し替える。VR最適化済みの結果は入力が変わるので捨てる。 */
-    const showOriginal = async (next: ViewerSource, buffer: ArrayBuffer) => {
+    const showOriginal = async (
+      next: ViewerSource,
+      buffer: ArrayBuffer,
+      cameras: CaptureCamera[] | null = null,
+    ) => {
       const isSample = next.kind === "sample";
       const hash = typeof crypto?.subtle === "undefined" ? null : await sha256Hex(buffer);
       const blob = new Blob([buffer]);
@@ -401,7 +567,13 @@ export function SogViewer() {
       const bounds = boundsFromResource(loaded.asset.resource) ?? { min: CAPTURE_MIN, max: CAPTURE_MAX };
       framedBounds = isSample ? { min: CAPTURE_MIN, max: CAPTURE_MAX } : bounds;
       applyPlacement(framedBounds);
-      frameBounds(framedBounds);
+      applyCaptureFov(cameras ? captureFovOf(cameras) : null);
+      // `view=` で開かれていればその視点。無ければ公式と同じ初期視点、
+      // それも無ければ空間の広がりから決める既定視点へ落ちる。
+      const linkedView = linkedViewFor(next.shareId);
+      const initialView = linkedView ?? homeViewFor(cameras, framedBounds);
+      if (initialView) applyViewPose(initialView);
+      else frameBounds(framedBounds);
       attachAsset(loaded.asset);
       const previous = original;
       original = { ...loaded, blob, hash };
@@ -409,7 +581,9 @@ export function SogViewer() {
       releaseOptimized();
       setOriginalSplats(splatCountOf(loaded.asset.resource));
       setSource(next);
-      syncPermalink(next.shareId);
+      // アドレスバーへ残すのはユーザーが指定した視点だけ。こちらで決めた
+      // 初期視点まで載せると、共有IDだけのリンクが視点付きに化けてしまう。
+      syncPermalink(next.shareId, linkedView);
       setStatus("ready");
     };
 
@@ -424,11 +598,10 @@ export function SogViewer() {
     const onXrEnd = () => {
       if (disposed) return;
       setInXr(false);
+      pendingXrSpawn = null;
       // Desktop表示はOriginalに戻す。
       if (original) attachAsset(original.asset);
-      rig.setLocalPosition(0, 0, 0);
-      rig.setLocalEulerAngles(0, 0, 0);
-      updateDesktopCamera();
+      restoreDesktopView();
     };
     const onXrError = (error: Error) => {
       if (disposed) return;
@@ -446,6 +619,15 @@ export function SogViewer() {
       setErrorMessage("");
       setVrOpen(false);
       pressedKeys.clear();
+      // VRはいまDesktopに見えている視点から始める（`view=` で開いていれば
+      // その視点、無ければ `frameBounds()` の既定視点）。rigは一度identityへ
+      // 戻し、HMDのposeが届いた最初のフレームでこの視点へ合わせ直す。ここで
+      // 0のままにすると、リンクで指定された場所を見失う。
+      const desktopView = currentViewPose();
+      pendingXrSpawn = desktopView;
+      // VRを抜けたときに戻る先。rigをゼロにするので、控えておかないと
+      // WASDで移動した分がここで失われる。
+      desktopReturnView = desktopView;
       rig.setLocalPosition(0, 0, 0);
       rig.setLocalEulerAngles(0, 0, 0);
       attachAsset(entry.asset);
@@ -456,7 +638,10 @@ export function SogViewer() {
         optionalFeatures: ["hand-tracking"],
         callback: (error) => {
           if (disposed || !error) return;
+          pendingXrSpawn = null;
           if (original) attachAsset(original.asset);
+          // 開始に失敗した場合も、rigはすでにゼロへ戻してある。
+          restoreDesktopView();
           setErrorMessage(error.message);
         },
       });
@@ -592,6 +777,7 @@ export function SogViewer() {
       }
     };
 
+    currentViewRef.current = () => (disposed ? null : currentViewPose());
     prepareVrRef.current = (variant) => {
       void prepareVariant(variant);
     };
@@ -616,12 +802,12 @@ export function SogViewer() {
         throw new Error("共有URLの解決サービスに接続できませんでした。");
       }
       const payload = (await response.json().catch(() => null)) as
-        | { assetUrl?: string; error?: string }
+        | { assetUrl?: string; camerasUrl?: string | null; error?: string }
         | null;
       if (!response.ok || !payload?.assetUrl) {
         throw new Error(payload?.error ?? `共有URLを解決できませんでした (HTTP ${response.status})`);
       }
-      return payload.assetUrl;
+      return { assetUrl: payload.assetUrl, camerasUrl: payload.camerasUrl ?? "" };
     };
 
     /**
@@ -673,6 +859,8 @@ export function SogViewer() {
       let label = "";
       let shareId: string | undefined;
       let fetchUrl = "";
+      // 撮影時のカメラ情報。Insta360共有を解決したときだけ入る。
+      let camerasUrl = "";
       let file: File | null = null;
 
       if (request.kind === "file") {
@@ -700,7 +888,9 @@ export function SogViewer() {
           setSourceStage("共有URLを解決中");
           reportProgress(-1);
           try {
-            fetchUrl = await resolveShare(share.shareUrl);
+            const resolved = await resolveShare(share.shareUrl);
+            fetchUrl = resolved.assetUrl;
+            camerasUrl = resolved.camerasUrl;
           } catch (error) {
             if (disposed || token !== loadToken) return;
             setSourceStage("");
@@ -722,12 +912,21 @@ export function SogViewer() {
       setPendingLabel(label);
       setSourceStage(`${label} を読み込み中`);
       reportProgress(0);
+      // カメラ情報はSOGと並行して取る。SOGより桁違いに小さいので、
+      // 待ち時間は増えない。
+      const camerasRequest = camerasUrl
+        ? downloadCaptureCameras(camerasUrl)
+        : Promise.resolve(null);
       try {
         const buffer = file ? await file.arrayBuffer() : await downloadSog(fetchUrl, reportProgress);
         if (disposed || token !== loadToken) return;
         setSourceStage(`${label} を展開中`);
         reportProgress(-1);
-        await showOriginal({ kind: request.kind === "file" ? "file" : "url", label, shareId }, buffer);
+        await showOriginal(
+          { kind: request.kind === "file" ? "file" : "url", label, shareId },
+          buffer,
+          await camerasRequest,
+        );
         if (disposed || token !== loadToken) return;
         shownKey = key;
         setSourceStage("");
@@ -932,6 +1131,77 @@ export function SogViewer() {
       updateDesktopCamera();
     };
 
+    // XR中のHMD姿勢を読むための作業用ベクトル。毎フレーム作らない。
+    const LOCAL_FORWARD = new Vec3(0, 0, -1);
+    const LOCAL_UP = new Vec3(0, 1, 0);
+    const headForward = new Vec3();
+    const headUp = new Vec3();
+
+    /**
+     * HMDのposeが届いた最初のフレームで、rigを目的の視点へ合わせる。
+     *
+     * XR中のcameraEntityの位置・回転はXRセッションがrig相対で毎フレーム
+     * 上書きするので、カメラへ直接書いても消える。動かせるのは親のrigだけ。
+     * `xrRigOffset` が `rig * HMD pose = 目的の視点` を解くので、その結果を
+     * そのままrigへ入れる。合わせるのは位置と水平yawだけで、pitch / rollは
+     * HMDのものを尊重する（VRではユーザー本人が頭を動かしている）。
+     *
+     * PlayCanvasはviewer poseを取れなかったフレームでは `app.update` ごと
+     * 飛ばすので、このハンドラが呼ばれた時点でカメラには有効なposeが
+     * 入っている。適用は1回だけで、あとは通常のlocomotionがrigを動かす。
+     */
+    const applyXrSpawn = () => {
+      if (!pendingXrSpawn) return;
+      const head = cameraEntity.getLocalPosition();
+      if (!Number.isFinite(head.x) || !Number.isFinite(head.y) || !Number.isFinite(head.z)) return;
+      const rotation = cameraEntity.getLocalRotation();
+      rotation.transformVector(LOCAL_FORWARD, headForward);
+      rotation.transformVector(LOCAL_UP, headUp);
+      const desired: HorizontalPose = {
+        x: pendingXrSpawn.x,
+        y: pendingXrSpawn.y,
+        z: pendingXrSpawn.z,
+        yaw: pendingXrSpawn.yaw,
+      };
+      const rigPose = xrRigOffset(desired, {
+        x: head.x,
+        y: head.y,
+        z: head.z,
+        yaw: yawDegreesFromBasis(headForward, headUp),
+      });
+      rig.setLocalPosition(rigPose.x, rigPose.y, rigPose.z);
+      rig.setLocalEulerAngles(0, rigPose.yaw, 0);
+      if (xrDebug) {
+        xrSpawnDebug = pendingXrSpawn;
+        console.info("[sog-xr] spawn", {
+          desired: desired,
+          head: { x: head.x, y: head.y, z: head.z, yaw: yawDegreesFromBasis(headForward, headUp) },
+          rig: rigPose,
+        });
+      }
+      pendingXrSpawn = null;
+    };
+
+    /**
+     * 補正の結果を、次のフレームの実際のカメラworld姿勢と突き合わせて出す。
+     *
+     * 見るのは `view=` に入っている値との差。位置で数cm〜10cm、yawで数度に
+     * 収まっていれば実機でも合っている。大きくずれるときは、local-floorの
+     * HMD poseをrigへ単純加算していないかを疑う。
+     */
+    const logXrSpawn = () => {
+      if (!xrSpawnDebug) return;
+      const actual = currentViewPose();
+      const desired = xrSpawnDebug;
+      xrSpawnDebug = null;
+      console.info("[sog-xr] spawned", {
+        desired,
+        actual,
+        positionDelta: Math.hypot(actual.x - desired.x, actual.y - desired.y, actual.z - desired.z),
+        yawDelta: Math.abs(normalizeYawDegrees(actual.yaw - desired.yaw)),
+      });
+    };
+
     const updateXrMovement = (deltaSeconds: number) => {
       let moveX = 0;
       let moveY = 0;
@@ -988,8 +1258,15 @@ export function SogViewer() {
     };
 
     const onUpdate = (deltaSeconds: number) => {
-      if (xr.active) updateXrMovement(Math.min(deltaSeconds, 0.05));
-      else updateDesktopMovement(Math.min(deltaSeconds, 0.05));
+      if (xr.active) {
+        // 突き合わせは補正の次のフレーム。実際のHMD poseで組み上がった
+        // world姿勢を見たいので、適用より先に置く。
+        logXrSpawn();
+        applyXrSpawn();
+        updateXrMovement(Math.min(deltaSeconds, 0.05));
+      } else {
+        updateDesktopMovement(Math.min(deltaSeconds, 0.05));
+      }
     };
     app.on("update", onUpdate);
 
@@ -998,6 +1275,7 @@ export function SogViewer() {
       const width = Math.max(1, viewport.clientWidth);
       const height = Math.max(1, viewport.clientHeight);
       app.resizeCanvas(width, height);
+      applyFov(width, height);
       updateDesktopCamera();
     };
     const resizeObserver = new ResizeObserver(resize);
@@ -1030,6 +1308,7 @@ export function SogViewer() {
 
     return () => {
       disposed = true;
+      currentViewRef.current = () => null;
       prepareVrRef.current = () => undefined;
       startVrRef.current = () => undefined;
       loadSourceRef.current = () => undefined;
@@ -1070,21 +1349,40 @@ export function SogViewer() {
    *
    * 共有IDから今のorigin/pathnameで組み立てるので、GitHub Pagesでも
    * localhostでも、開いているのと同じ配信先のURLになる。
+   *
+   * `view` を選ぶと、いま見えている視点（world空間の位置・yaw・pitch）を
+   * `view=` に足したリンクになる。受け取った側はDesktopでもQuestでも
+   * 同じ場所・同じ向きから始まる。
    */
-  const copyPermalink = async () => {
-    const permalink = source.shareId ? permalinkFor(window.location.href, source.shareId) : null;
+  const copyPermalink = async (target: CopyTarget) => {
+    const shareId = source.shareId;
+    if (!shareId) return;
+    const pose = target === "view" ? currentViewRef.current() : null;
+    if (target === "view" && !pose) return;
+    const permalink = permalinkFor(window.location.href, shareId, pose);
     if (!permalink) return;
+    // 視点リンクはアドレスバーも合わせておく。Clipboard APIが使えない環境でも
+    // 同じURLをアドレスバーから拾えるようにするため。
+    if (target === "view") window.history.replaceState(null, "", permalink);
     if (copyTimerRef.current !== null) clearTimeout(copyTimerRef.current);
     try {
       await navigator.clipboard.writeText(permalink);
-      setCopyState("done");
+      setCopyState({ target, state: "done" });
     } catch {
       // 非セキュアコンテキストなどでClipboard APIが使えない場合。
       // 同じURLはアドレスバーに出ているので、そちらを案内する。
-      setCopyState("error");
+      setCopyState({ target, state: "error" });
     }
-    copyTimerRef.current = setTimeout(() => setCopyState("idle"), 2400);
+    copyTimerRef.current = setTimeout(() => setCopyState(null), 2400);
   };
+
+  /** コピーボタンの表示。押されたボタンにだけ結果を出す。 */
+  const copyLabel = (target: CopyTarget, idle: string) =>
+    copyState?.target !== target
+      ? idle
+      : copyState.state === "done"
+        ? "✓ コピーしました"
+        : "コピーできませんでした（アドレスバーのURLをお使いください）";
 
   const isSample = source.kind === "sample";
   const sourceBusy = sourceStage !== "";
@@ -1164,19 +1462,26 @@ export function SogViewer() {
           VRを開始
         </button>
         {source.shareId && (
-          <button
-            id="copy-permalink"
-            className="copy-link-button"
-            type="button"
-            aria-label="この空間のリンクをコピー"
-            onClick={() => void copyPermalink()}
-          >
-            {copyState === "done"
-              ? "✓ コピーしました"
-              : copyState === "error"
-                ? "コピーできませんでした（アドレスバーのURLをお使いください）"
-                : "この空間のリンクをコピー"}
-          </button>
+          <>
+            <button
+              id="copy-permalink"
+              className="copy-link-button"
+              type="button"
+              aria-label="この空間のリンクをコピー"
+              onClick={() => void copyPermalink("space")}
+            >
+              {copyLabel("space", "この空間のリンクをコピー")}
+            </button>
+            <button
+              id="copy-view-permalink"
+              className="copy-link-button"
+              type="button"
+              aria-label="この視点のリンクをコピー"
+              onClick={() => void copyPermalink("view")}
+            >
+              {copyLabel("view", "この視点のリンクをコピー")}
+            </button>
+          </>
         )}
         <p className="control-hint">
           <span>左スティック</span> 移動&nbsp;&nbsp;·&nbsp;&nbsp;<span>右スティック</span> 旋回

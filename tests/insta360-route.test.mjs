@@ -7,6 +7,9 @@ const SIGNED_QUERY = "?x-oss-date=20260822T000000Z&x-oss-expires=604800&x-oss-si
 const SOG_URL = `https://p2-app.insta360.com/3dgs/${SHARE_ID}/1_3DGS.sog${SIGNED_QUERY}`;
 const API_URL = `https://service-g.insta360.com/app-service/app/service/gs3d/task/detail?taskOrderNo=${SHARE_ID}`;
 const API_SOG_URL = `https://p2-app.insta360.com/3dgs/${SHARE_ID}/1_3DGS.sog?from=api`;
+// 公式Viewerの初期視点のもとになるカメラ情報。SOGと同じ `outputs` に並んでいる。
+const CAMERAS_URL = `https://p2-app.insta360.com/3dgs/${SHARE_ID}/2_cameras.json${SIGNED_QUERY}`;
+const API_CAMERAS_URL = `https://p2-app.insta360.com/3dgs/${SHARE_ID}/2_cameras.json?from=api`;
 
 /** 実際の共有ページと同じく、署名付きURLを __NEXT_DATA__ に埋めたHTMLを作る。 */
 function sharePageHtml() {
@@ -23,6 +26,7 @@ function sharePageHtml() {
               url: `https://p2-app.insta360.com/3dgs/${SHARE_ID}/0_3DGS.ply${SIGNED_QUERY}`,
             },
             { name: "1_3DGS.sog", type: "model", fileFormat: "sog", url: SOG_URL },
+            { name: "2_cameras.json", type: "model", fileFormat: "json", url: CAMERAS_URL },
           ],
         },
       },
@@ -41,6 +45,7 @@ function taskDetailBody() {
       outputs: [
         { fileFormat: "ply", type: "model", url: `https://p2-app.insta360.com/3dgs/${SHARE_ID}/0_3DGS.ply?from=api` },
         { fileFormat: "sog", type: "model", url: API_SOG_URL },
+        { fileFormat: "json", type: "model", url: API_CAMERAS_URL },
       ],
     },
   };
@@ -90,7 +95,11 @@ test("resolves an Insta360 share URL through the task detail API", async () => {
     const response = await callRoute(`url=${encodeURIComponent(SHARE_URL)}`);
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("access-control-allow-origin"), "*");
-    assert.deepEqual(await response.json(), { shareId: SHARE_ID, assetUrl: API_SOG_URL });
+    assert.deepEqual(await response.json(), {
+      shareId: SHARE_ID,
+      assetUrl: API_SOG_URL,
+      camerasUrl: API_CAMERAS_URL,
+    });
     // APIで解決できたら共有ページのHTMLは取りに行かない。
     assert.ok(seen.includes(API_URL));
     assert.ok(!seen.some((url) => url.startsWith(SHARE_URL)));
@@ -106,7 +115,11 @@ test("falls back to the share page when the task detail API fails", async () => 
   try {
     const response = await callRoute(`url=${encodeURIComponent(SHARE_URL)}`);
     assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { shareId: SHARE_ID, assetUrl: SOG_URL });
+    assert.deepEqual(await response.json(), {
+      shareId: SHARE_ID,
+      assetUrl: SOG_URL,
+      camerasUrl: CAMERAS_URL,
+    });
   } finally {
     restore();
   }
@@ -120,8 +133,14 @@ test("hands back the signed URL instead of proxying the SOG", async () => {
     const response = await callRoute(`url=${encodeURIComponent(SHARE_URL)}&mode=asset`);
     assert.equal(response.status, 200);
     assert.match(response.headers.get("content-type") ?? "", /application\/json/);
-    assert.deepEqual(await response.json(), { shareId: SHARE_ID, assetUrl: API_SOG_URL });
+    assert.deepEqual(await response.json(), {
+      shareId: SHARE_ID,
+      assetUrl: API_SOG_URL,
+      camerasUrl: API_CAMERAS_URL,
+    });
+    // URLを返すだけ。SOGもカメラ情報もWorkerは取りに行かない。
     assert.ok(!seen.includes(API_SOG_URL));
+    assert.ok(!seen.includes(API_CAMERAS_URL));
   } finally {
     restore();
   }
