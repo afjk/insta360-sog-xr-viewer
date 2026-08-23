@@ -259,7 +259,9 @@ test("restores the linked view on desktop and spawns XR from the rig", async () 
   // 実機の突き合わせ用ログは `?debug=1` のときだけ。既定では何も出さない。
   assert.match(viewer, /const xrDebug = new URLSearchParams\(window\.location\.search\)\.get\("debug"\) === "1"/);
   assert.match(viewer, /if \(xrDebug\) \{/);
-  assert.equal(viewer.match(/console\.info/g)?.length, 2);
+  // 初期視点の根拠（`cameras.json` が届いたか）も同じフラグで出す。
+  assert.match(viewer, /console\.info\("\[sog-xr\] initial"/);
+  assert.equal(viewer.match(/console\.info/g)?.length, 3);
 });
 
 test("builds and deploys a repository-relative GitHub Pages site", async () => {

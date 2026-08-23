@@ -35,13 +35,17 @@ import {
   type ViewPose,
 } from "./view-pose";
 import {
+  boxCentre,
   captureFovOf,
   captureHomeView,
   parseCaptureCameras,
   responsiveFovDegrees,
+  splatBoundsFromCenters,
   splatPlacement,
+  worldFromCapturePoint,
   type CaptureCamera,
   type CaptureFov,
+  type SplatBounds,
 } from "./capture-view";
 import { optimizationUnsupportedReason } from "./sog-image";
 import {
@@ -62,7 +66,7 @@ type SourceKind = "sample" | "url" | "file";
 // 出し分けは、ラベル文字列を読み直すのではなくこれで判断する。
 type ViewerSource = { kind: SourceKind; label: string; shareId?: string };
 type LoadRequest = { kind: "url"; value: string } | { kind: "file"; file: File };
-type Bounds = { min: Vec3; max: Vec3 };
+type Bounds = SplatBounds;
 // コピーできるリンクは2種類。「この空間のリンク」(`?id=`) と
 // 「この視点のリンク」(`?id=…&view=`)。結果の表示はボタンごとに出し分ける。
 type CopyTarget = "space" | "view";
@@ -76,6 +80,12 @@ const SAMPLE_LABEL = "サンプル空間 capture.sog";
 // outliers in the raw bounds are intentionally ignored when placing the room.
 const CAPTURE_MIN = new Vec3(-6.911, -1.263, -3.762);
 const CAPTURE_MAX = new Vec3(6.178, 1.654, 3.802);
+// サンプルは中央値を持たないので、箱の中点をそのまま中心として使う。
+const CAPTURE_BOUNDS: Bounds = {
+  min: CAPTURE_MIN,
+  max: CAPTURE_MAX,
+  centre: boxCentre({ min: CAPTURE_MIN, max: CAPTURE_MAX }),
+};
 const INITIAL_PITCH = 0.08;
 // 撮影画角が分からない空間で使う既定の垂直画角。Insta360共有から
 // `cameras.json` が取れたときは、そちらの画角へ置き換える。
@@ -95,9 +105,6 @@ const ORBIT_SPEED = { yaw: 0.006, pitch: 0.004 };
 // ホイール1ノッチ（deltaY≈100）で距離が約13%変わる。
 const DOLLY_SPEED = 0.0012;
 const WHEEL_LINE_HEIGHT = 16;
-// 任意SOGの床合わせに使う分位点。外れ値を無視して部屋の広がりを求める。
-const BOUNDS_PERCENTILE = 0.02;
-const BOUNDS_MAX_SAMPLES = 60_000;
 // 描画設定はVRで表示する版に合わせる。軽量版は解像度を下げてフォービエイションを強める。
 const VR_RENDER_PROFILE: Record<VrVariant, { framebufferScaleFactor: number; foveation: number }> = {
   original: { framebufferScaleFactor: 0.78, foveation: 0.55 },
@@ -125,33 +132,6 @@ const gamepadButtonPressed = (buttons: readonly GamepadButton[], index: number) 
   return Boolean(button?.pressed || (button?.value ?? 0) > 0.5);
 };
 
-/** 読み込んだSOGの重心分布から、外れ値に引きずられない配置用バウンズを求める。 */
-const percentileBounds = (centers: Float32Array): Bounds | null => {
-  const count = Math.floor(centers.length / 3);
-  if (count < 1) return null;
-  const stride = Math.max(1, Math.ceil(count / BOUNDS_MAX_SAMPLES));
-  const xs: number[] = [];
-  const ys: number[] = [];
-  const zs: number[] = [];
-  for (let index = 0; index < count; index += stride) {
-    xs.push(centers[index * 3]);
-    ys.push(centers[index * 3 + 1]);
-    zs.push(centers[index * 3 + 2]);
-  }
-  const range = (values: number[]) => {
-    values.sort((a, b) => a - b);
-    const last = values.length - 1;
-    return [
-      values[Math.round(last * BOUNDS_PERCENTILE)],
-      values[Math.round(last * (1 - BOUNDS_PERCENTILE))],
-    ] as const;
-  };
-  const [minX, maxX] = range(xs);
-  const [minY, maxY] = range(ys);
-  const [minZ, maxZ] = range(zs);
-  return { min: new Vec3(minX, minY, minZ), max: new Vec3(maxX, maxY, maxZ) };
-};
-
 const boundsFromResource = (resource: unknown): Bounds | null => {
   const splat = resource as
     | { centers?: Float32Array | null; aabb?: { getMin(): Vec3; getMax(): Vec3 } | null }
@@ -159,12 +139,13 @@ const boundsFromResource = (resource: unknown): Bounds | null => {
     | undefined;
   const centers = splat?.centers;
   if (centers && centers.length >= 3) {
-    const bounds = percentileBounds(centers);
+    const bounds = splatBoundsFromCenters(centers);
     if (bounds) return bounds;
   }
   const aabb = splat?.aabb;
-  if (aabb) return { min: aabb.getMin().clone(), max: aabb.getMax().clone() };
-  return null;
+  if (!aabb) return null;
+  const box = { min: aabb.getMin().clone(), max: aabb.getMax().clone() };
+  return { ...box, centre: boxCentre(box) };
 };
 
 const splatCountOf = (resource: unknown): number | null => {
@@ -412,24 +393,30 @@ export function SogViewer() {
       cameras ? captureHomeView(cameras, splatPlacement(bounds)) : null;
 
     /**
-     * 読み込んだ空間に合わせて視点を組み直す。
+     * 読み込んだ空間に合わせて視点を組み直す。`cameras.json` が無いときの既定視点。
      *
-     * 回転の中心は部屋の中心（目線の高さ）に置く。以前はカメラの前方に軌道中心を
-     * 取っていたため、何も無い場所を軸にカメラが振り回されていた。カメラは中心から
-     * 部屋の半径の3割ほど引いた位置に構えるので、360度キャプチャの内側に
-     * 留まったまま中心を軸に回れる。
+     * 回転の中心は目線の高さの「splatが集まっているところ」に置く。カメラは
+     * そこから空間の半径の3割ほど引いた位置に構えるので、360度キャプチャの
+     * 内側に留まったまま中心を軸に回れる。
+     *
+     * 中心に箱の中点ではなく重心の中央値を使うのは、屋外のキャプチャでは
+     * 分位点バウンズでさえ大半が遠景（向かいのビルや空）で埋まり、中点が
+     * 歩いた範囲の外——建物の中——へ落ちるため。中央値なら撮影した場所の
+     * 近くに留まる。配置（`applyPlacement`）は箱の中点のままにしてあり、
+     * 既に配ったリンクの `view=` が別の場所を指すことはない。
      */
     const frameBounds = (bounds: Bounds) => {
       const eyeHeight = clamp((bounds.max.y - bounds.min.y) * 0.54, 1, 2.2);
       const radius = Math.max(bounds.max.x - bounds.min.x, bounds.max.z - bounds.min.z) * 0.5;
+      const centre = worldFromCapturePoint(bounds.centre, splatPlacement(bounds));
       resetView(
-        new Vec3(0, eyeHeight, 0),
+        new Vec3(centre.x, eyeHeight, centre.z),
         clamp(radius * ORBIT_DISTANCE_RATIO, ORBIT_DISTANCE_RANGE.min, ORBIT_DISTANCE_RANGE.max),
       );
     };
 
     // ダブルクリックで視点を戻せるよう、いま表示している空間の広がりを覚えておく。
-    let framedBounds: Bounds = { min: CAPTURE_MIN, max: CAPTURE_MAX };
+    let framedBounds: Bounds = CAPTURE_BOUNDS;
     // VR開始時に合わせたいworld視点。HMDのposeが届く前は補正できないので、
     // ここへ置いて最初の有効なフレームで1回だけ適用する。
     let pendingXrSpawn: ViewPose | null = null;
@@ -564,14 +551,27 @@ export function SogViewer() {
       const hash = typeof crypto?.subtle === "undefined" ? null : await sha256Hex(buffer);
       const blob = new Blob([buffer]);
       const loaded = await loadSplatAsset(next.label, blob, "space.sog");
-      const bounds = boundsFromResource(loaded.asset.resource) ?? { min: CAPTURE_MIN, max: CAPTURE_MAX };
-      framedBounds = isSample ? { min: CAPTURE_MIN, max: CAPTURE_MAX } : bounds;
+      const bounds = boundsFromResource(loaded.asset.resource) ?? CAPTURE_BOUNDS;
+      framedBounds = isSample ? CAPTURE_BOUNDS : bounds;
       applyPlacement(framedBounds);
       applyCaptureFov(cameras ? captureFovOf(cameras) : null);
       // `view=` で開かれていればその視点。無ければ公式と同じ初期視点、
       // それも無ければ空間の広がりから決める既定視点へ落ちる。
       const linkedView = linkedViewFor(next.shareId);
       const initialView = linkedView ?? homeViewFor(cameras, framedBounds);
+      // `?debug=1` のときだけ、何を根拠に初期視点を決めたかを出す。`cameras` が
+      // `null` のまま既定視点へ落ちていないか（resolverが `camerasUrl` を返して
+      // いるか）を、実際に配信されている版で確かめるための出力。
+      if (xrDebug) {
+        console.info("[sog-xr] initial", {
+          bounds: { ...framedBounds },
+          placement: splatPlacement(framedBounds),
+          cameraCount: cameras?.length ?? null,
+          linkedView,
+          initialView,
+          fov: camera.fov,
+        });
+      }
       if (initialView) applyViewPose(initialView);
       else frameBounds(framedBounds);
       attachAsset(loaded.asset);
