@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  boxCentre,
   captureFovOf,
   captureHomeView,
   parseCaptureCameras,
   responsiveFovDegrees,
+  splatBoundsFromCenters,
   splatPlacement,
   worldFromCapturePoint,
 } from "../app/capture-view.ts";
@@ -198,4 +200,30 @@ test("fits the capture field of view to the viewport", () => {
   close(responsiveFovDegrees(wide, 800, 1600), 90, 1e-9, "capped at 90");
   // 画面の大きさが取れないうちは撮影時の垂直画角をそのまま使う。
   close(responsiveFovDegrees(wide, 0, 0), 55, 1e-9, "no viewport yet");
+});
+
+test("summarises splat centres without letting outliers decide", () => {
+  // 90点は原点付近の塊、10点は遠くの背景。屋外キャプチャの縮図。
+  const values: number[] = [];
+  for (let i = 0; i < 90; i += 1) values.push(i / 90, 0, i / 90);
+  for (let i = 0; i < 10; i += 1) values.push(100 + i, 0, 100 + i);
+  const bounds = splatBoundsFromCenters(new Float32Array(values));
+  assert.ok(bounds);
+  // 2–98%の分位点なので、いちばん遠い外れ値は落ちるが背景はまだ残る。
+  assert.ok(bounds.max.x > 100, "the box still reaches the background");
+  // 中央値は塊の側に留まる。箱の中点（50超）とは大きく違う。
+  assert.ok(bounds.centre.x < 1.1, `centre stayed with the cluster (${bounds.centre.x})`);
+  assert.ok(boxCentre(bounds).x > 50, "the box midpoint is dragged into the background");
+  assert.equal(bounds.centre.z, bounds.centre.x);
+});
+
+test("has no bounds without splats", () => {
+  assert.equal(splatBoundsFromCenters(new Float32Array([])), null);
+});
+
+test("takes the midpoint of a box", () => {
+  const centre = boxCentre(BOUNDS);
+  close(centre.x, -0.5, 1e-12, "x");
+  close(centre.y, 0.05, 1e-12, "y");
+  close(centre.z, 1, 1e-12, "z");
 });

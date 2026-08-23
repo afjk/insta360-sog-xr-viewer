@@ -129,6 +129,23 @@ DesktopとQuestで同じ規則を使います。
 `null` を返すと `frameBounds()` へ落ちます。2で決まった視点はアドレスバーには載せません
 （`?id=` だけのリンクが、勝手に視点付きのリンクへ化けないようにするため）。
 
+どれが使われたかは `?debug=1` で開くと分かります。空間を読み込んだ直後に、分位点バウンズ・
+splatの配置・届いたカメラ情報の件数・決まった視点・画角が `[sog-xr] initial` として
+consoleへ出ます。`cameraCount` が `null` なら `cameras.json` が届いておらず、3へ落ちています
+（配信中のresolver Workerが古い、共有が期限切れ、`.sog` の直接指定、などが原因）。
+
+#### `cameras.json` が無いときの既定視点
+
+`frameBounds()` は、splat重心の分位点バウンズ（2–98%）から目線の高さと引きの距離を決め、
+**重心の中央値**を回転の中心に置きます。中心に箱の中点を使わないのは、屋外のキャプチャでは
+分位点バウンズでさえ大半が遠景（向かいのビルや空）で埋まり、中点が歩いた範囲の外——
+建物の中——へ落ちるためです。実データでは、ある夜間の街路キャプチャで箱の中点が撮影地点から
+水平に約5.7mずれ、開いた直後が真っ暗になっていました。中央値ならsplatが密なところ、つまり
+撮影した場所の近くに留まります。
+
+splatの**配置**（`applyPlacement()`）は箱の中点のままです。ここを動かすとworld座標が変わり、
+既に配ったリンクの `view=` が別の場所を指してしまいます。
+
 #### 公式Viewerと同じ初期視点
 
 resolverはタスク詳細の `outputs` から `2_cameras.json`（撮影時のカメラ情報）の署名付きURLを
@@ -263,6 +280,16 @@ GitHub Pagesは静的配信で `/api` を持たないため、`vite.pages.config
 ```bash
 npm run resolver:dev      # ローカルで動かす
 npm run resolver:deploy   # Cloudflareへデプロイ
+```
+
+**解決ロジックを変えたら、このWorkerも必ず再デプロイしてください。** Pages側のビルドが新しくても
+Workerが古いままだと、増えたフィールドがViewerへ届きません。実際、`camerasUrl` を返すように
+した後にWorkerを更新し忘れ、公開版だけが公式と違う初期視点で開く状態になっていました。
+配信中のWorkerが何を返しているかは、ブラウザを使わずに確かめられます。
+
+```bash
+curl "https://insta360-sog-resolver.<account>.workers.dev/api/insta360?url=https://app.insta360.com/3dspace/detail/GS3DG…"
+# => {"shareId":"GS3DG…","assetUrl":"…","camerasUrl":"…"}   camerasUrl が無ければ古い版
 ```
 
 デプロイしたら、リポジトリの **Settings → Secrets and variables → Actions → Variables** で

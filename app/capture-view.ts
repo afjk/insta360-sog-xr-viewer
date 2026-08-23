@@ -73,6 +73,62 @@ export function worldFromCapturePoint(point: Vec3Like, placement: SplatPlacement
   };
 }
 
+/** 配置と既定視点に使う、SOGの重心分布の要約。 */
+export type SplatBounds = {
+  /** 外れ値を落とした広がり（分位点）。配置と距離の目安に使う。 */
+  min: Vec3Like;
+  max: Vec3Like;
+  /** 重心の中央値。「splatが実際に集まっている場所」。 */
+  centre: Vec3Like;
+};
+
+// 外れ値を無視するための分位点と、走査するサンプル数の上限。
+const BOUNDS_PERCENTILE = 0.02;
+const BOUNDS_MAX_SAMPLES = 60_000;
+
+const quantile = (sorted: number[], ratio: number) =>
+  sorted[Math.round((sorted.length - 1) * ratio)];
+
+/**
+ * 読み込んだSOGの重心分布から、配置用のバウンズと中央値を求める。
+ *
+ * 広がり（`min` / `max`）は2–98%の分位点で、遠くに散った少数のsplatに
+ * 引きずられないようにしている。ただし屋外のキャプチャでは、その範囲でも
+ * 大半が遠景（向かいのビルや空）で埋まり、**箱の中点は撮影した場所から
+ * 大きく外れる**。既定視点の回転中心にはそこではなく `centre`（重心の
+ * 中央値＝splatが密なところ）を使う。
+ */
+export function splatBoundsFromCenters(centers: Float32Array): SplatBounds | null {
+  const count = Math.floor(centers.length / 3);
+  if (count < 1) return null;
+  const stride = Math.max(1, Math.ceil(count / BOUNDS_MAX_SAMPLES));
+  const axes: [number[], number[], number[]] = [[], [], []];
+  for (let index = 0; index < count; index += stride) {
+    axes[0].push(centers[index * 3]);
+    axes[1].push(centers[index * 3 + 1]);
+    axes[2].push(centers[index * 3 + 2]);
+  }
+  const [xs, ys, zs] = axes.map((values) => values.sort((a, b) => a - b));
+  return {
+    min: { x: quantile(xs, BOUNDS_PERCENTILE), y: quantile(ys, BOUNDS_PERCENTILE), z: quantile(zs, BOUNDS_PERCENTILE) },
+    max: {
+      x: quantile(xs, 1 - BOUNDS_PERCENTILE),
+      y: quantile(ys, 1 - BOUNDS_PERCENTILE),
+      z: quantile(zs, 1 - BOUNDS_PERCENTILE),
+    },
+    centre: { x: quantile(xs, 0.5), y: quantile(ys, 0.5), z: quantile(zs, 0.5) },
+  };
+}
+
+/** バウンズの箱の中点。中央値が取れないときの中心の代わり。 */
+export function boxCentre(bounds: CaptureBounds): Vec3Like {
+  return {
+    x: (bounds.min.x + bounds.max.x) * 0.5,
+    y: (bounds.min.y + bounds.max.y) * 0.5,
+    z: (bounds.min.z + bounds.max.z) * 0.5,
+  };
+}
+
 const readIntrinsics = (record: Record<string, unknown>): CaptureIntrinsics | null => {
   const { width, height, fx, fy } = record;
   if (!isFiniteNumber(width) || !isFiniteNumber(height)) return null;
