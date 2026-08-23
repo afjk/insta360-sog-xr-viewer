@@ -76,16 +76,15 @@ function stubInsta360(overrides = {}) {
   };
 }
 
-async function callRoute(query) {
-  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
-  const { default: worker } = await import(workerUrl.href);
-
-  return worker.fetch(
-    new Request(`http://localhost/api/insta360?${query}`),
-    { ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) } },
-    { waitUntil() {}, passThroughOnException() {} },
-  );
+/**
+ * 解決用Workerをそのまま呼ぶ。
+ *
+ * ビルド成果物ではなくソースを直接importする。このリポジトリが持つサーバーは
+ * このWorkerだけなので、テストするならこれが実物。
+ */
+async function callRoute(query, init) {
+  const { default: worker } = await import("../resolver-worker/index.ts");
+  return worker.fetch(new Request(`http://localhost/api/insta360?${query}`, init));
 }
 
 test("resolves an Insta360 share URL through the task detail API", async () => {
@@ -170,21 +169,40 @@ test("reports a readable error when the share page has no SOG", async () => {
   }
 });
 
-test("the dedicated Pages resolver Worker serves the same endpoint", async () => {
+test("answers the preflight the static site sends from another origin", async () => {
+  const { default: worker } = await import("../resolver-worker/index.ts");
+  const response = await worker.fetch(
+    new Request("http://localhost/api/insta360", { method: "OPTIONS" }),
+  );
+  assert.equal(response.status, 204);
+  assert.equal(response.headers.get("access-control-allow-origin"), "*");
+  assert.match(response.headers.get("access-control-allow-methods") ?? "", /GET/);
+});
+
+test("serves nothing but the resolver", async () => {
+  const { default: worker } = await import("../resolver-worker/index.ts");
+
+  // 素の `/` は生存確認だけ。SOGもページも配らない。
+  const root = await worker.fetch(new Request("http://localhost/"));
+  assert.equal(root.status, 200);
+  assert.match(await root.text(), /share URL resolver/);
+
+  const missing = await worker.fetch(new Request("http://localhost/anything"));
+  assert.equal(missing.status, 404);
+
+  const posted = await worker.fetch(
+    new Request("http://localhost/api/insta360", { method: "POST" }),
+  );
+  assert.equal(posted.status, 405);
+  assert.equal(posted.headers.get("access-control-allow-origin"), "*");
+});
+
+test("deploys as the one Worker this repository runs", async () => {
   const { readFile } = await import("node:fs/promises");
-  const [worker, config, packageJson] = await Promise.all([
-    readFile(new URL("../resolver-worker/index.ts", import.meta.url), "utf8"),
+  const [config, packageJson] = await Promise.all([
     readFile(new URL("../resolver-worker/wrangler.toml", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
-
-  // 解決ロジックはアプリ本体のWorkerと共有する。二重実装にしない。
-  assert.match(worker, /from "\.\.\/app\/insta360-resolver"/);
-  assert.match(worker, /url\.pathname === "\/api\/insta360"/);
-  assert.match(worker, /handleInsta360Options\(\)/);
   assert.match(config, /name = "insta360-sog-resolver"/);
   assert.match(packageJson, /"resolver:deploy": "wrangler deploy --config resolver-worker\/wrangler\.toml"/);
-
-  const route = await readFile(new URL("../app/api/insta360/route.ts", import.meta.url), "utf8");
-  assert.match(route, /handleInsta360Request\(request\)/);
 });

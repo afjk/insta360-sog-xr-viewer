@@ -11,6 +11,9 @@
  * 15MB前後のSOGをWorkerに通す必要はない。
  *
  * - `GET ?url=<共有URL>` … 解決したSOGのURLと、あればカメラ情報のURLをJSONで返す
+ *
+ * 拡張子つきでimportしているのは、このモジュールをテストからNodeで直接importするため。
+ * バンドラ（Vite / Wrangler）は付いていても解決できる。
  */
 import {
   isPubliclyRoutableHost,
@@ -21,7 +24,7 @@ import {
   toAbsoluteUrl,
   type Insta360Assets,
   type Insta360Share,
-} from "./insta360";
+} from "./insta360.ts";
 
 export const CORS_HEADERS: Record<string, string> = {
   "access-control-allow-origin": "*",

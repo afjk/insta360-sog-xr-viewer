@@ -5,7 +5,10 @@ PlayCanvasとWebXRを使い、Insta360 Spatial CaptureのSOG形式3D Gaussian Sp
 ## Live viewer
 
 - [GitHub Pages](https://afjk.github.io/insta360-sog-xr-viewer/)
-- [ChatGPT Sites版](https://insta360-sog-xr-viewer.afjk01.chatgpt.site/)
+
+配信しているのはこの静的サイトと、共有URLの解決だけを担う小さなCloudflare Worker
+（`resolver-worker/`）の2つです。以前あったChatGPT Sites版（vinextのNext.jsアプリを
+Cloudflare Workerで配信するもの）は撤去しました。
 
 ## 空間を読み込む
 
@@ -202,7 +205,7 @@ Desktopのどの縦横比でも垂直90°になります。`cameras.json` が無
 ### Insta360共有URLの解決について
 
 Insta360の共有ページはブラウザからのクロスオリジン取得を許可しないため、共有URLの解決だけを
-サーバー側（`GET /api/insta360`）が担当します。SOG本体は中継しません。
+Worker（`GET /api/insta360`）が担当します。SOG本体は中継しません。
 
 共有ページはNext.jsで、生成済みアセットの署名付きURLが `__NEXT_DATA__` に最初から入っています。
 
@@ -266,16 +269,16 @@ CORSセーフリストのレスポンスヘッダーなので、直接取得で�
 
 | 値 | 動作 |
 | --- | --- |
-| 未設定 | 同一オリジンの `/api/insta360` を使う（Cloudflare Worker版） |
+| 未設定 | 同一オリジンの `/api/insta360` を使う（同じオリジンでWorkerを配信する場合） |
 | `none` | 解決エンドポイントを持たない配信。共有URLの入力を無効にし、理由を表示する |
-| URL | そのオリジンの `/api/insta360` を使う（専用Workerなど） |
+| URL | そのオリジンの `/api/insta360` を使う（下記の専用Worker） |
 
-GitHub Pagesは静的配信で `/api` を持たないため、`vite.pages.config.ts` が既定で `none` を入れます。
+GitHub Pagesは静的配信で `/api` を持たないため、`vite.config.ts` が既定で `none` を入れます。
 
-#### GitHub Pages用のresolver Worker
+#### resolver Worker
 
 `resolver-worker/` に、共有URLの解決だけを行う単機能のCloudflare Workerがあります。
-解決ロジックはアプリ本体のWorkerと共有しています。
+このリポジトリで動くサーバーはこれだけです。
 
 ```bash
 npm run resolver:dev      # ローカルで動かす
@@ -408,13 +411,17 @@ Node.js 22.13以降が必要です。
 
 ```bash
 npm install
-npm run dev
+npm run dev       # Viteの開発サーバー（github-pages-src/ がエントリ）
 ```
 
 ```bash
-npm run build
-npm run build:pages
-npm test
+npm run build     # dist-pages/ へ静的生成
+npm run preview   # ビルド結果を配信して確認する
+npm test          # ビルドしてからユニットテスト
+npm run lint
 ```
 
-`main` ブランチへのpushで、GitHub ActionsがGitHub Pages版を自動更新します。
+ビルドは1つだけです。`vite.config.ts` が `github-pages-src/` を入口に `dist-pages/` を
+出力し、`main` ブランチへのpushでGitHub Actionsがそれを配信します。
+
+Workerは別系統で、変更したら手で再デプロイします（`npm run resolver:deploy`）。

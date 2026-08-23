@@ -48,11 +48,11 @@ test("does not hardcode any deployment host", async () => {
 
 test("the GitHub Pages build ships without a resolver unless one is given", async () => {
   const { readFile } = await import("node:fs/promises");
-  const [pagesConfig, workflow] = await Promise.all([
-    readFile(new URL("../vite.pages.config.ts", import.meta.url), "utf8"),
+  const [viteConfig, workflow] = await Promise.all([
+    readFile(new URL("../vite.config.ts", import.meta.url), "utf8"),
     readFile(new URL("../.github/workflows/pages.yml", import.meta.url), "utf8"),
   ]);
-  assert.match(pagesConfig, /VITE_SOG_RESOLVER_ORIGIN\?\.trim\(\) \|\| "none"/);
-  assert.match(pagesConfig, /__SOG_RESOLVER_ORIGIN__: JSON\.stringify\(resolverOrigin\)/);
+  assert.match(viteConfig, /VITE_SOG_RESOLVER_ORIGIN\?\.trim\(\) \|\| "none"/);
+  assert.match(viteConfig, /__SOG_RESOLVER_ORIGIN__: JSON\.stringify\(resolverOrigin\)/);
   assert.match(workflow, /VITE_SOG_RESOLVER_ORIGIN: \$\{\{ vars\.SOG_RESOLVER_ORIGIN \}\}/);
 });

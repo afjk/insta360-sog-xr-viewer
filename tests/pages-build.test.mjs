@@ -2,43 +2,44 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
-async function render() {
-  const workerUrl = new URL("../dist/server/index.js", import.meta.url);
-  workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
-  const { default: worker } = await import(workerUrl.href);
+/** ビルド済みの静的サイト。`npm test` はビルドしてからこのファイルを走らせる。 */
+const built = (file) => readFile(new URL(`../dist-pages/${file}`, import.meta.url), "utf8");
 
-  return worker.fetch(
-    new Request("http://localhost/", {
-      headers: { accept: "text/html" },
-    }),
-    {
-      ASSETS: {
-        fetch: async () => new Response("Not found", { status: 404 }),
-      },
-    },
-    {
-      waitUntil() {},
-      passThroughOnException() {},
-    },
-  );
+/** `dist-pages` に出たJSバンドル（1本）の中身。 */
+async function bundle() {
+  const html = await built("index.html");
+  const src = html.match(/<script[^>]+src="[^"]*\/(assets\/[^"]+\.js)"/)?.[1];
+  assert.ok(src, "index.html references no bundle");
+  return built(src);
 }
 
-test("server-renders the PlayCanvas SOG viewer shell", async () => {
-  const response = await render();
-  assert.equal(response.status, 200);
-  assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
-
-  const html = await response.text();
+test("builds the static viewer shell GitHub Pages serves", async () => {
+  // 配信されるのはこの1枚のHTMLとアセットだけ。サーバー側のレンダリングは持たない。
+  const html = await built("index.html");
   assert.match(html, /<title>SOG XR Viewer \| Insta360 Spatial Capture<\/title>/i);
-  assert.match(html, /PLAYCANVAS · SOG v2/);
-  assert.match(html, /PICO 4 UltraやQuest/);
-  assert.match(html, /空間データを読み込み中/);
-  assert.match(html, /VRを開始/);
-  assert.match(html, /空間を開く/);
-  assert.match(html, /SAMPLE/);
-  assert.match(html, /サンプル空間 capture\.sog/);
-  assert.match(html, /WASD 移動 · E\/Q 上下/);
-  assert.match(html, /role="status"/);
+  // 属性が複数行に折り返されているので、meta の存在と本文を分けて見る。
+  assert.match(html, /<meta\s+name="description"/);
+  assert.ok(html.includes("WebXRで体験する3D Gaussian Splatビューアー"));
+  assert.match(html, /<div id="root"><\/div>/);
+  // サブパス配信なので、参照はすべてリポジトリ名から始まる。
+  assert.match(html, /src="\/insta360-sog-xr-viewer\/assets\/[^"]+\.js"/);
+  assert.doesNotMatch(html, /src="\/assets\//);
+});
+
+test("ships the viewer UI in the bundle instead of prerendering it", async () => {
+  // 画面のコピーはクライアントで描かれる。HTMLではなくバンドルの中にある。
+  const code = await bundle();
+  for (const copy of [
+    "PLAYCANVAS · SOG v2",
+    "PICO 4 UltraやQuest",
+    "空間データを読み込み中",
+    "VRを開始",
+    "空間を開く",
+    "サンプル空間 capture.sog",
+    "WASD 移動 · E/Q 上下",
+  ]) {
+    assert.ok(code.includes(copy), `bundle is missing ${copy}`);
+  }
 });
 
 test("keeps the PlayCanvas SOG and WebXR controls wired up", async () => {
@@ -110,9 +111,8 @@ test("generates the VR variant in the browser instead of shipping a second SOG",
 });
 
 test("loads arbitrary SOG sources while keeping the bundled sample as default", async () => {
-  const [viewer, route, resolver] = await Promise.all([
+  const [viewer, resolver] = await Promise.all([
     readFile(new URL("../app/SogViewer.tsx", import.meta.url), "utf8"),
-    readFile(new URL("../app/api/insta360/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/insta360-resolver.ts", import.meta.url), "utf8"),
   ]);
 
@@ -144,8 +144,6 @@ test("loads arbitrary SOG sources while keeping the bundled sample as default", 
   assert.match(viewer, /parseInsta360ShareUrl/);
   assert.match(viewer, /resolverConfig\(\)/);
   assert.match(viewer, /return \{ assetUrl: payload\.assetUrl, camerasUrl: payload\.camerasUrl \?\? "" \}/);
-  assert.match(route, /export function GET/);
-  assert.match(route, /handleInsta360Request/);
   assert.match(resolver, /access-control-allow-origin/);
   assert.match(resolver, /isPubliclyRoutableHost/);
   assert.match(resolver, /resolveAssetsFromHtml/);
@@ -265,18 +263,51 @@ test("restores the linked view on desktop and spawns XR from the rig", async () 
 });
 
 test("builds and deploys a repository-relative GitHub Pages site", async () => {
-  const [pagesConfig, pagesEntry, workflow, packageJson] = await Promise.all([
-    readFile(new URL("../vite.pages.config.ts", import.meta.url), "utf8"),
+  const [viteConfig, pagesEntry, workflow, packageJson] = await Promise.all([
+    readFile(new URL("../vite.config.ts", import.meta.url), "utf8"),
     readFile(new URL("../github-pages-src/main.tsx", import.meta.url), "utf8"),
     readFile(new URL("../.github/workflows/pages.yml", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
 
-  assert.match(pagesConfig, /base: "\/insta360-sog-xr-viewer\/"/);
-  assert.match(pagesConfig, /publicDir: resolve\(projectRoot, "public"\)/);
+  assert.match(viteConfig, /base: "\/insta360-sog-xr-viewer\/"/);
+  assert.match(viteConfig, /publicDir: resolve\(projectRoot, "public"\)/);
   assert.match(pagesEntry, /<SogViewer \/>/);
-  assert.match(packageJson, /"build:pages": "vite build --config vite\.pages\.config\.ts"/);
+  assert.match(packageJson, /"build": "vite build"/);
+  assert.match(workflow, /npm run build\b/);
   assert.match(workflow, /actions\/configure-pages@v5/);
   assert.match(workflow, /actions\/upload-pages-artifact@v4/);
   assert.match(workflow, /actions\/deploy-pages@v4/);
+});
+
+test("keeps GitHub Pages and the resolver Worker as the only deployables", async () => {
+  // ChatGPT Sites版（vinext + Cloudflare Worker）は撤去した。ビルドは1つだけで、
+  // Next.jsもRSCもD1も残っていない。
+  const { readdir } = await import("node:fs/promises");
+  const root = new URL("../", import.meta.url);
+  const entries = await readdir(root);
+  for (const gone of [
+    "worker",
+    "db",
+    "drizzle",
+    "drizzle.config.ts",
+    "examples",
+    ".openai",
+    "next.config.ts",
+    "next-env.d.ts",
+    "vite.pages.config.ts",
+    "postcss.config.mjs",
+  ]) {
+    assert.ok(!entries.includes(gone), `${gone} should be gone with the ChatGPT Sites build`);
+  }
+
+  const packageJson = await readFile(new URL("../package.json", import.meta.url), "utf8");
+  for (const dependency of ["vinext", "@openai/sites-vite-plugin", "drizzle", "tailwindcss", "react-server-dom-webpack"]) {
+    assert.doesNotMatch(packageJson, new RegExp(dependency.replace(/[/@-]/g, "\\$&")), dependency);
+  }
+
+  const app = await readdir(new URL("../app/", import.meta.url));
+  for (const gone of ["api", "page.tsx", "layout.tsx", "chatgpt-auth.ts"]) {
+    assert.ok(!app.includes(gone), `app/${gone} belonged to the ChatGPT Sites build`);
+  }
 });

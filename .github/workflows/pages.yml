@@ -28,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
       - name: Build static site
-        run: npm run build:pages
+        run: npm run build
         env:
           # 共有URLの解決を担うWorkerを用意したら、リポジトリ変数に設定する。
           # 未設定なら共有URL入力は無効のままビルドされる。

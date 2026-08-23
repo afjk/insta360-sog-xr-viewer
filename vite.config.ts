@@ -1,59 +1,25 @@
-import { sites } from "@openai/sites-vite-plugin";
-import vinext from "vinext";
+import react from "@vitejs/plugin-react";
+import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
-import hostingConfig from "./.openai/hosting.json";
 
-const SITE_CREATOR_PLACEHOLDER_DATABASE_ID =
-  "00000000-0000-4000-8000-000000000000";
+const projectRoot = fileURLToPath(new URL(".", import.meta.url));
 
-const { d1, r2 } = hostingConfig;
+// このリポジトリ唯一のビルド。エントリは `github-pages-src/`、出力は `dist-pages/`。
+// GitHub Pagesは静的配信で `/api` を持たないため、共有URLの解決先は既定で無効。
+// 専用のCloudflare Workerを用意したら VITE_SOG_RESOLVER_ORIGIN に渡してビルドする。
+const resolverOrigin = process.env.VITE_SOG_RESOLVER_ORIGIN?.trim() || "none";
 
-// macOS Seatbelt blocks FSEvents, so Codex previews need polling for HMR.
-const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === "seatbelt";
-
-const localBindingConfig = {
-  main: "./worker/index.ts",
-  compatibility_flags: ["nodejs_compat"],
-  d1_databases: d1
-    ? [
-        {
-          binding: d1,
-          database_name: "site-creator-d1",
-          database_id: SITE_CREATOR_PLACEHOLDER_DATABASE_ID,
-        },
-      ]
-    : [],
-  r2_buckets: r2
-    ? [
-        {
-          binding: r2,
-          bucket_name: "site-creator-r2",
-        },
-      ]
-    : [],
-};
-
-export default defineConfig(async () => {
-  // Keep Wrangler and Miniflare state project-local. These are non-secret tool
-  // settings; application environment belongs in ignored `.env*` files.
-  process.env.WRANGLER_WRITE_LOGS ??= "false";
-  process.env.WRANGLER_LOG_PATH ??= ".wrangler/logs";
-  process.env.MINIFLARE_REGISTRY_PATH ??= ".wrangler/registry";
-
-  // Wrangler snapshots its log path while the Cloudflare plugin is imported.
-  const { cloudflare } = await import("@cloudflare/vite-plugin");
-
-  return {
-    server: isCodexSeatbeltSandbox
-      ? { watch: { useFsEvents: false, usePolling: true } }
-      : undefined,
-    plugins: [
-      vinext(),
-      sites(),
-      cloudflare({
-        viteEnvironment: { name: "rsc", childEnvironments: ["ssr"] },
-        config: localBindingConfig,
-      }),
-    ],
-  };
+export default defineConfig({
+  root: resolve(projectRoot, "github-pages-src"),
+  base: "/insta360-sog-xr-viewer/",
+  publicDir: resolve(projectRoot, "public"),
+  plugins: [react()],
+  define: {
+    __SOG_RESOLVER_ORIGIN__: JSON.stringify(resolverOrigin),
+  },
+  build: {
+    outDir: resolve(projectRoot, "dist-pages"),
+    emptyOutDir: true,
+  },
 });
