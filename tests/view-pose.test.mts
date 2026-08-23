@@ -8,6 +8,7 @@ import {
   normalizeYawDegrees,
   orbitTargetOf,
   parseViewPose,
+  poseFromEyeAndTarget,
   pitchDegreesFromForward,
   xrRigOffset,
   yawDegreesFromBasis,
@@ -319,4 +320,31 @@ test("returns to the pre-VR desktop view after XR ends", () => {
     Math.hypot(rigOnly.eye.x - before.eye.x, rigOnly.eye.y - before.eye.y, rigOnly.eye.z - before.eye.z) > 1,
     "rigをゼロにするだけの復帰は視点を失う",
   );
+});
+
+test("folds an eye and a target back into a pose", () => {
+  const target = orbitTargetOf(POSE);
+  const pose = poseFromEyeAndTarget({ x: POSE.x, y: POSE.y, z: POSE.z }, target);
+  assert.ok(pose);
+  close(pose.x, POSE.x, 1e-12, "eye x");
+  close(pose.y, POSE.y, 1e-12, "eye y");
+  close(pose.z, POSE.z, 1e-12, "eye z");
+  close(pose.yaw, POSE.yaw, 1e-9, "yaw");
+  close(pose.pitch, POSE.pitch, 1e-9, "pitch");
+  close(pose.distance, POSE.distance, 1e-12, "distance");
+});
+
+test("has no pose when the eye and the target coincide", () => {
+  const eye = { x: 1, y: 2, z: 3 };
+  assert.equal(poseFromEyeAndTarget(eye, eye), null);
+  // `view=` が受け付ける最小距離（1mm）より近いものも、向きが定まらない。
+  assert.equal(poseFromEyeAndTarget(eye, { x: 1.000_1, y: 2, z: 3 }), null);
+});
+
+test("looks straight down without losing the pose", () => {
+  const pose = poseFromEyeAndTarget({ x: 0, y: 2, z: 0 }, { x: 0, y: 0, z: 0 });
+  assert.ok(pose);
+  close(pose.pitch, 90, 1e-9, "pitch");
+  close(pose.distance, 2, 1e-12, "distance");
+  assert.equal(pose.yaw, 0);
 });

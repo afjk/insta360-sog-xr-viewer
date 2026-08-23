@@ -122,31 +122,65 @@ spawnします。
 DesktopとQuestで同じ規則を使います。
 
 1. URLに `view=` がある … ユーザーが指定した視点
-2. Insta360共有の公式Home Viewが取れる … Insta360公式の初期視点（**未実装**。下記）
-3. どちらも無い … これまでどおり、読み込んだ空間の広がりから決める `frameBounds()`
+2. Insta360共有で `2_cameras.json` が取れる … 公式Viewerと同じ初期視点（下記）
+3. どちらも無い … 読み込んだ空間の広がりから決める `frameBounds()`
 
-判定は `SogViewer.tsx` の `initialViewFor()` にまとまっていて、`null` を返すと
-呼び出し側が `frameBounds()` へ落ちます。
+判定は `SogViewer.tsx` の `linkedViewFor()` と `homeViewFor()` に分かれていて、どちらも
+`null` を返すと `frameBounds()` へ落ちます。2で決まった視点はアドレスバーには載せません
+（`?id=` だけのリンクが、勝手に視点付きのリンクへ化けないようにするため）。
 
-#### 公式Home Viewの現状
+#### 公式Viewerと同じ初期視点
 
-resolverは `2_cameras.json`（タスク詳細の `outputs` にSOGと並んでいる、撮影時のカメラ情報）の
-署名付きURLを `camerasUrl` として返すところまで実装済みです。
+resolverはタスク詳細の `outputs` から `2_cameras.json`（撮影時のカメラ情報）の署名付きURLを
+`camerasUrl` として返します。
 
 ```json
 { "shareId": "GS3DG…", "assetUrl": "https://p2-app.insta360.com/…/1_3DGS.sog?…", "camerasUrl": "https://p2-app.insta360.com/…/2_cameras.json?…" }
 ```
 
-一方、**このJSONを公式Viewerと同じ初期視点へ変換する部分は未実装**です。次の3点は実サービスを
-読まないと決められず、推測で実装すると公式Viewerと違う場所から始まってしまいます。
+このJSONは配信元が `access-control-allow-origin: *` を返すので、SOGと同じくブラウザから
+直接取ります（SOGと並行して取得。失敗しても3へ落ちるだけで、空間は表示できます）。中身は
+3DGS標準の `cameras.json` で、実データは1件がこの形でした。
 
-- `2_cameras.json` のスキーマと、rotationが c2w / w2c のどちらか
-- 公式Viewer（`/_next/static/chunks/pages/3dgs/remy-*.js`、`app.3dgs.remy.back_to_origin` 周辺）が
-  Home / Reset Viewをどう決めているか（特定camera indexか、補間・計算したposeか）
-- `fx / fy / width / height` からのFOV復元と、viewport aspectに応じた公式の調整
+```json
+{ "id": 0, "img_name": "frame_00000_cam1_center", "width": 1000, "height": 1000,
+  "position": [-2.7597, -0.0070, -4.4427], "rotation": [[…], […], […]], "fx": 500, "fy": 500 }
+```
 
-変換にはSOG側の配置（`splatEntity` のX軸180°回転＋bounds由来の平行移動）を通す必要があり、
-`2_cameras.json` の座標系がSOGと同じかどうかも実データでの確認が要ります。
+- `position` はカメラ中心のworld座標、`rotation` はcamera-to-worldの回転（COLMAP/OpenCVの
+  向き。+Zが前、+Yが下）。座標系はSOGの重心と同じで、スケールも揃っています。
+- 実データは1274件で、`frame_00000`〜`frame_00079` の実フレーム（cam1/cam2 × 5〜6面）に
+  加えて、フレーム間を補間した `*_pseudo` が並びます。
+- `outputs` 上の `type` はSOGやPLYと同じ `"model"` なので、型では選別できません。選別は
+  ファイル名で行っています（`selectCamerasOutput`）。
+
+公式Viewer（`/_next/static/chunks/4348.*.js`＝`src/pages/3dgs/remy/kiriCameraControls.js` の
+`calculateCameraProfile()`）は、このファイルから初期視点をこう決めています。
+
+- eye … `cameras[0].position`（撮り始めた場所）
+- 注視点 … **全カメラ位置の平均**（歩き回った軌跡の中心）
+- 画角 … `cameras[0]` の `2·atan(width / 2fx)` と `2·atan(height / 2fy)`
+
+向きが `cameras[0].rotation` ではなく eye→注視点で決まるのが要点です（最初のフレームが
+向いていた方向ではなく、撮った範囲の中心を見る構図になります）。この実装は
+`app/capture-view.ts` の `captureHomeView()` にあります。
+
+座標系は公式とこちらで違いますが、構図は変わりません。公式はメッシュにもカメラにも
+`scale(-1, -1, 1)`（Z軸まわり180°）を掛けるだけで、こちらは `splatEntity` のX軸180°回転＋
+bounds由来の平行移動（部屋を原点へ、床をy=0へ）を掛けます。カメラ位置をsplatと同じ変換へ
+通すので、両者はY軸まわり180°と平行移動の差にしかならず、eyeから見える絵は一致します。
+変換は `splatPlacement()` / `worldFromCapturePoint()` にまとめてあり、`applyPlacement()` も
+同じ関数を見ています。
+
+画角は撮影画角をそのまま垂直画角にはできない（画面の縦横比で水平方向の写り方が変わる）ため、
+公式と同じ規則で決めます。垂直を合わせても水平が撮影画角を下回らないなら垂直基準、下回るなら
+水平基準（ただし90°まで）。実データは 1000×1000 / fx=fy=500 なので水平垂直とも90°で、
+Desktopのどの縦横比でも垂直90°になります。`cameras.json` が無い空間は既定の58°のままです。
+
+公式が同じファイルから作っている**Orbitの可動域**（軌跡の広がりから決まる距離と極角・
+方位角の制限、およびその範囲へ引き戻すダンピング）は移植していません。こちらのDesktop操作は
+`DOLLY_RANGE` / `MAX_PITCH` で足りており、実データでは初期視点が公式の可動域の内側にあって
+補正なしで一致します。
 
 ### Insta360共有URLの解決について
 

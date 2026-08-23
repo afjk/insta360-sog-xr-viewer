@@ -60,6 +60,8 @@ const NUMBER_PATTERN = /^-?\d+(?:\.\d+)?$/;
 const DEG_TO_RAD = Math.PI / 180;
 const RAD_TO_DEG = 180 / Math.PI;
 
+const WORLD_UP: Vec3Like = { x: 0, y: 1, z: 0 };
+
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value));
 
 /** 水平向きを `[-180, 180)` へ畳む。リンクの中の角度を一意にする。 */
@@ -177,6 +179,32 @@ export function orbitTargetOf(pose: ViewPose): Vec3Like {
     x: pose.x + forward.x * pose.distance,
     y: pose.y + forward.y * pose.distance,
     z: pose.z + forward.z * pose.distance,
+  };
+}
+
+/**
+ * eyeと注視点から視点を組み立てる。`orbitTargetOf` の逆。
+ *
+ * 「どこから、どこを見ているか」しか分かっていない初期視点（公式Viewerの
+ * Home Viewなど）を、Viewerが扱う yaw / pitch / distance の形へ畳む。
+ * 二点が重なっていて向きが決まらないときは `null` を返す。
+ */
+export function poseFromEyeAndTarget(eye: Vec3Like, target: Vec3Like): ViewPose | null {
+  const dx = target.x - eye.x;
+  const dy = target.y - eye.y;
+  const dz = target.z - eye.z;
+  const distance = Math.hypot(dx, dy, dz);
+  if (!Number.isFinite(distance) || distance < DISTANCE_RANGE.min) return null;
+  const forward = { x: dx / distance, y: dy / distance, z: dz / distance };
+  return {
+    x: eye.x,
+    y: eye.y,
+    z: eye.z,
+    // 真下・真上を向いていてもyawが決まるよう、上ベクトルを渡す口を使う。
+    // ここでの上はworldの上。水平成分が残っている限りは使われない。
+    yaw: yawDegreesFromBasis(forward, WORLD_UP),
+    pitch: pitchDegreesFromForward(forward),
+    distance,
   };
 }
 

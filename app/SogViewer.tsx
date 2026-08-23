@@ -34,6 +34,15 @@ import {
   type HorizontalPose,
   type ViewPose,
 } from "./view-pose";
+import {
+  captureFovOf,
+  captureHomeView,
+  parseCaptureCameras,
+  responsiveFovDegrees,
+  splatPlacement,
+  type CaptureCamera,
+  type CaptureFov,
+} from "./capture-view";
 import { optimizationUnsupportedReason } from "./sog-image";
 import {
   DEFAULT_TARGET_SPLATS,
@@ -68,6 +77,9 @@ const SAMPLE_LABEL = "サンプル空間 capture.sog";
 const CAPTURE_MIN = new Vec3(-6.911, -1.263, -3.762);
 const CAPTURE_MAX = new Vec3(6.178, 1.654, 3.802);
 const INITIAL_PITCH = 0.08;
+// 撮影画角が分からない空間で使う既定の垂直画角。Insta360共有から
+// `cameras.json` が取れたときは、そちらの画角へ置き換える。
+const DEFAULT_FOV = 58;
 const UP = new Vec3(0, 1, 0);
 const RAD_TO_DEG = 180 / Math.PI;
 const DEG_TO_RAD = Math.PI / 180;
@@ -249,12 +261,31 @@ export function SogViewer() {
     const cameraEntity = new Entity("xr-camera");
     cameraEntity.addComponent("camera", {
       clearColor: new Color(0.0196, 0.0275, 0.0392),
-      fov: 58,
+      fov: DEFAULT_FOV,
       nearClip: 0.01,
       farClip: 500,
     });
     rig.addChild(cameraEntity);
     const camera = cameraEntity.camera as CameraComponent;
+    // 表示中の空間の撮影画角。`cameras.json` が取れたときだけ入る。
+    let captureFov: CaptureFov | null = null;
+
+    /**
+     * 表示領域に合わせて垂直画角を決め直す。
+     *
+     * 撮影画角は水平・垂直の組で来るので、画面の縦横比によってどちらを
+     * 基準にするかが変わる。撮影画角が無い空間では既定値のまま。
+     * XR中は画角をHMDが決めるので、ここでは触らない。
+     */
+    const applyFov = (width: number, height: number) => {
+      camera.fov = captureFov ? responsiveFovDegrees(captureFov, width, height) : DEFAULT_FOV;
+    };
+
+    /** 読み込んだ空間の撮影画角へ切り替える。無ければ既定値へ戻す。 */
+    const applyCaptureFov = (fov: CaptureFov | null) => {
+      captureFov = fov;
+      applyFov(Math.max(1, viewport.clientWidth), Math.max(1, viewport.clientHeight));
+    };
 
     const worldTarget = new Vec3();
     const updateDesktopCamera = () => {
@@ -298,12 +329,9 @@ export function SogViewer() {
 
     /** 180°回転後に部屋が原点に中心し、床がy=0に来るよう配置する。 */
     const applyPlacement = (bounds: Bounds) => {
+      const placement = splatPlacement(bounds);
       splatEntity.setLocalEulerAngles(180, 0, 0);
-      splatEntity.setLocalPosition(
-        -(bounds.min.x + bounds.max.x) * 0.5,
-        bounds.max.y,
-        (bounds.min.z + bounds.max.z) * 0.5,
-      );
+      splatEntity.setLocalPosition(placement.x, placement.y, placement.z);
     };
 
     const resetView = (target: Vec3, nextDistance: number) => {
@@ -359,21 +387,29 @@ export function SogViewer() {
     };
 
     /**
-     * 開いた空間の初期視点を決める。優先順位はDesktopでもXRでも同じ。
-     *
-     * 1. URLの `view=` … ユーザーが指定した視点
-     * 2. Insta360共有の公式Home View … 取得できるようになったらここへ挟む
-     * 3. どちらも無い … `null` を返し、呼び出し側が `frameBounds()` へ落ちる
+     * URLの `view=` に入っている視点。初期視点の第一優先。
      *
      * `view=` は空間に紐づくので、アドレスバーが指している共有IDといま読み込んだ
      * 空間が一致するときだけ使う。別の空間へ切り替えたときに前の視点を持ち込まない。
      */
-    const initialViewFor = (shareId: string | undefined): ViewPose | null => {
+    const linkedViewFor = (shareId: string | undefined): ViewPose | null => {
       if (!shareId) return null;
       const href = window.location.href;
       if (readShareId(href) !== shareId) return null;
       return readViewPose(href);
     };
+
+    /**
+     * `cameras.json` から組み立てた、公式Viewerと同じ初期視点。第二優先。
+     *
+     * 撮影を始めた地点から軌跡の中心を見る構図で、公式の共有ページを開いた
+     * 直後と同じ場所・同じ向きになる。Insta360共有のときだけ入る。
+     *
+     * 初期視点の優先順位はDesktopでもXRでも同じで、
+     * 1. URLの `view=`（`linkedViewFor`）→ 2. これ → 3. `frameBounds()` の既定視点。
+     */
+    const homeViewFor = (cameras: CaptureCamera[] | null, bounds: Bounds): ViewPose | null =>
+      cameras ? captureHomeView(cameras, splatPlacement(bounds)) : null;
 
     /**
      * 読み込んだ空間に合わせて視点を組み直す。
@@ -486,6 +522,23 @@ export function SogViewer() {
     };
 
     /**
+     * 撮影時のカメラ情報（`cameras.json`）を取りに行く。取れなければ `null`。
+     *
+     * 署名付きURLは `access-control-allow-origin: *` を返すので、SOGと同じく
+     * ブラウザから直接取れる。使い道は初期視点と画角だけなので、失敗しても
+     * 空間の表示は止めない（既定の視点へ落ちる）。
+     */
+    const downloadCaptureCameras = async (url: string): Promise<CaptureCamera[] | null> => {
+      try {
+        const response = await fetch(url);
+        if (!response.ok) return null;
+        return parseCaptureCameras(await response.json());
+      } catch {
+        return null;
+      }
+    };
+
+    /**
      * アドレスバーを表示中の空間に合わせる。
      *
      * Insta360由来なら共有IDだけを載せ、それ以外なら残っている `id` を落とす。
@@ -502,7 +555,11 @@ export function SogViewer() {
     };
 
     /** Original SOGを差し替える。VR最適化済みの結果は入力が変わるので捨てる。 */
-    const showOriginal = async (next: ViewerSource, buffer: ArrayBuffer) => {
+    const showOriginal = async (
+      next: ViewerSource,
+      buffer: ArrayBuffer,
+      cameras: CaptureCamera[] | null = null,
+    ) => {
       const isSample = next.kind === "sample";
       const hash = typeof crypto?.subtle === "undefined" ? null : await sha256Hex(buffer);
       const blob = new Blob([buffer]);
@@ -510,7 +567,11 @@ export function SogViewer() {
       const bounds = boundsFromResource(loaded.asset.resource) ?? { min: CAPTURE_MIN, max: CAPTURE_MAX };
       framedBounds = isSample ? { min: CAPTURE_MIN, max: CAPTURE_MAX } : bounds;
       applyPlacement(framedBounds);
-      const initialView = initialViewFor(next.shareId);
+      applyCaptureFov(cameras ? captureFovOf(cameras) : null);
+      // `view=` で開かれていればその視点。無ければ公式と同じ初期視点、
+      // それも無ければ空間の広がりから決める既定視点へ落ちる。
+      const linkedView = linkedViewFor(next.shareId);
+      const initialView = linkedView ?? homeViewFor(cameras, framedBounds);
       if (initialView) applyViewPose(initialView);
       else frameBounds(framedBounds);
       attachAsset(loaded.asset);
@@ -520,7 +581,9 @@ export function SogViewer() {
       releaseOptimized();
       setOriginalSplats(splatCountOf(loaded.asset.resource));
       setSource(next);
-      syncPermalink(next.shareId, initialView);
+      // アドレスバーへ残すのはユーザーが指定した視点だけ。こちらで決めた
+      // 初期視点まで載せると、共有IDだけのリンクが視点付きに化けてしまう。
+      syncPermalink(next.shareId, linkedView);
       setStatus("ready");
     };
 
@@ -739,12 +802,12 @@ export function SogViewer() {
         throw new Error("共有URLの解決サービスに接続できませんでした。");
       }
       const payload = (await response.json().catch(() => null)) as
-        | { assetUrl?: string; error?: string }
+        | { assetUrl?: string; camerasUrl?: string | null; error?: string }
         | null;
       if (!response.ok || !payload?.assetUrl) {
         throw new Error(payload?.error ?? `共有URLを解決できませんでした (HTTP ${response.status})`);
       }
-      return payload.assetUrl;
+      return { assetUrl: payload.assetUrl, camerasUrl: payload.camerasUrl ?? "" };
     };
 
     /**
@@ -796,6 +859,8 @@ export function SogViewer() {
       let label = "";
       let shareId: string | undefined;
       let fetchUrl = "";
+      // 撮影時のカメラ情報。Insta360共有を解決したときだけ入る。
+      let camerasUrl = "";
       let file: File | null = null;
 
       if (request.kind === "file") {
@@ -823,7 +888,9 @@ export function SogViewer() {
           setSourceStage("共有URLを解決中");
           reportProgress(-1);
           try {
-            fetchUrl = await resolveShare(share.shareUrl);
+            const resolved = await resolveShare(share.shareUrl);
+            fetchUrl = resolved.assetUrl;
+            camerasUrl = resolved.camerasUrl;
           } catch (error) {
             if (disposed || token !== loadToken) return;
             setSourceStage("");
@@ -845,12 +912,21 @@ export function SogViewer() {
       setPendingLabel(label);
       setSourceStage(`${label} を読み込み中`);
       reportProgress(0);
+      // カメラ情報はSOGと並行して取る。SOGより桁違いに小さいので、
+      // 待ち時間は増えない。
+      const camerasRequest = camerasUrl
+        ? downloadCaptureCameras(camerasUrl)
+        : Promise.resolve(null);
       try {
         const buffer = file ? await file.arrayBuffer() : await downloadSog(fetchUrl, reportProgress);
         if (disposed || token !== loadToken) return;
         setSourceStage(`${label} を展開中`);
         reportProgress(-1);
-        await showOriginal({ kind: request.kind === "file" ? "file" : "url", label, shareId }, buffer);
+        await showOriginal(
+          { kind: request.kind === "file" ? "file" : "url", label, shareId },
+          buffer,
+          await camerasRequest,
+        );
         if (disposed || token !== loadToken) return;
         shownKey = key;
         setSourceStage("");
@@ -1199,6 +1275,7 @@ export function SogViewer() {
       const width = Math.max(1, viewport.clientWidth);
       const height = Math.max(1, viewport.clientHeight);
       app.resizeCanvas(width, height);
+      applyFov(width, height);
       updateDesktopCamera();
     };
     const resizeObserver = new ResizeObserver(resize);

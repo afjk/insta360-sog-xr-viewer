@@ -143,7 +143,7 @@ test("loads arbitrary SOG sources while keeping the bundled sample as default", 
   // but the signed SOG it hands back is fetched straight from the browser.
   assert.match(viewer, /parseInsta360ShareUrl/);
   assert.match(viewer, /resolverConfig\(\)/);
-  assert.match(viewer, /return payload\.assetUrl/);
+  assert.match(viewer, /return \{ assetUrl: payload\.assetUrl, camerasUrl: payload\.camerasUrl \?\? "" \}/);
   assert.match(route, /export function GET/);
   assert.match(route, /handleInsta360Request/);
   assert.match(resolver, /access-control-allow-origin/);
@@ -151,6 +151,9 @@ test("loads arbitrary SOG sources while keeping the bundled sample as default", 
   assert.match(resolver, /resolveAssetsFromHtml/);
   // 初期視点のもとになるカメラ情報のURLも一緒に返す。取れなくてもSOGは表示できる。
   assert.match(resolver, /camerasUrl/);
+  // カメラ情報はSOGと並行して取り、失敗しても表示は止めない。
+  assert.match(viewer, /const camerasRequest = camerasUrl/);
+  assert.match(viewer, /return parseCaptureCameras\(await response\.json\(\)\);/);
 });
 
 test("opens a shared space straight from ?id= without touching the sample", async () => {
@@ -166,7 +169,10 @@ test("opens a shared space straight from ?id= without touching the sample", asyn
 
   // 共有IDは表示中のソースに残し、ラベルの読み直しでは判断しない。
   assert.match(viewer, /type ViewerSource = \{ kind: SourceKind; label: string; shareId\?: string \}/);
-  assert.match(viewer, /showOriginal\(\{ kind: request\.kind === "file" \? "file" : "url", label, shareId \}, buffer\)/);
+  assert.match(
+    viewer,
+    /showOriginal\(\s*\n\s*\{ kind: request\.kind === "file" \? "file" : "url", label, shareId \},\s*\n\s*buffer,\s*\n\s*await camerasRequest,/,
+  );
   // サンプルは共有IDを持たない。ローカルファイルと直接URLも shareId が undefined のまま。
   assert.match(viewer, /showOriginal\(\{ kind: "sample", label: SAMPLE_LABEL \}, buffer\)/);
   assert.match(viewer, /shareId = share\.shareId/);
@@ -174,7 +180,8 @@ test("opens a shared space straight from ?id= without touching the sample", asyn
   // 成功したロードのたびにアドレスバーを合わせる。Insta360由来でなければ id を消す。
   assert.match(viewer, /const next = shareId \? permalinkFor\(href, shareId, pose\) : hrefWithoutShareId\(href\)/);
   assert.match(viewer, /window\.history\.replaceState\(null, "", next\)/);
-  assert.match(viewer, /syncPermalink\(next\.shareId, initialView\)/);
+  // アドレスバーへ残すのはユーザーが指定した視点だけ。公式Home Viewは載せない。
+  assert.match(viewer, /syncPermalink\(next\.shareId, linkedView\)/);
   // 署名付きURLはアドレスバーへ出さない。載せるのは共有IDだけ。
   assert.doesNotMatch(viewer, /replaceState\([^)]*assetUrl/);
 
@@ -192,13 +199,15 @@ test("opens a shared space straight from ?id= without touching the sample", asyn
 });
 
 test("restores the linked view on desktop and spawns XR from the rig", async () => {
-  const [viewer, pose] = await Promise.all([
+  const [viewer, pose, capture] = await Promise.all([
     readFile(new URL("../app/SogViewer.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/view-pose.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/capture-view.ts", import.meta.url), "utf8"),
   ]);
 
   // 初期視点の優先順位は `view=` → 公式Home View → bounds。Desktopもここを通る。
-  assert.match(viewer, /const initialView = initialViewFor\(next\.shareId\)/);
+  assert.match(viewer, /const linkedView = linkedViewFor\(next\.shareId\);/);
+  assert.match(viewer, /const initialView = linkedView \?\? homeViewFor\(cameras, framedBounds\);/);
   assert.match(viewer, /if \(initialView\) applyViewPose\(initialView\);\s*\n\s*else frameBounds\(framedBounds\);/);
   // `view=` は共有IDが一致する空間にだけ効く。別の空間へ持ち越さない。
   assert.match(viewer, /if \(readShareId\(href\) !== shareId\) return null;/);
@@ -236,6 +245,16 @@ test("restores the linked view on desktop and spawns XR from the rig", async () 
   assert.match(viewer, /desktopReturnView = null;\s*\n\s*applyViewPose\(view\);/);
   assert.equal(viewer.match(/restoreDesktopView\(\);/g)?.length, 2);
   assert.doesNotMatch(viewer, /setInXr\(false\);[\s\S]{0,400}rig\.setLocalPosition\(0, 0, 0\)/);
+
+  // 公式Home Viewは `cameras.json` から組み立てる。splatと同じ変換を通すので、
+  // 配置は `applyPlacement` と同じ `splatPlacement` を見る。
+  assert.match(viewer, /captureHomeView\(cameras, splatPlacement\(bounds\)\)/);
+  assert.match(viewer, /const placement = splatPlacement\(bounds\);/);
+  assert.match(capture, /export function captureHomeView\(/);
+  assert.match(capture, /worldFromCapturePoint\(cameras\[0\]\.position, placement\)/);
+  // 画角も撮影時のものへ合わせる。取れない空間では既定値のまま。
+  assert.match(viewer, /applyCaptureFov\(cameras \? captureFovOf\(cameras\) : null\)/);
+  assert.match(viewer, /camera\.fov = captureFov \? responsiveFovDegrees\(captureFov, width, height\) : DEFAULT_FOV;/);
 
   // 実機の突き合わせ用ログは `?debug=1` のときだけ。既定では何も出さない。
   assert.match(viewer, /const xrDebug = new URLSearchParams\(window\.location\.search\)\.get\("debug"\) === "1"/);
