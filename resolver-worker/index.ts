@@ -1,8 +1,9 @@
 /**
- * GitHub Pages（静的配信）から使うための、共有URL解決専用のCloudflare Worker。
+ * 共有URLの解決だけを担うCloudflare Worker。
  *
- * アプリ本体のWorkerとは別にこれを置くことで、GitHub Pages版でも
- * Insta360共有URLを解決できる。解決ロジックは `app/insta360-resolver.ts` と共有。
+ * GitHub Pagesは静的配信で `/api` を持てないので、Insta360の共有ページを読む処理
+ * （ブラウザからはCORSで届かない）はここに置く。このリポジトリで動くサーバーは
+ * これ1つだけ。
  *
  * デプロイ:
  *   npm run resolver:deploy
@@ -13,7 +14,7 @@ import {
   CORS_HEADERS,
   handleInsta360Options,
   handleInsta360Request,
-} from "../app/insta360-resolver";
+} from "../app/insta360-resolver.ts";
 
 const worker = {
   async fetch(request: Request): Promise<Response> {

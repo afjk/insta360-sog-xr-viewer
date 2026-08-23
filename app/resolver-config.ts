@@ -5,11 +5,11 @@
  * どこにそのサーバーがあるかは配信先によって違うため、コードに直接書かず
  * `VITE_SOG_RESOLVER_ORIGIN` で渡す。
  *
- * - 未設定 … 同一オリジンの `/api/insta360` を使う（Cloudflare Worker版）
+ * - 未設定 … 同一オリジンの `/api/insta360` を使う（同じオリジンでWorkerを配信する場合）
  * - `"none"` … 解決エンドポイントを持たない配信。共有URLの入力を無効化する
  * - URL … そのオリジンの `/api/insta360` を使う（専用Workerなど）
  *
- * GitHub Pagesのような静的配信には `/api` が無いため、`vite.pages.config.ts`
+ * GitHub Pagesのような静的配信には `/api` が無いため、`vite.config.ts`
  * が既定で `"none"` を入れる。専用Workerを用意したら
  * `VITE_SOG_RESOLVER_ORIGIN=<そのWorkerのオリジン>` を渡してビルドする。
  */
