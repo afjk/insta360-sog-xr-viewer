@@ -379,7 +379,6 @@ const collectByKey = (roots: readonly unknown[], keys: readonly string[]): unkno
 // 「作者がダウンロードを許可した」ことを表す真偽値のキー。
 const DOWNLOADABLE_KEYS = ["downloadable", "isdownloadable", "allowdownload", "allowdownloads"];
 const LICENSE_KEYS = ["license", "licence", "licenseCode", "licenseId", "usageInfo"];
-const TITLE_KEYS = ["title", "name", "sceneTitle"];
 const AUTHOR_KEYS = ["author", "username", "owner", "creator", "authorName"];
 
 /** Creative Commonsの正規URLから識別子と表記を組み立てる。 */
@@ -465,15 +464,50 @@ const licenseFromRelLink = (html: string): SuperSplatLicense | null => {
   return null;
 };
 
+/** 表示に回す文字列の実体参照をほどく。属性値に `&amp;` などが入るため。 */
+const decodeEntities = (text: string): string =>
+  text
+    .replace(/&#(\d+);/g, (_, code: string) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code: string) => String.fromCodePoint(parseInt(code, 16)))
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&nbsp;/gi, " ")
+    // `&amp;` は最後。先に戻すと `&amp;lt;` が `<` に化ける。
+    .replace(/&amp;/gi, "&");
+
 const metaContent = (html: string, names: readonly string[]): string => {
   for (const match of html.matchAll(/<meta\b([^>]*)>/gi)) {
     const attributes = match[1];
     const key = (attributeOf(attributes, "property") || attributeOf(attributes, "name")).toLowerCase();
     if (!names.includes(key)) continue;
-    const content = attributeOf(attributes, "content");
+    const content = decodeEntities(attributeOf(attributes, "content"));
     if (content) return content;
   }
   return "";
+};
+
+/** `<title>` の中身。 */
+const documentTitle = (html: string): string =>
+  decodeEntities(html.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i)?.[1] ?? "").trim();
+
+/**
+ * 表題の末尾に付くサイト名を落とす。
+ *
+ * 実ページは `<title>Lion - SuperSplat</title>` / `og:title` も同じ形。区切りは
+ * ハイフンで、`|` とは限らない。何を落とすかは `og:site_name` が教えてくれるので、
+ * 区切り文字だけを決め打ちして残りはその値で照合する。
+ *
+ * 落とした結果が空になる場合（作品名がサイト名と同じ）は元の値を返す。
+ */
+const stripSiteName = (text: string, siteName: string): string => {
+  const value = text.trim();
+  const site = siteName.trim();
+  if (!value || !site) return value;
+  const escaped = site.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const stripped = value.replace(new RegExp(`\\s*[-|｜—–]\\s*${escaped}\\s*$`, "i"), "").trim();
+  return stripped || value;
 };
 
 const firstString = (values: readonly unknown[]): string => {
@@ -491,14 +525,17 @@ const firstString = (values: readonly unknown[]): string => {
  */
 export function readSuperSplatSceneMeta(html: string): SuperSplatSceneMeta {
   const blocks = embeddedJsonBlocks(html);
+  // サイト名は `og:site_name` が持っている。表題から落とす接尾辞をこれで決める。
+  const siteName = metaContent(html, ["og:site_name"]);
 
+  // 埋め込みJSONの `title` / `name` は**見ない**。実ページではそこにサイト名
+  // （"SuperSplat"）が入っていて、シーン名より先に当たってしまう。作品名を
+  // 名指ししているのはOGPのほうなので、そちらを先に読む。
   const title =
-    firstString(collectByKey(blocks, TITLE_KEYS)) ||
-    metaContent(html, ["og:title", "twitter:title"]) ||
-    // `<title>` は "Lion | SuperSplat" のようにサイト名が付く。区切りより前だけ取る。
-    (html.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i)?.[1] ?? "")
-      .split(/\s+[|｜]\s+/)[0]
-      .trim();
+    stripSiteName(metaContent(html, ["og:title", "twitter:title"]), siteName) ||
+    // プレビュー画像のalt。実ページではサイト名の付かない作品名そのもの。
+    metaContent(html, ["og:image:alt"]) ||
+    stripSiteName(documentTitle(html), siteName);
 
   const author =
     firstString(collectByKey(blocks, AUTHOR_KEYS)) ||

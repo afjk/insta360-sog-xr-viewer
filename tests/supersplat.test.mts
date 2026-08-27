@@ -335,14 +335,56 @@ test("survives a malformed scene page without throwing", () => {
 
 // --- scene page: attribution -----------------------------------------------
 
-test("reads title and author for display", () => {
-  const meta = readSuperSplatSceneMeta(scenePage());
-  assert.equal(meta.title, "Lion");
-  assert.equal(meta.author, "splat-artist");
+/** 実ページの `<head>` から採った表題まわり。順序も実物どおり。 */
+const REAL_HEAD = `<title>Lion - SuperSplat</title>
+  <meta property="og:title" content="Lion - SuperSplat"/>
+  <meta property="og:site_name" content="SuperSplat"/>
+  <meta property="og:url" content="https://superspl.at/scene/56155c3f"/>
+  <meta property="og:image:alt" content="Lion"/>
+  <meta name="twitter:title" content="Lion - SuperSplat"/>`;
+
+test("reads the scene title, not the site name", () => {
+  // 実ページの区切りは "|" ではなく " - "。落とす接尾辞は og:site_name が教える。
+  assert.equal(readSuperSplatSceneMeta(`<html><head>${REAL_HEAD}</head></html>`).title, "Lion");
 });
 
-test("drops the site name that the document title carries", () => {
-  assert.equal(readSuperSplatSceneMeta("<html><head><title>Lion | SuperSplat</title></head></html>").title, "Lion");
+test("does not let embedded JSON site metadata win over the scene title", () => {
+  // 埋め込みJSONの title/name にはサイト名が入っていることがある。これを
+  // 優先していたため表題が "SuperSplat" になっていた。
+  const html = `<html><head>${REAL_HEAD}
+    <script type="application/json" id="x">{"title":"SuperSplat","name":"SuperSplat"}</script>
+  </head></html>`;
+  assert.equal(readSuperSplatSceneMeta(html).title, "Lion");
+});
+
+test("strips the site name from every place the title can come from", () => {
+  const site = `<meta property="og:site_name" content="SuperSplat"/>`;
+  for (const head of [
+    `<meta property="og:title" content="Lion - SuperSplat"/>${site}`,
+    `<meta name="twitter:title" content="Lion - SuperSplat"/>${site}`,
+    `<title>Lion - SuperSplat</title>${site}`,
+    `<title>Lion | SuperSplat</title>${site}`,
+  ]) {
+    assert.equal(readSuperSplatSceneMeta(`<html><head>${head}</head></html>`).title, "Lion", head);
+  }
+});
+
+test("keeps a scene whose name happens to match the site", () => {
+  const html = `<html><head><meta property="og:title" content="SuperSplat"/>
+    <meta property="og:site_name" content="SuperSplat"/></head></html>`;
+  // 落とすと空になる場合は落とさない。
+  assert.equal(readSuperSplatSceneMeta(html).title, "SuperSplat");
+});
+
+test("decodes entities in the title", () => {
+  const html = `<html><head><meta property="og:title" content="Salt &amp; Pepper - SuperSplat"/>
+    <meta property="og:site_name" content="SuperSplat"/></head></html>`;
+  assert.equal(readSuperSplatSceneMeta(html).title, "Salt & Pepper");
+});
+
+test("reads an author when the page names one", () => {
+  const html = `<html><head><meta name="author" content="Joanna Kobierska"/></head></html>`;
+  assert.equal(readSuperSplatSceneMeta(html).author, "Joanna Kobierska");
 });
 
 test("reads structured blocks without executing the page", () => {

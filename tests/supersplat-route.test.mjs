@@ -22,7 +22,9 @@ function scenePageHtml({
   author = "splat-artist",
 } = {}) {
   return `<!doctype html><html><head>
-    <title>${title} | SuperSplat</title>
+    <title>${title} - SuperSplat</title>
+    <meta property="og:title" content="${title} - SuperSplat"/>
+    <meta property="og:site_name" content="SuperSplat"/>
     <meta name="author" content="${author}" />
     ${licenseHref ? `<link rel="license" href="${licenseHref}">` : ""}
   </head><body><main>
