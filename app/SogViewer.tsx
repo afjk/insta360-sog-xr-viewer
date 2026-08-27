@@ -23,8 +23,23 @@ import {
   shareUrlFromShareId,
   toAbsoluteUrl,
 } from "./insta360";
+import {
+  SUPERSPLAT_ERROR_MESSAGES,
+  parseSuperSplatUrl,
+  sceneUrlFromSceneId,
+  type SuperSplatErrorCode,
+  type SuperSplatLicense,
+  type SuperSplatResolution,
+} from "./supersplat";
 import { resolverConfig } from "./resolver-config";
-import { hrefWithoutShareId, permalinkFor, readShareId, readViewPose } from "./permalink";
+import {
+  hrefWithoutSpace,
+  isSameSpace,
+  permalinkFor,
+  readSpaceRef,
+  readViewPose,
+  type SpaceRef,
+} from "./permalink";
 import {
   normalizeYawDegrees,
   orbitTargetOf,
@@ -35,6 +50,8 @@ import {
   type ViewPose,
 } from "./view-pose";
 import {
+  INSTA360_PLACEMENT,
+  SUPERSPLAT_PLACEMENT,
   boxCentre,
   captureFovOf,
   captureHomeView,
@@ -42,9 +59,11 @@ import {
   responsiveFovDegrees,
   splatBoundsFromCenters,
   splatPlacement,
-  worldFromCapturePoint,
+  splatPlacementFor,
+  worldFromCapturePointFor,
   type CaptureCamera,
   type CaptureFov,
+  type PlacementTransform,
   type SplatBounds,
 } from "./capture-view";
 import { optimizationUnsupportedReason } from "./sog-image";
@@ -62,9 +81,31 @@ import { readCachedOptimization, writeCachedOptimization } from "./sog-cache";
 type ViewerStatus = "loading" | "ready" | "error";
 type VrVariant = "original" | "optimized";
 type SourceKind = "sample" | "url" | "file";
-// shareIdはInsta360共有由来のときだけ入る。「この空間のリンクをコピー」の
-// 出し分けは、ラベル文字列を読み直すのではなくこれで判断する。
-type ViewerSource = { kind: SourceKind; label: string; shareId?: string };
+/**
+ * 空間の出どころ。
+ *
+ * `kind` は「どう渡されたか」、`provider` は「どこの何か」。座標変換・
+ * パーマリンク・ライセンス表示はすべて `provider` で決める。ラベル文字列や
+ * URLの形から後で提供元を推測しない。
+ */
+type SourceProvider = "sample" | "file" | "direct" | "insta360" | "supersplat";
+/** SuperSplat由来の空間に付く、公開ページから取れた情報。 */
+type SuperSplatSource = {
+  sceneId: string;
+  pageUrl: string;
+  title: string;
+  author: string;
+  license: SuperSplatLicense | null;
+};
+type ViewerSource = {
+  kind: SourceKind;
+  provider: SourceProvider;
+  label: string;
+  /** Insta360共有由来のときだけ入る。 */
+  shareId?: string;
+  /** SuperSplat由来のときだけ入る。 */
+  supersplat?: SuperSplatSource;
+};
 type LoadRequest = { kind: "url"; value: string } | { kind: "file"; file: File };
 type Bounds = SplatBounds;
 // コピーできるリンクは2種類。「この空間のリンク」(`?id=`) と
@@ -113,6 +154,50 @@ const VR_RENDER_PROFILE: Record<VrVariant, { framebufferScaleFactor: number; fov
 
 // 解決エンドポイントの有無はビルド時に決まるので、一度だけ読めばよい。
 const SHARE_RESOLVER = resolverConfig();
+
+// unbundled SOG（`meta.json` ＋ WebP群）はViewerが元データをひと続きのバイト列
+// として持っていない。いまのoptimizerはArrayBufferを前提にしているので、この
+// 形の空間では軽量化を出さない。Originalのままなら通常どおり表示できる。
+const UNBUNDLED_OPTIMIZE_REASON =
+  "このSuperSplat形式（meta.json + WebP）では現在VR向け軽量化を利用できません。";
+
+/**
+ * 表示中の空間をパーマリンクの形で指す。載せられない出どころでは `null`。
+ *
+ * サンプル・ローカルファイル・`.sog` の直接URLは、別の端末で開き直せる
+ * 恒久的な識別子を持たないのでリンクを作らない。
+ */
+const spaceRefOf = (source: ViewerSource): SpaceRef | null => {
+  if (source.provider === "insta360" && source.shareId) {
+    return { provider: "insta360", id: source.shareId };
+  }
+  if (source.provider === "supersplat" && source.supersplat) {
+    return { provider: "supersplat", id: source.supersplat.sceneId };
+  }
+  return null;
+};
+
+/**
+ * 提供元ごとの座標変換。
+ *
+ * SuperSplatだけ別の回転で、それ以外——サンプル・ローカルファイル・`.sog` の
+ * 直接URL・Insta360共有——は従来どおりInsta360の変換のまま。既に配ってある
+ * リンクの見え方を変えないため。
+ */
+const placementTransformOf = (provider: SourceProvider): PlacementTransform =>
+  provider === "supersplat" ? SUPERSPLAT_PLACEMENT : INSTA360_PLACEMENT;
+
+/** resolverのエラー応答を、画面に出す日本語へ直す。 */
+const superSplatErrorMessage = (
+  payload: { error?: string; code?: string } | null,
+  status: number,
+): string => {
+  const code = payload?.code;
+  if (code && Object.prototype.hasOwnProperty.call(SUPERSPLAT_ERROR_MESSAGES, code)) {
+    return SUPERSPLAT_ERROR_MESSAGES[code as SuperSplatErrorCode];
+  }
+  return payload?.error ?? `SuperSplatのシーンを解決できませんでした (HTTP ${status})`;
+};
 
 const clamp = (value: number, min: number, max: number) =>
   Math.min(max, Math.max(min, value));
@@ -186,7 +271,14 @@ export function SogViewer() {
   const [optimizeRatio, setOptimizeRatio] = useState(0);
   const [optimizeError, setOptimizeError] = useState("");
   const [optimizeUnsupported, setOptimizeUnsupported] = useState<string | null>(null);
-  const [source, setSource] = useState<ViewerSource>({ kind: "sample", label: SAMPLE_LABEL });
+  // 表示中の空間の形が理由でVR向け軽量化を出せない場合の説明。端末側の理由
+  // (`optimizeUnsupported`) とは別に持ち、空間を切り替えるたびに更新する。
+  const [optimizeSourceReason, setOptimizeSourceReason] = useState<string | null>(null);
+  const [source, setSource] = useState<ViewerSource>({
+    kind: "sample",
+    provider: "sample",
+    label: SAMPLE_LABEL,
+  });
   const [openOpen, setOpenOpen] = useState(false);
   const [openInput, setOpenInput] = useState("");
   // 読み込み中の対象名。表示中の空間 (`source`) はロードが終わってから
@@ -302,16 +394,22 @@ export function SogViewer() {
       };
     };
 
-    const splatEntity = new Entity("insta360-sog");
-    // Insta360's capture axes are Y-down / Z-forward. A 180° X rotation makes
-    // the room Y-up / Z-back without using a negative scale in stereo XR.
-    splatEntity.setLocalEulerAngles(180, 0, 0);
+    const splatEntity = new Entity("sog-space");
+    // 表示中の空間の座標変換。読み込むたびにその提供元のものへ差し替える。
+    // 既定はInsta360（サンプルもこの向きで表示してきた）。
+    let placementTransform: PlacementTransform = INSTA360_PLACEMENT;
+    splatEntity.setLocalEulerAngles(
+      placementTransform.eulerAngles.x,
+      placementTransform.eulerAngles.y,
+      placementTransform.eulerAngles.z,
+    );
     app.root.addChild(splatEntity);
 
-    /** 180°回転後に部屋が原点に中心し、床がy=0に来るよう配置する。 */
+    /** 回転後に部屋が原点に中心し、床がy=0に来るよう配置する。 */
     const applyPlacement = (bounds: Bounds) => {
-      const placement = splatPlacement(bounds);
-      splatEntity.setLocalEulerAngles(180, 0, 0);
+      const placement = splatPlacementFor(bounds, placementTransform);
+      const { x, y, z } = placementTransform.eulerAngles;
+      splatEntity.setLocalEulerAngles(x, y, z);
       splatEntity.setLocalPosition(placement.x, placement.y, placement.z);
     };
 
@@ -370,13 +468,14 @@ export function SogViewer() {
     /**
      * URLの `view=` に入っている視点。初期視点の第一優先。
      *
-     * `view=` は空間に紐づくので、アドレスバーが指している共有IDといま読み込んだ
+     * `view=` は空間に紐づくので、アドレスバーが指している空間といま読み込んだ
      * 空間が一致するときだけ使う。別の空間へ切り替えたときに前の視点を持ち込まない。
+     * 提供元まで含めて突き合わせるので、`?id=` と `?ss=` を取り違えることはない。
      */
-    const linkedViewFor = (shareId: string | undefined): ViewPose | null => {
-      if (!shareId) return null;
+    const linkedViewFor = (space: SpaceRef | null): ViewPose | null => {
+      if (!space) return null;
       const href = window.location.href;
-      if (readShareId(href) !== shareId) return null;
+      if (!isSameSpace(readSpaceRef(href), space)) return null;
       return readViewPose(href);
     };
 
@@ -408,7 +507,11 @@ export function SogViewer() {
     const frameBounds = (bounds: Bounds) => {
       const eyeHeight = clamp((bounds.max.y - bounds.min.y) * 0.54, 1, 2.2);
       const radius = Math.max(bounds.max.x - bounds.min.x, bounds.max.z - bounds.min.z) * 0.5;
-      const centre = worldFromCapturePoint(bounds.centre, splatPlacement(bounds));
+      const centre = worldFromCapturePointFor(
+        bounds.centre,
+        splatPlacementFor(bounds, placementTransform),
+        placementTransform,
+      );
       resetView(
         new Vec3(centre.x, eyeHeight, centre.z),
         clamp(radius * ORBIT_DISTANCE_RATIO, ORBIT_DISTANCE_RANGE.min, ORBIT_DISTANCE_RANGE.max),
@@ -434,7 +537,11 @@ export function SogViewer() {
     let loadToken = 0;
     let optimizeToken = 0;
     // 表示中のOriginal SOG。バイト列はVR最適化とハッシュ計算に使い回す。
-    let original: { asset: Asset; objectUrl: string; blob: Blob; hash: string | null } | null = null;
+    // `blob` はbundled SOG（ローカル・Insta360・直接URL）でだけ入る。unbundled
+    // SOGはPlayCanvasが直接取りに行くので、Viewerの手元にバイト列が残らない。
+    let original:
+      | { asset: Asset; objectUrl: string; blob: Blob | null; hash: string | null }
+      | null = null;
     let optimizedEntry: { asset: Asset; objectUrl: string; key: string } | null = null;
     let splatComponent: GSplatComponent | null = null;
     let pendingFoveation = VR_RENDER_PROFILE.original.foveation;
@@ -465,7 +572,8 @@ export function SogViewer() {
       app.assets.remove(entry.asset);
       entry.asset.off();
       if (entry.asset.loaded) entry.asset.unload();
-      URL.revokeObjectURL(entry.objectUrl);
+      // リモートURLから直接読んだアセットにはobject URLが無い。
+      if (entry.objectUrl) URL.revokeObjectURL(entry.objectUrl);
     };
 
     const releaseOptimized = () => {
@@ -485,6 +593,32 @@ export function SogViewer() {
           reject(new Error(assetErrorMessage(error)));
         });
         asset.ready(() => resolve({ asset, objectUrl }));
+        app.assets.add(asset);
+        app.assets.load(asset);
+      });
+
+    /**
+     * リモートのURLをそのままPlayCanvasへ渡してGSplatアセットを作る。
+     *
+     * unbundled SOG（`meta.json`）用。`meta.json` は同じディレクトリのWebPを
+     * **相対パスで**参照しているので、いったんBlobにしてobject URLで読ませると
+     * 相対解決の基準が `blob:` になり、WebPを取りに行けなくなる。PlayCanvasの
+     * SOGパーサーは相対URLを「読み込みに使ったURL」基準で解決する
+     * （`new URL(filename, url.load)`）ため、CDNのURLをそのまま渡せば
+     * `meta.json` と同じ場所のWebPが引ける。
+     *
+     * `filename` はパーサーの選択にしか使われない（拡張子が `json` なら
+     * SOGパーサー、`sog` ならバンドルパーサー）。取得先は `url` のままなので、
+     * クエリ付きのCDN URLでも取り違えない。
+     *
+     * WebPはtextureアセットとして `crossOrigin: "anonymous"` で読まれるので、
+     * 配信元がCORSを許可している必要がある。
+     */
+    const loadRemoteGsplatAsset = (name: string, url: string, filename: string) =>
+      new Promise<{ asset: Asset; objectUrl: string }>((resolve, reject) => {
+        const asset = new Asset(name, "gsplat", { url, filename });
+        asset.once("error", (error: unknown) => reject(new Error(assetErrorMessage(error))));
+        asset.ready(() => resolve({ asset, objectUrl: "" }));
         app.assets.add(asset);
         app.assets.load(asset);
       });
@@ -535,37 +669,47 @@ export function SogViewer() {
      * `pose` は復元に使った視点。`view=` 付きで開かれたときはそのまま残すので、
      * リロードしても同じ画角に戻る。視点を使わなかった空間では落とす。
      */
-    const syncPermalink = (shareId: string | undefined, pose: ViewPose | null) => {
+    const syncPermalink = (space: SpaceRef | null, pose: ViewPose | null) => {
       const href = window.location.href;
-      const next = shareId ? permalinkFor(href, shareId, pose) : hrefWithoutShareId(href);
+      const next = space ? permalinkFor(href, space, pose) : hrefWithoutSpace(href);
       if (next && next !== href) window.history.replaceState(null, "", next);
     };
 
-    /** Original SOGを差し替える。VR最適化済みの結果は入力が変わるので捨てる。 */
-    const showOriginal = async (
+    /**
+     * 読み込み終わったアセットを表示中の空間として据える。
+     *
+     * bundled SOG（バイト列を持っている）とunbundled SOG（PlayCanvasが直接
+     * 取りに行く）で共通の後始末。`bytes` が `null` の空間ではVR向け軽量化を
+     * 出さない——optimizerが元のバイト列を必要とするため。
+     */
+    const showSplat = async (
       next: ViewerSource,
-      buffer: ArrayBuffer,
-      cameras: CaptureCamera[] | null = null,
+      loaded: { asset: Asset; objectUrl: string },
+      bytes: { blob: Blob; hash: string | null } | null,
+      cameras: CaptureCamera[] | null,
     ) => {
       const isSample = next.kind === "sample";
-      const hash = typeof crypto?.subtle === "undefined" ? null : await sha256Hex(buffer);
-      const blob = new Blob([buffer]);
-      const loaded = await loadSplatAsset(next.label, blob, "space.sog");
+      // 配置は提供元ごとに違うので、バウンズを測る前に切り替える。
+      placementTransform = placementTransformOf(next.provider);
       const bounds = boundsFromResource(loaded.asset.resource) ?? CAPTURE_BOUNDS;
       framedBounds = isSample ? CAPTURE_BOUNDS : bounds;
       applyPlacement(framedBounds);
       applyCaptureFov(cameras ? captureFovOf(cameras) : null);
       // `view=` で開かれていればその視点。無ければ公式と同じ初期視点、
       // それも無ければ空間の広がりから決める既定視点へ落ちる。
-      const linkedView = linkedViewFor(next.shareId);
+      // SuperSplatには `cameras.json` に当たるものが無いので、実質
+      // 「`view=` があればそれ、無ければ `frameBounds()`」になる。
+      const space = spaceRefOf(next);
+      const linkedView = linkedViewFor(space);
       const initialView = linkedView ?? homeViewFor(cameras, framedBounds);
       // `?debug=1` のときだけ、何を根拠に初期視点を決めたかを出す。`cameras` が
       // `null` のまま既定視点へ落ちていないか（resolverが `camerasUrl` を返して
       // いるか）を、実際に配信されている版で確かめるための出力。
       if (xrDebug) {
         console.info("[sog-xr] initial", {
+          provider: next.provider,
           bounds: { ...framedBounds },
-          placement: splatPlacement(framedBounds),
+          placement: splatPlacementFor(framedBounds, placementTransform),
           cameraCount: cameras?.length ?? null,
           linkedView,
           initialView,
@@ -576,15 +720,28 @@ export function SogViewer() {
       else frameBounds(framedBounds);
       attachAsset(loaded.asset);
       const previous = original;
-      original = { ...loaded, blob, hash };
+      original = { ...loaded, blob: bytes?.blob ?? null, hash: bytes?.hash ?? null };
       releaseAsset(previous);
       releaseOptimized();
       setOriginalSplats(splatCountOf(loaded.asset.resource));
       setSource(next);
+      setOptimizeSourceReason(bytes ? null : UNBUNDLED_OPTIMIZE_REASON);
       // アドレスバーへ残すのはユーザーが指定した視点だけ。こちらで決めた
-      // 初期視点まで載せると、共有IDだけのリンクが視点付きに化けてしまう。
-      syncPermalink(next.shareId, linkedView);
+      // 初期視点まで載せると、空間だけのリンクが視点付きに化けてしまう。
+      syncPermalink(space, linkedView);
       setStatus("ready");
+    };
+
+    /** Original SOGをバイト列から差し替える。VR最適化済みの結果は入力が変わるので捨てる。 */
+    const showOriginal = async (
+      next: ViewerSource,
+      buffer: ArrayBuffer,
+      cameras: CaptureCamera[] | null = null,
+    ) => {
+      const hash = typeof crypto?.subtle === "undefined" ? null : await sha256Hex(buffer);
+      const blob = new Blob([buffer]);
+      const loaded = await loadSplatAsset(next.label, blob, "space.sog");
+      await showSplat(next, loaded, { blob, hash }, cameras);
     };
 
     const onXrAvailability = (available: boolean) => {
@@ -695,6 +852,14 @@ export function SogViewer() {
         return;
       }
 
+      // unbundled SOGでは元のバイト列が手元に無い。UI側でも選べないように
+      // してあるが、ここでも念のため止める。
+      if (!original.blob) {
+        setOptimizeError(UNBUNDLED_OPTIMIZE_REASON);
+        return;
+      }
+      const sourceBlob = original.blob;
+
       const settings: OptimizeSettings = {
         targetSplats: targetSplatsRef.current,
         dropSphericalHarmonics: true,
@@ -725,7 +890,7 @@ export function SogViewer() {
           splats = cached.splats;
           bytes = cached.bytes;
         } else {
-          const source = await original.blob.arrayBuffer();
+          const source = await sourceBlob.arrayBuffer();
           if (disposed || token !== optimizeToken) return;
           const result = await runOptimizer(source, settings);
           if (disposed || token !== optimizeToken) return;
@@ -795,7 +960,7 @@ export function SogViewer() {
 
       let response: Response;
       try {
-        response = await fetch(`${resolver.endpoint}?url=${encodeURIComponent(shareUrl)}`, {
+        response = await fetch(`${resolver.endpoints.insta360}?url=${encodeURIComponent(shareUrl)}`, {
           headers: { accept: "application/json" },
         });
       } catch {
@@ -811,17 +976,53 @@ export function SogViewer() {
     };
 
     /**
+     * SuperSplatの公開シーンURLをサーバー経由で解決する。
+     *
+     * resolverが確かめるのは、作者がダウンロードを許可しているか（Downloadable）と
+     * ライセンスが読み取れるか。そこを通ったシーンだけがアセットのURLを返す。
+     * ブラウザ側でその判断をやり直さない。
+     */
+    const resolveSuperSplat = async (sceneUrl: string): Promise<SuperSplatResolution> => {
+      const resolver = resolverConfig();
+      if (!resolver.available) throw new Error(resolver.reason);
+
+      let response: Response;
+      try {
+        response = await fetch(
+          `${resolver.endpoints.supersplat}?url=${encodeURIComponent(sceneUrl)}`,
+          { headers: { accept: "application/json" } },
+        );
+      } catch {
+        throw new Error("SuperSplatのシーンURLの解決サービスに接続できませんでした。");
+      }
+      const payload = (await response.json().catch(() => null)) as
+        | (Partial<SuperSplatResolution> & { error?: string; code?: string })
+        | null;
+      if (!response.ok || !payload?.asset?.url) {
+        throw new Error(superSplatErrorMessage(payload ?? null, response.status));
+      }
+      // Streamed SOGはresolverが見つけても、このViewerではまだ描画できない。
+      // resolverの応答はそのままなので、対応を足すのはViewer側だけで済む。
+      if (payload.asset.format === "streamed-sog") {
+        throw new Error(SUPERSPLAT_ERROR_MESSAGES.SUPERSPLAT_STREAMED_SOG_UNSUPPORTED);
+      }
+      return payload as SuperSplatResolution;
+    };
+
+    /**
      * 同じ空間を二重に読み込まないための鍵。
      *
-     * 共有IDやSOGのURLが同じなら、解決もダウンロードもデコードもやり直す
-     * 必要がない。ファイルは同じ名前でも中身が違いうるので鍵を作らない
-     * （毎回読み直す）。
+     * 共有ID・シーンID・SOGのURLが同じなら、解決もダウンロードもデコードも
+     * やり直す必要がない。ファイルは同じ名前でも中身が違いうるので鍵を
+     * 作らない（毎回読み直す）。
      */
     const sourceKeyOf = (request: LoadRequest): string => {
       if (request.kind === "file") return "";
       const input = request.value.trim();
       const share = parseInsta360ShareUrl(input);
       if (share) return `share:${share.shareId}`;
+      const scene = parseSuperSplatUrl(input);
+      if (scene) return `supersplat:${scene.sceneId}`;
       const direct = isSpatialAssetUrl(input) ? toAbsoluteUrl(input) : null;
       return direct ? `sog:${direct.toString()}` : "";
     };
@@ -857,8 +1058,12 @@ export function SogViewer() {
       };
 
       let label = "";
+      let provider: SourceProvider = "direct";
       let shareId: string | undefined;
+      let supersplat: SuperSplatSource | undefined;
       let fetchUrl = "";
+      // PlayCanvasに直接読ませるアセット。unbundled SOGのときだけ入る。
+      let remote: { url: string; filename: string } | null = null;
       // 撮影時のカメラ情報。Insta360共有を解決したときだけ入る。
       let camerasUrl = "";
       let file: File | null = null;
@@ -870,11 +1075,14 @@ export function SogViewer() {
           return;
         }
         file = request.file;
+        provider = "file";
         label = request.file.name;
       } else {
+        // 判定の順番は Insta360共有URL → SuperSplatシーンURL → 直接URL。
         const input = request.value.trim();
         const share = parseInsta360ShareUrl(input);
-        const direct = isSpatialAssetUrl(input) ? toAbsoluteUrl(input) : null;
+        const scene = share ? null : parseSuperSplatUrl(input);
+        const direct = !share && !scene && isSpatialAssetUrl(input) ? toAbsoluteUrl(input) : null;
         if (share) {
           const resolver = resolverConfig();
           if (!resolver.available) {
@@ -882,6 +1090,7 @@ export function SogViewer() {
             loadingKey = "";
             return;
           }
+          provider = "insta360";
           shareId = share.shareId;
           label = `Insta360共有 ${share.shareId}`;
           setPendingLabel(label);
@@ -899,34 +1108,87 @@ export function SogViewer() {
             reportFailure(error);
             return;
           }
+        } else if (scene) {
+          const resolver = resolverConfig();
+          if (!resolver.available) {
+            reportFailure(new Error(resolver.reason));
+            loadingKey = "";
+            return;
+          }
+          provider = "supersplat";
+          label = `SuperSplat ${scene.sceneId}`;
+          setPendingLabel(label);
+          setSourceStage("SuperSplatのシーンを確認中");
+          reportProgress(-1);
+          try {
+            const resolved = await resolveSuperSplat(scene.sceneUrl);
+            supersplat = {
+              sceneId: resolved.sceneId,
+              pageUrl: resolved.pageUrl,
+              title: resolved.title,
+              author: resolved.author,
+              license: resolved.license,
+            };
+            label = resolved.title ? `SuperSplat ${resolved.title}` : label;
+            // bundled SOGはバイト列で取ればVR向け軽量化まで使える。
+            // unbundled SOG (`meta.json`) は相対参照を保つためURLのまま渡す。
+            if (resolved.asset.format === "sog") fetchUrl = resolved.asset.url;
+            else remote = { url: resolved.asset.url, filename: "meta.json" };
+          } catch (error) {
+            if (disposed || token !== loadToken) return;
+            setSourceStage("");
+            setPendingLabel("");
+            loadingKey = "";
+            reportFailure(error);
+            return;
+          }
         } else if (direct) {
           fetchUrl = direct.toString();
           label = direct.pathname.split("/").pop() || "space.sog";
         } else {
-          setSourceError("Insta360の共有URL、または .sog のURLを入力してください。");
+          setSourceError(
+            "Insta360の共有URL、SuperSplatのシーンURL、または .sog のURLを入力してください。",
+          );
           loadingKey = "";
           return;
         }
       }
 
+      const next: ViewerSource = {
+        kind: request.kind === "file" ? "file" : "url",
+        provider,
+        label,
+        shareId,
+        supersplat,
+      };
+
       setPendingLabel(label);
       setSourceStage(`${label} を読み込み中`);
-      reportProgress(0);
+      reportProgress(remote ? -1 : 0);
       // カメラ情報はSOGと並行して取る。SOGより桁違いに小さいので、
       // 待ち時間は増えない。
       const camerasRequest = camerasUrl
         ? downloadCaptureCameras(camerasUrl)
         : Promise.resolve(null);
       try {
-        const buffer = file ? await file.arrayBuffer() : await downloadSog(fetchUrl, reportProgress);
-        if (disposed || token !== loadToken) return;
-        setSourceStage(`${label} を展開中`);
-        reportProgress(-1);
-        await showOriginal(
-          { kind: request.kind === "file" ? "file" : "url", label, shareId },
-          buffer,
-          await camerasRequest,
-        );
+        if (remote) {
+          // 取得と展開はPlayCanvasの中で進むので、こちらは進捗を出せない。
+          const loaded = await loadRemoteGsplatAsset(label, remote.url, remote.filename);
+          // 読み込んでいる間に別の空間へ切り替えられていたら、出さずに捨てる。
+          if (disposed || token !== loadToken) {
+            releaseAsset(loaded);
+            return;
+          }
+          await showSplat(next, loaded, null, null);
+        } else {
+          const buffer = file
+            ? await file.arrayBuffer()
+            : await downloadSog(fetchUrl, reportProgress);
+          if (disposed || token !== loadToken) return;
+          setSourceStage(`${label} を展開中`);
+          reportProgress(-1);
+          await showOriginal(next, buffer, await camerasRequest);
+        }
         if (disposed || token !== loadToken) return;
         shownKey = key;
         setSourceStage("");
@@ -960,7 +1222,7 @@ export function SogViewer() {
       try {
         const buffer = await downloadSog(SAMPLE_URL, initial ? setProgress : setSourceProgress);
         if (disposed || token !== loadToken) return;
-        await showOriginal({ kind: "sample", label: SAMPLE_LABEL }, buffer);
+        await showOriginal({ kind: "sample", provider: "sample", label: SAMPLE_LABEL }, buffer);
         if (disposed || token !== loadToken) return;
         shownKey = SAMPLE_KEY;
         setPendingLabel("");
@@ -1298,11 +1560,17 @@ export function SogViewer() {
 
     resize();
     app.start();
-    // `?id=` 付きで開かれたら、サンプルには一切触れずにその空間だけを読む。
+    // `?id=` / `?ss=` 付きで開かれたら、サンプルには一切触れずにその空間だけを読む。
     // サンプル→本番の二重ロード（fetch・decode・GPU転送）を起こさないため、
     // ここで分岐してどちらか一方だけを呼ぶ。
-    const deepLinkShareUrl = shareUrlFromShareId(readShareId(window.location.href) ?? "");
-    if (deepLinkShareUrl) void loadSource({ kind: "url", value: deepLinkShareUrl }, true);
+    const deepLink = readSpaceRef(window.location.href);
+    const deepLinkUrl =
+      deepLink === null
+        ? null
+        : deepLink.provider === "insta360"
+          ? shareUrlFromShareId(deepLink.id)
+          : sceneUrlFromSceneId(deepLink.id);
+    if (deepLinkUrl) void loadSource({ kind: "url", value: deepLinkUrl }, true);
     else void loadSample(true);
     setXrAvailable(xr.isAvailable(XRTYPE_VR));
 
@@ -1330,15 +1598,14 @@ export function SogViewer() {
       window.removeEventListener("drop", onDrop);
       if (xr.active) xr.end();
       optimizeWorker?.terminate();
-      if (original) URL.revokeObjectURL(original.objectUrl);
-      if (optimizedEntry) URL.revokeObjectURL(optimizedEntry.objectUrl);
+      if (original?.objectUrl) URL.revokeObjectURL(original.objectUrl);
+      if (optimizedEntry?.objectUrl) URL.revokeObjectURL(optimizedEntry.objectUrl);
       app.destroy();
       viewport.replaceChildren();
     };
   }, []);
 
   targetSplatsRef.current = targetSplats;
-  vrVariantRef.current = vrVariant;
 
   useEffect(() => () => {
     if (copyTimerRef.current !== null) clearTimeout(copyTimerRef.current);
@@ -1347,7 +1614,7 @@ export function SogViewer() {
   /**
    * 表示中の空間のViewerリンクをクリップボードへ入れる。
    *
-   * 共有IDから今のorigin/pathnameで組み立てるので、GitHub Pagesでも
+   * 共有ID／シーンIDから今のorigin/pathnameで組み立てるので、GitHub Pagesでも
    * localhostでも、開いているのと同じ配信先のURLになる。
    *
    * `view` を選ぶと、いま見えている視点（world空間の位置・yaw・pitch）を
@@ -1355,11 +1622,11 @@ export function SogViewer() {
    * 同じ場所・同じ向きから始まる。
    */
   const copyPermalink = async (target: CopyTarget) => {
-    const shareId = source.shareId;
-    if (!shareId) return;
+    const space = spaceRefOf(source);
+    if (!space) return;
     const pose = target === "view" ? currentViewRef.current() : null;
     if (target === "view" && !pose) return;
-    const permalink = permalinkFor(window.location.href, shareId, pose);
+    const permalink = permalinkFor(window.location.href, space, pose);
     if (!permalink) return;
     // 視点リンクはアドレスバーも合わせておく。Clipboard APIが使えない環境でも
     // 同じURLをアドレスバーから拾えるようにするため。
@@ -1385,6 +1652,13 @@ export function SogViewer() {
         : "コピーできませんでした（アドレスバーのURLをお使いください）";
 
   const isSample = source.kind === "sample";
+  // リンクを配れる空間かどうか。ラベルではなくproviderで決まる。
+  const space = spaceRefOf(source);
+  // VR向け軽量化を出せない理由。端末側の制約が先、次に表示中の空間の形。
+  const optimizeBlocked = optimizeUnsupported ?? optimizeSourceReason;
+  // 実際にVRへ持っていく版。軽量化を出せないときは、選択がどうであれOriginal。
+  // 選択そのもの (`vrVariant`) は残すので、表示できる空間へ戻れば元の選択に戻る。
+  const effectiveVrVariant: VrVariant = optimizeBlocked ? "original" : vrVariant;
   const sourceBusy = sourceStage !== "";
   const optimizing = optimizeStage !== "";
   const optimizedMatches = optimized !== null && optimized.targetSplats === targetSplats;
@@ -1395,6 +1669,8 @@ export function SogViewer() {
       : errorMessage
         ? { title: "VRを開始できませんでした", body: errorMessage }
         : null;
+
+  vrVariantRef.current = effectiveVrVariant;
 
   const submitFile = (file: File | undefined) => {
     if (file) loadSourceRef.current({ kind: "file", file });
@@ -1420,6 +1696,28 @@ export function SogViewer() {
             PLAYCANVAS · SOG v2
             {originalSplats ? ` · ${formatSplats(originalSplats)} SPLATS` : ""}
           </div>
+          {source.supersplat && (
+            <div className="source-credit">
+              <span className="source-provider">SUPERSPLAT</span>
+              {source.supersplat.title && (
+                <span className="source-credit-title">{source.supersplat.title}</span>
+              )}
+              {source.supersplat.author && (
+                <span className="source-credit-author">{source.supersplat.author}</span>
+              )}
+              {source.supersplat.license && (
+                <span className="source-credit-license">{source.supersplat.license.label}</span>
+              )}
+              <a
+                className="source-credit-link"
+                href={source.supersplat.pageUrl}
+                target="_blank"
+                rel="noreferrer noopener"
+              >
+                Original ↗
+              </a>
+            </div>
+          )}
         </div>
       </header>
 
@@ -1461,7 +1759,7 @@ export function SogViewer() {
           <span className="vr-icon" aria-hidden="true">◫</span>
           VRを開始
         </button>
-        {source.shareId && (
+        {space && (
           <>
             <button
               id="copy-permalink"
@@ -1514,7 +1812,7 @@ export function SogViewer() {
             <h2 id="open-title">空間を開く</h2>
             <p className="quality-copy">
               {SHARE_RESOLVER.available
-                ? "Insta360 Spatial Captureの共有URLを貼り付けるか、SOGファイルをドラッグ＆ドロップ、またはファイル選択から読み込みます。"
+                ? "Insta360 Spatial Captureの共有URL、またはSuperSplatの公開シーンURLを貼り付けるか、SOGファイルをドラッグ＆ドロップ、またはファイル選択から読み込みます。SuperSplatは作者がダウンロードを許可したシーンのみ開けます。"
                 : "SOGファイルをドラッグ＆ドロップするか、.sog のURLを指定して読み込みます。"}
             </p>
 
@@ -1533,11 +1831,13 @@ export function SogViewer() {
                 spellCheck={false}
                 placeholder={
                   SHARE_RESOLVER.available
-                    ? "https://app.insta360.com/3dspace/detail/..."
+                    ? "https://superspl.at/scene/... または https://app.insta360.com/3dspace/detail/..."
                     : "https://example.com/space.sog"
                 }
                 aria-label={
-                  SHARE_RESOLVER.available ? "Insta360共有URLまたはSOGのURL" : "SOGのURL"
+                  SHARE_RESOLVER.available
+                    ? "Insta360の共有URL、SuperSplatのシーンURL、またはSOGのURL"
+                    : "SOGのURL"
                 }
                 value={openInput}
                 disabled={sourceBusy}
@@ -1640,7 +1940,7 @@ export function SogViewer() {
 
             <div className="quality-options">
               <button
-                className={`quality-option${vrVariant === "original" ? " is-active" : ""}`}
+                className={`quality-option${effectiveVrVariant === "original" ? " is-active" : ""}`}
                 type="button"
                 disabled={optimizing}
                 onClick={() => setVrVariant("original")}
@@ -1650,9 +1950,9 @@ export function SogViewer() {
                 <span>{formatSplats(originalSplats)} splats · VR解像度 78%</span>
               </button>
               <button
-                className={`quality-option${vrVariant === "optimized" ? " is-active" : ""}`}
+                className={`quality-option${effectiveVrVariant === "optimized" ? " is-active" : ""}`}
                 type="button"
-                disabled={optimizing || optimizeUnsupported !== null}
+                disabled={optimizing || optimizeBlocked !== null}
                 onClick={() => setVrVariant("optimized")}
               >
                 <span className="quality-badge">PICO推奨</span>
@@ -1665,7 +1965,7 @@ export function SogViewer() {
               </button>
             </div>
 
-            {vrVariant === "optimized" && optimizeUnsupported === null && (
+            {effectiveVrVariant === "optimized" && optimizeBlocked === null && (
               <label className="vr-target">
                 <span>目標splat数</span>
                 <select
@@ -1682,9 +1982,9 @@ export function SogViewer() {
               </label>
             )}
 
-            {optimizeUnsupported && (
+            {optimizeBlocked && (
               <p className="open-error" role="status">
-                {optimizeUnsupported}VR向けSOGの生成はできませんが、オリジナルのままVRを開始できます。
+                {optimizeBlocked}VR向けSOGの生成はできませんが、オリジナルのままVRを開始できます。
               </p>
             )}
 
@@ -1716,11 +2016,14 @@ export function SogViewer() {
                 className="quality-start"
                 type="button"
                 onClick={() => {
-                  if (vrVariant === "optimized" && vrReady && optimizedMatches) startVrRef.current();
-                  else prepareVrRef.current(vrVariant);
+                  if (effectiveVrVariant === "optimized" && vrReady && optimizedMatches) {
+                    startVrRef.current();
+                  } else {
+                    prepareVrRef.current(effectiveVrVariant);
+                  }
                 }}
               >
-                {vrVariant === "original" || (vrReady && optimizedMatches)
+                {effectiveVrVariant === "original" || (vrReady && optimizedMatches)
                   ? "VRを開始"
                   : "最適化してVRを開始"}
               </button>

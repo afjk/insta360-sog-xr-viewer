@@ -7,8 +7,12 @@ import {
   parseCaptureCameras,
   responsiveFovDegrees,
   splatBoundsFromCenters,
+  INSTA360_PLACEMENT,
+  SUPERSPLAT_PLACEMENT,
   splatPlacement,
+  splatPlacementFor,
   worldFromCapturePoint,
+  worldFromCapturePointFor,
 } from "../app/capture-view.ts";
 import { orbitTargetOf } from "../app/view-pose.ts";
 
@@ -226,4 +230,58 @@ test("takes the midpoint of a box", () => {
   close(centre.x, -0.5, 1e-12, "x");
   close(centre.y, 0.05, 1e-12, "y");
   close(centre.z, 1, 1e-12, "z");
+});
+
+// --- provider ごとの配置 ---------------------------------------------------
+
+test("keeps the Insta360 placement exactly as it was", () => {
+  // 既に配ってあるリンクの見え方を変えないための固定。X軸まわり180°で、
+  // 撮影座標の y と z が反転する。
+  assert.deepEqual(INSTA360_PLACEMENT.eulerAngles, { x: 180, y: 0, z: 0 });
+  assert.deepEqual(INSTA360_PLACEMENT.signs, { x: 1, y: -1, z: -1 });
+  // 一般形が、以前の式（x: -(min+max)/2, y: max.y, z: (min+max)/2）と一致する。
+  assert.deepEqual(splatPlacementFor(BOUNDS, INSTA360_PLACEMENT), splatPlacement(BOUNDS));
+  assert.deepEqual(splatPlacementFor(BOUNDS, INSTA360_PLACEMENT), { x: 0.5, y: 1.6, z: 1 });
+  const placement = splatPlacement(BOUNDS);
+  assert.deepEqual(
+    worldFromCapturePointFor(BOUNDS.min, placement, INSTA360_PLACEMENT),
+    worldFromCapturePoint(BOUNDS.min, placement),
+  );
+});
+
+test("uses SuperSplat's own rotation for SuperSplat scenes", () => {
+  // SuperSplatの公開Viewerが全シーンに掛けているのと同じ回転。
+  // `playcanvas/supersplat-viewer` の src/index.ts:
+  //   entity.setLocalEulerAngles(0, 0, 180);
+  // Z軸まわり180°なので、反転するのは x と y。z はそのまま。
+  assert.deepEqual(SUPERSPLAT_PLACEMENT.eulerAngles, { x: 0, y: 0, z: 180 });
+  assert.deepEqual(SUPERSPLAT_PLACEMENT.signs, { x: -1, y: -1, z: 1 });
+  // Insta360の変換とは別物。取り違えるとzの符号が逆になり前後が入れ替わる。
+  assert.notDeepEqual(SUPERSPLAT_PLACEMENT.signs, INSTA360_PLACEMENT.signs);
+});
+
+test("centres and floors a SuperSplat scene the same way", () => {
+  const placement = splatPlacementFor(BOUNDS, SUPERSPLAT_PLACEMENT);
+  const min = worldFromCapturePointFor(BOUNDS.min, placement, SUPERSPLAT_PLACEMENT);
+  const max = worldFromCapturePointFor(BOUNDS.max, placement, SUPERSPLAT_PLACEMENT);
+  // どの提供元でも、置き方の約束は同じ: x/z は原点まわりに中心、床は y=0。
+  close(min.x + max.x, 0, 1e-12, "x is centred");
+  close(min.z + max.z, 0, 1e-12, "z is centred");
+  close(Math.min(min.y, max.y), 0, 1e-12, "floor sits at y=0");
+  assert.ok(Math.max(min.y, max.y) > 0, "the ceiling is above the floor");
+});
+
+test("does not flip a SuperSplat scene front to back", () => {
+  // Z軸まわり180°ではzの向きが変わらない。奥にあるものは奥のまま。
+  const placement = splatPlacementFor(BOUNDS, SUPERSPLAT_PLACEMENT);
+  const near = worldFromCapturePointFor({ x: 0, y: 0, z: -1 }, placement, SUPERSPLAT_PLACEMENT);
+  const far = worldFromCapturePointFor({ x: 0, y: 0, z: 1 }, placement, SUPERSPLAT_PLACEMENT);
+  assert.ok(near.z < far.z, "z keeps its ordering");
+  // Insta360の変換なら、同じ2点の前後が入れ替わる。
+  const insta = splatPlacement(BOUNDS);
+  assert.ok(
+    worldFromCapturePoint({ x: 0, y: 0, z: -1 }, insta).z >
+      worldFromCapturePoint({ x: 0, y: 0, z: 1 }, insta).z,
+    "the Insta360 transform reverses z",
+  );
 });

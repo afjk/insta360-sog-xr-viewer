@@ -5,6 +5,14 @@
  * 両方から使うため、DOMにもWorkerランタイムにも依存しない実装にしている。
  */
 
+// 拡張子を明示しているのは、このモジュールをテストからNodeで直接importするため。
+// バンドラは付いていても解決できる。
+import { hasHostSuffix, isPubliclyRoutableHost, toAbsoluteUrl } from "./url-safety.ts";
+
+// URLの安全判定は共通モジュールへ移した。このモジュール経由で読んでいる箇所が
+// あるので、そのまま再輸出しておく。
+export { isPubliclyRoutableHost, toAbsoluteUrl };
+
 /** 共有URLとして受け付けるホストのサフィックス。 */
 export const INSTA360_HOST_SUFFIXES = ["insta360.com", "insta360.cn", "arashivision.com"];
 
@@ -16,41 +24,9 @@ export type Insta360Share = {
   shareUrl: string;
 };
 
-/** 入力文字列を絶対URLとして解釈する。スキームが無い場合はhttpsを補う。 */
-export function toAbsoluteUrl(input: string): URL | null {
-  const trimmed = input.trim();
-  if (!trimmed) return null;
-  const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
-  try {
-    const url = new URL(withScheme);
-    return url.protocol === "http:" || url.protocol === "https:" ? url : null;
-  } catch {
-    return null;
-  }
-}
-
 /** Insta360が運用しているホストかどうか。 */
 export function isInsta360Host(hostname: string): boolean {
-  const host = hostname.toLowerCase();
-  return INSTA360_HOST_SUFFIXES.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
-}
-
-/**
- * ループバックやプライベートIP宛のURLを弾く。共有ページから拾ったURLを
- * サーバーが再取得するため、SSRFの踏み台にならないようにする。
- */
-export function isPubliclyRoutableHost(hostname: string): boolean {
-  const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return false;
-  if (host === "::1" || host.startsWith("fc") || host.startsWith("fd")) return false;
-  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (!ipv4) return true;
-  const [a, b] = ipv4.slice(1).map(Number);
-  if (a === 10 || a === 127 || a === 0) return false;
-  if (a === 172 && b >= 16 && b <= 31) return false;
-  if (a === 192 && b === 168) return false;
-  if (a === 169 && b === 254) return false;
-  return true;
+  return hasHostSuffix(hostname, INSTA360_HOST_SUFFIXES);
 }
 
 /** Insta360の共有ページURLを解析して共有IDを取り出す。 */
