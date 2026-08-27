@@ -20,7 +20,12 @@ PlayCanvasとWebXRを使い、Insta360 Spatial CaptureのSOG形式3D Gaussian Sp
 - **Insta360共有URL**: Spatial Captureの共有ページURL（例:
   `https://app.insta360.com/3dspace/detail/GS3DG...`）を貼り付けます。解決には
   サーバー側のエンドポイントが必要です。下記を参照してください。
-- **`?id=` 付きのViewer URL**: 一度開いた空間はリンクとして配れます。
+- **SuperSplat公開シーンURL**: `https://superspl.at/scene/56155c3f` または
+  `https://superspl.at/s?id=56155c3f` を貼り付けます。**作者がダウンロードを許可した
+  公開シーンのみ対応**します。こちらも解決にはサーバー側のエンドポイントが必要です。
+  詳しくは[SuperSplat公開シーンURLの解決について](#supersplat公開シーンurlの解決について)を
+  参照してください。
+- **`?id=` / `?ss=` 付きのViewer URL**: 一度開いた空間はリンクとして配れます。
   [空間を別の端末へ渡す](#空間を別の端末へ渡す)を参照してください。視点ごと渡したいときは
   [視点ごと渡す](#視点ごと渡すview)を参照してください。
 
@@ -28,11 +33,22 @@ PlayCanvasとWebXRを使い、Insta360 Spatial CaptureのSOG形式3D Gaussian Sp
 
 ### 空間を別の端末へ渡す
 
-Insta360共有URLから読み込むと、アドレスバーが自動でViewer専用のリンクになります。
+Insta360共有URLやSuperSplatのシーンURLから読み込むと、アドレスバーが自動で
+Viewer専用のリンクになります。載るのは提供元ごとの恒久的なIDだけです。
 
 ```
 https://afjk.github.io/insta360-sog-xr-viewer/?id=GS3DGbfd0ddd0dd4a47ccba4d3d2c2eed8a4d
+https://afjk.github.io/insta360-sog-xr-viewer/?ss=56155c3f
 ```
+
+| パラメータ | 提供元 | 値 |
+| --- | --- | --- |
+| `id` | Insta360 Spatial Capture | 共有ID (`GS3DG…`) |
+| `ss` | SuperSplat | シーンID (`56155c3f`) |
+
+`id` と `ss` の両方が載った異常なURLでは、**先に配ってある `id` を優先**し、`ss` は
+無視します。片方だけが有効で、`id` の形が合わなければ `ss` へは落ちずサンプルを
+表示します。
 
 このURLをQuestやPICOのブラウザで開くと、**サンプルを経由せず**その空間だけを読み込みます。
 画面右下の「この空間のリンクをコピー」で同じURLをクリップボードへ入れられます。
@@ -266,16 +282,20 @@ CORSセーフリストのレスポンスヘッダーなので、直接取得で�
 
 | 値 | 動作 |
 | --- | --- |
-| 未設定 | 同一オリジンの `/api/insta360` を使う（Cloudflare Worker版） |
+| 未設定 | 同一オリジンの `/api/insta360` と `/api/supersplat` を使う（Cloudflare Worker版） |
 | `none` | 解決エンドポイントを持たない配信。共有URLの入力を無効にし、理由を表示する |
-| URL | そのオリジンの `/api/insta360` を使う（専用Workerなど） |
+| URL | そのオリジンの `/api/insta360` と `/api/supersplat` を使う（専用Workerなど） |
+
+オリジンは1つで、その下に提供元ごとのパスがぶら下がります。提供元が増えても
+ビルド設定（`VITE_SOG_RESOLVER_ORIGIN`）は増えません。
 
 GitHub Pagesは静的配信で `/api` を持たないため、`vite.pages.config.ts` が既定で `none` を入れます。
 
 #### GitHub Pages用のresolver Worker
 
-`resolver-worker/` に、共有URLの解決だけを行う単機能のCloudflare Workerがあります。
-解決ロジックはアプリ本体のWorkerと共有しています。
+`resolver-worker/` に、共有URL・シーンURLの解決だけを行う単機能のCloudflare Workerが
+あります。`/api/insta360` と `/api/supersplat` の両方を提供し、解決ロジックはアプリ本体の
+Workerと共有しています。
 
 ```bash
 npm run resolver:dev      # ローカルで動かす
@@ -290,6 +310,10 @@ Workerが古いままだと、増えたフィールドがViewerへ届きませ�
 ```bash
 curl "https://insta360-sog-resolver.<account>.workers.dev/api/insta360?url=https://app.insta360.com/3dspace/detail/GS3DG…"
 # => {"shareId":"GS3DG…","assetUrl":"…","camerasUrl":"…"}   camerasUrl が無ければ古い版
+
+curl "https://insta360-sog-resolver.<account>.workers.dev/api/supersplat?url=https://superspl.at/scene/56155c3f"
+# => {"provider":"supersplat","sceneId":"56155c3f","title":"…","license":{…},"asset":{…}}
+# 404 が返るなら SuperSplat 対応前の古い版
 ```
 
 デプロイしたら、リポジトリの **Settings → Secrets and variables → Actions → Variables** で
@@ -301,7 +325,129 @@ curl "https://insta360-sog-resolver.<account>.workers.dev/api/insta360?url=https
 これは設定の問題で、解決処理そのものの不具合ではありません。それまでは
 `.sog` ファイルのドロップか、署名付き `.sog` URLの直接指定で読み込めます。
 
-共有ページからSOGのURLを探す処理は `app/insta360.ts` にまとまっています。
+共有ページからSOGのURLを探す処理は `app/insta360.ts` にまとまっています。SuperSplat側は
+`app/supersplat.ts` です。URLの安全判定（ループバック・プライベートIP宛を弾く処理）は
+両者で共通の `app/url-safety.ts` にあります。
+
+### SuperSplat公開シーンURLの解決について
+
+[SuperSplat](https://superspl.at) の公開シーンも、共有ページがブラウザからの
+クロスオリジン取得を許可していないため、解決だけをサーバー側（`GET /api/supersplat`）が
+担当します。SOG本体は中継しません。
+
+#### 対応するのは「ダウンロードが許可された公開シーン」だけ
+
+SuperSplatには、作者がManageページで**Downloadable**を有効にしたシーンだけを
+ダウンロード可能にする仕組みと、Creative Commonsライセンスを付ける仕組みがあります。
+このViewerはその意思表示を尊重します。
+
+処理の順番は固定です。
+
+```
+シーンURL
+  ↓
+公開ページ取得
+  ↓
+公開メタデータ解析
+  ↓
+Downloadable判定  ── NO / 判定不能 ──> 読み込まない (403)
+  ↓ YES
+ライセンス確認    ── 取れない ──────> 読み込まない (422)
+  ↓
+asset discovery
+```
+
+- **Downloadableを確認できない場合は読み込みません**（fail-closed）。「許可されていない」も
+  「ページから読み取れなかった」も、同じく読み込まない側に倒します。
+- **CDNにデータが存在するという理由だけで取得しません。** シーンIDからCDNを当て推量で
+  叩くことはせず、CDNへのアクセスはDownloadable判定を通ったあとにしか起きません。
+  Downloadableでないシーンでは、公開ページ以外へは1リクエストも出ません。
+- ライセンスは種別を保ったまま扱います（`CC BY 4.0` と `CC BY-NC 4.0` を混同しません）。
+  読み取れない場合は推測せず、明示的にエラーにします。
+
+resolverが返す内部エラーコードは次のとおりです。画面に出す日本語とは分けてあります。
+
+| コード | HTTP | 意味 |
+| --- | --- | --- |
+| `INVALID_SUPERSPLAT_URL` | 400 | SuperSplatのシーンURLではない |
+| `SUPERSPLAT_SCENE_NOT_FOUND` | 404 | シーンが見つからない |
+| `SUPERSPLAT_NOT_DOWNLOADABLE` | 403 | ダウンロードが許可されていない／確認できない |
+| `SUPERSPLAT_LICENSE_NOT_FOUND` | 422 | ライセンスを読み取れない |
+| `SUPERSPLAT_ASSET_NOT_FOUND` | 422 | 読み込めるSOGが見つからない |
+| `SUPERSPLAT_STREAMED_SOG_UNSUPPORTED` | — | Streamed SOG（Viewer側で判断） |
+| `SUPERSPLAT_UNAVAILABLE` | 502 | 公開ページを取得できない |
+
+#### アセットの探し方
+
+SuperSplatの公開ページはオープンソースのViewer
+（[`playcanvas/supersplat-viewer`](https://github.com/playcanvas/supersplat-viewer)）で
+描かれていて、アセットのURLはページ内の1か所に機械可読な形で埋め込まれています。
+
+```html
+<script type="application/json" id="sse-bootstrap">
+  {"contentUrl":"https://.../v3/meta.json","contentFilename":"meta.json"}
+</script>
+```
+
+resolverはここから `contentUrl` を読みます。**CDNのURLを組み立てて探索することは
+しません。** リビジョン（`v3` など）も、ページが持っているURLから読むだけです。
+取得を許可するホストは明示的な許可リストで絞り、ループバック・プライベートIP・
+リンクローカル（メタデータエンドポイントを含む）は弾きます。
+
+#### SOGの形
+
+SuperSplatの公開配信は、単一ファイルの `.sog` とは限りません。
+
+| `asset.format` | 実体 | このViewer |
+| --- | --- | --- |
+| `sog` | bundled SOG（単一ファイル） | 対応 |
+| `sog-meta` | unbundled SOG（`meta.json` ＋ WebP群） | 対応 |
+| `streamed-sog` | Streamed SOG（`lod-meta.json`） | **未対応** |
+
+**Streamed SOG（`lod-meta.json`）は現時点では未対応です。** 1M splatsを超える大きな
+シーンは自動的にこの形式で配信されるため、それらは開けません。その場合は
+「このSuperSplatシーンはストリーミング形式です。現在このViewerでは未対応です。」と
+表示します。resolverは `format: "streamed-sog"` をそのまま返すので、対応を足すのは
+Viewer側だけで済みます。
+
+unbundled SOGの `meta.json` は、同じディレクトリのWebPを**相対パス**で参照しています。
+そのためこの形式だけはBlob化せず、CDNのURLをそのままPlayCanvasへ渡します
+（`blob:` のobject URLにすると相対解決の基準が失われ、WebPを取りに行けなくなります）。
+
+その代わり、unbundled SOGでは元データがひと続きのバイト列として手元に残らないため、
+**VR向け軽量化は利用できません**（Desktop表示とVRのOriginal表示は通常どおり動きます）。
+UIにもその旨を表示します。bundled SOGとInsta360共有では従来どおり軽量化を使えます。
+
+#### 座標系
+
+SuperSplatが配るSOGはInsta360のものと軸の向きが違います。SuperSplat自身の公開Viewerは、
+読み込んだgsplatに対して無条件で `entity.setLocalEulerAngles(0, 0, 180)`（Z軸まわり180°）を
+掛けています。このViewerも同じ回転をSuperSplat由来の空間に適用します。
+
+| 提供元 | 回転 | 反転する軸 |
+| --- | --- | --- |
+| Insta360 / サンプル / ローカルファイル / `.sog` 直接URL | X軸まわり180° | y, z |
+| SuperSplat | Z軸まわり180° | x, y |
+
+Insta360の変換（X軸180°）をSuperSplatへ流用すると前後が逆になります。配置
+（中心合わせと床のy=0合わせ）の約束はどちらも同じで、`app/capture-view.ts` の
+`PlacementTransform` として定義してあります。
+
+#### 初期視点
+
+SuperSplatには Insta360 の `cameras.json` に当たるものがありません。初期視点は
+`view=` があればそれ、無ければ空間の広がりから決める既定視点（`frameBounds()`）です。
+Insta360側の優先順位（`view=` → `cameras.json` → `frameBounds()`）は変わりません。
+
+#### 実装の置き場所
+
+SuperSplat固有の処理は2つのモジュールに閉じ込めてあり、`SogViewer.tsx` には
+HTML構造もCDNのホストも出てきません。
+
+| ファイル | 役割 |
+| --- | --- |
+| `app/supersplat.ts` | URL解析、公開ページの解析、ライセンス正規化、アセット選択 |
+| `app/supersplat-resolver.ts` | 処理順の強制、HTTPハンドラ、エラーコード |
 
 ## Controls
 

@@ -160,6 +160,52 @@ canvas {
   backdrop-filter: blur(12px);
 }
 
+/*
+ * 表示中の空間の出どころ表示。いまはSuperSplat由来の空間にだけ出る。
+ * 作者がライセンスを付けて公開しているので、タイトル・作者・ライセンスと
+ * 原典へのリンクを画面上で辿れるようにしておく。
+ */
+.source-credit {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  max-width: 46vw;
+  padding: 9px 13px;
+  border: 1px solid rgba(110, 231, 227, 0.34);
+  border-radius: 999px;
+  color: var(--cyan);
+  background: rgba(7, 10, 14, 0.46);
+  backdrop-filter: blur(12px);
+}
+
+.source-credit-title,
+.source-credit-author,
+.source-credit-license {
+  overflow: hidden;
+  max-width: 18vw;
+  color: #bdc6cb;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.source-credit-author::before,
+.source-credit-license::before {
+  margin-right: 9px;
+  color: rgba(189, 198, 203, 0.5);
+  content: "·";
+}
+
+.source-credit-link {
+  color: var(--cyan);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.source-credit-link:hover,
+.source-credit-link:focus-visible {
+  text-decoration: underline;
+}
+
 .live-dot {
   width: 6px;
   height: 6px;
@@ -823,6 +869,20 @@ canvas {
 
   .source-name {
     max-width: 40vw;
+  }
+
+  /* 狭い画面ではタイトルとライセンスだけ残す。 */
+  .source-credit {
+    max-width: none;
+  }
+
+  .source-credit-author {
+    display: none;
+  }
+
+  .source-credit-title,
+  .source-credit-license {
+    max-width: 28vw;
   }
 
   .open-url {

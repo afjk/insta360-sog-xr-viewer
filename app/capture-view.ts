@@ -45,32 +45,105 @@ const isFiniteNumber = (value: unknown): value is number =>
   typeof value === "number" && Number.isFinite(value);
 
 /**
+ * splatをworldへ置くときの座標系変換。提供元ごとに違う。
+ *
+ * 3D Gaussian Splatは撮影・書き出しパイプラインごとに軸の向きが違い、
+ * PlayCanvasのY-up / Z-back へ持っていくには提供元に応じた回転が要る。
+ * どちらも180°回転なので、実体は「どの軸の符号を反転するか」に尽きる。
+ * `signs` はその反転を表し、`eulerAngles` は同じ回転をPlayCanvasの
+ * entityへ入れるための表現。2つは必ず同じ回転を指す。
+ */
+export type PlacementTransform = {
+  /** `splatEntity.setLocalEulerAngles` に入れる値（度）。 */
+  eulerAngles: { x: number; y: number; z: number };
+  /** 撮影座標の各軸をworldへ移すときの符号。 */
+  signs: { x: 1 | -1; y: 1 | -1; z: 1 | -1 };
+};
+
+/**
+ * Insta360 Spatial Captureの配置。X軸まわり180°。
+ *
+ * Insta360's capture axes are Y-down / Z-forward. A 180° X rotation makes
+ * the room Y-up / Z-back without using a negative scale in stereo XR.
+ *
+ * サンプル・ローカルファイル・`.sog` の直接URLもこれを使う。Viewerが最初から
+ * この向きで表示してきたので、既に配ってあるリンクの見え方を変えないため。
+ */
+export const INSTA360_PLACEMENT: PlacementTransform = {
+  eulerAngles: { x: 180, y: 0, z: 0 },
+  signs: { x: 1, y: -1, z: -1 },
+};
+
+/**
+ * SuperSplat公開シーンの配置。Z軸まわり180°。
+ *
+ * SuperSplat自身の公開Viewerが、公開されている全シーンに対して無条件で
+ * `entity.setLocalEulerAngles(0, 0, 180)` を掛けている
+ * （`playcanvas/supersplat-viewer` の `src/index.ts`、gsplatを読み込んだ直後）。
+ * SuperSplatが配るSOGはY-downで書き出されていて、Z軸まわり180°——
+ * つまり X と Y の符号反転——でPlayCanvasのY-upに揃う。X軸まわり180°
+ * （Insta360の変換）ではYと**Z**が反転するので、前後が逆になってしまう。
+ *
+ * ここを identity にはしない。identityだと上下が逆さまに出る。superspl.at で
+ * 見えている向きと同じにするには、本家と同じ回転を掛けるのが唯一の根拠のある
+ * 選択で、「見た目で合わせた」値ではない。
+ */
+export const SUPERSPLAT_PLACEMENT: PlacementTransform = {
+  eulerAngles: { x: 0, y: 0, z: 180 },
+  signs: { x: -1, y: -1, z: 1 },
+};
+
+/**
  * splatをworldへ置くときのローカル位置。
  *
- * Viewerはsplatへ X軸まわり180°（＝ y と z の符号反転）を掛けてから、この位置を
- * 足している。撮影座標の点をworldへ持っていく計算（`worldFromCapturePoint`）と
- * 表裏なので、両方が同じ値を見るようにここへ切り出してある。
+ * Viewerはsplatへ `transform` の回転を掛けてから、この位置を足している。
+ * 回転後に x / z が原点に中心し、床が y=0 に来るように決める。撮影座標の点を
+ * worldへ持っていく計算（`worldFromCapturePoint`）と表裏なので、両方が同じ値を
+ * 見るようにここへ切り出してある。
+ *
+ * yは「回転後に低いほうの端」を床として0に合わせる。Y-downのまま180°回して
+ * いる提供元では元の `max.y` が床になり、その分だけ持ち上げる形になる。
  */
-export function splatPlacement(bounds: CaptureBounds): SplatPlacement {
+export function splatPlacementFor(
+  bounds: CaptureBounds,
+  transform: PlacementTransform,
+): SplatPlacement {
+  const { signs } = transform;
   return {
-    x: -(bounds.min.x + bounds.max.x) * 0.5,
-    y: bounds.max.y,
-    z: (bounds.min.z + bounds.max.z) * 0.5,
+    x: -signs.x * (bounds.min.x + bounds.max.x) * 0.5,
+    y: -Math.min(signs.y * bounds.min.y, signs.y * bounds.max.y),
+    z: -signs.z * (bounds.min.z + bounds.max.z) * 0.5,
   };
 }
 
 /**
  * 撮影座標系の点をViewerのworld座標へ移す。
  *
- * splatに掛かっているのと同じ変換（X軸180°回転＋`splatPlacement` の平行移動）。
- * カメラ位置を部屋と同じ場所へ重ねるには、splatと同じ変換を通すしかない。
+ * splatに掛かっているのと同じ変換（`transform` の回転＋`splatPlacementFor` の
+ * 平行移動）。カメラ位置を部屋と同じ場所へ重ねるには、splatと同じ変換を
+ * 通すしかない。
  */
-export function worldFromCapturePoint(point: Vec3Like, placement: SplatPlacement): Vec3Like {
+export function worldFromCapturePointFor(
+  point: Vec3Like,
+  placement: SplatPlacement,
+  transform: PlacementTransform,
+): Vec3Like {
+  const { signs } = transform;
   return {
-    x: point.x + placement.x,
-    y: -point.y + placement.y,
-    z: -point.z + placement.z,
+    x: signs.x * point.x + placement.x,
+    y: signs.y * point.y + placement.y,
+    z: signs.z * point.z + placement.z,
   };
+}
+
+/** Insta360配置での `splatPlacementFor`。既存の呼び出し向けの薄い別名。 */
+export function splatPlacement(bounds: CaptureBounds): SplatPlacement {
+  return splatPlacementFor(bounds, INSTA360_PLACEMENT);
+}
+
+/** Insta360配置での `worldFromCapturePointFor`。 */
+export function worldFromCapturePoint(point: Vec3Like, placement: SplatPlacement): Vec3Like {
+  return worldFromCapturePointFor(point, placement, INSTA360_PLACEMENT);
 }
 
 /** 配置と既定視点に使う、SOGの重心分布の要約。 */

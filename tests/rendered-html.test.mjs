@@ -117,7 +117,10 @@ test("loads arbitrary SOG sources while keeping the bundled sample as default", 
   ]);
 
   // The bundled sample stays the auto-loaded default.
-  assert.match(viewer, /useState<ViewerSource>\(\{ kind: "sample", label: SAMPLE_LABEL \}\)/);
+  assert.match(
+    viewer,
+    /useState<ViewerSource>\(\{\s*\n\s*kind: "sample",\s*\n\s*provider: "sample",\s*\n\s*label: SAMPLE_LABEL,\s*\n\s*\}\)/,
+  );
   assert.match(viewer, /else void loadSample\(true\);/);
 
   // One "空間を開く" panel offers URL, drag & drop and the file picker.
@@ -161,40 +164,44 @@ test("opens a shared space straight from ?id= without touching the sample", asyn
 
   // 起動時の分岐はどちらか一方だけを呼ぶ。`?id=` のときにサンプルを読むと
   // fetch・decode・GPU転送が二重に走るので、そこを固定しておく。
-  assert.match(viewer, /const deepLinkShareUrl = shareUrlFromShareId\(readShareId\(window\.location\.href\) \?\? ""\)/);
-  assert.match(viewer, /if \(deepLinkShareUrl\) void loadSource\(\{ kind: "url", value: deepLinkShareUrl \}, true\);/);
+  assert.match(viewer, /const deepLink = readSpaceRef\(window\.location\.href\);/);
+  assert.match(viewer, /\? shareUrlFromShareId\(deepLink\.id\)/);
+  assert.match(viewer, /: sceneUrlFromSceneId\(deepLink\.id\);/);
+  assert.match(viewer, /if \(deepLinkUrl\) void loadSource\(\{ kind: "url", value: deepLinkUrl \}, true\);/);
   assert.match(viewer, /else void loadSample\(true\);/);
   // サンプルの取得はこの1箇所だけ。深いリンク経路からは辿り着けない。
   assert.equal(viewer.match(/downloadSog\(SAMPLE_URL/g)?.length, 1);
 
-  // 共有IDは表示中のソースに残し、ラベルの読み直しでは判断しない。
-  assert.match(viewer, /type ViewerSource = \{ kind: SourceKind; label: string; shareId\?: string \}/);
+  // 出どころは表示中のソースにproviderとして残し、ラベルの読み直しでは判断しない。
+  assert.match(viewer, /type SourceProvider = "sample" \| "file" \| "direct" \| "insta360" \| "supersplat";/);
+  assert.match(viewer, /provider: SourceProvider;/);
+  assert.match(viewer, /const next: ViewerSource = \{\s*\n\s*kind: request\.kind === "file" \? "file" : "url",\s*\n\s*provider,/);
+  // サンプルは共有IDを持たない。ローカルファイルと直接URLも shareId が undefined のまま。
   assert.match(
     viewer,
-    /showOriginal\(\s*\n\s*\{ kind: request\.kind === "file" \? "file" : "url", label, shareId \},\s*\n\s*buffer,\s*\n\s*await camerasRequest,/,
+    /showOriginal\(\{ kind: "sample", provider: "sample", label: SAMPLE_LABEL \}, buffer\)/,
   );
-  // サンプルは共有IDを持たない。ローカルファイルと直接URLも shareId が undefined のまま。
-  assert.match(viewer, /showOriginal\(\{ kind: "sample", label: SAMPLE_LABEL \}, buffer\)/);
   assert.match(viewer, /shareId = share\.shareId/);
 
-  // 成功したロードのたびにアドレスバーを合わせる。Insta360由来でなければ id を消す。
-  assert.match(viewer, /const next = shareId \? permalinkFor\(href, shareId, pose\) : hrefWithoutShareId\(href\)/);
+  // 成功したロードのたびにアドレスバーを合わせる。載せられない空間では id / ss を消す。
+  assert.match(viewer, /const next = space \? permalinkFor\(href, space, pose\) : hrefWithoutSpace\(href\)/);
   assert.match(viewer, /window\.history\.replaceState\(null, "", next\)/);
   // アドレスバーへ残すのはユーザーが指定した視点だけ。公式Home Viewは載せない。
-  assert.match(viewer, /syncPermalink\(next\.shareId, linkedView\)/);
+  assert.match(viewer, /syncPermalink\(space, linkedView\)/);
   // 署名付きURLはアドレスバーへ出さない。載せるのは共有IDだけ。
   assert.doesNotMatch(viewer, /replaceState\([^)]*assetUrl/);
 
-  // 同じ空間を二度読まない。共有IDとSOGのURLで鍵を作り、表示中／読み込み中を見る。
+  // 同じ空間を二度読まない。共有ID・シーンID・SOGのURLで鍵を作り、表示中／読み込み中を見る。
   assert.match(viewer, /return `share:\$\{share\.shareId\}`/);
+  assert.match(viewer, /return `supersplat:\$\{scene\.sceneId\}`/);
   assert.match(viewer, /if \(key && \(key === loadingKey \|\| key === shownKey\)\)/);
 
   // 共有由来のときだけリンクのコピーを出す。空間そのものと、いまの視点の2種類。
-  assert.match(viewer, /source\.shareId && \(/);
+  assert.match(viewer, /\{space && \(/);
   assert.match(viewer, /この空間のリンクをコピー/);
   assert.match(viewer, /この視点のリンクをコピー/);
   assert.match(viewer, /navigator\.clipboard\.writeText\(permalink\)/);
-  assert.match(viewer, /permalinkFor\(window\.location\.href, shareId, pose\)/);
+  assert.match(viewer, /permalinkFor\(window\.location\.href, space, pose\)/);
   assert.match(viewer, /✓ コピーしました/);
 });
 
@@ -206,11 +213,11 @@ test("restores the linked view on desktop and spawns XR from the rig", async () 
   ]);
 
   // 初期視点の優先順位は `view=` → 公式Home View → bounds。Desktopもここを通る。
-  assert.match(viewer, /const linkedView = linkedViewFor\(next\.shareId\);/);
+  assert.match(viewer, /const linkedView = linkedViewFor\(space\);/);
   assert.match(viewer, /const initialView = linkedView \?\? homeViewFor\(cameras, framedBounds\);/);
   assert.match(viewer, /if \(initialView\) applyViewPose\(initialView\);\s*\n\s*else frameBounds\(framedBounds\);/);
   // `view=` は共有IDが一致する空間にだけ効く。別の空間へ持ち越さない。
-  assert.match(viewer, /if \(readShareId\(href\) !== shareId\) return null;/);
+  assert.match(viewer, /if \(!isSameSpace\(readSpaceRef\(href\), space\)\) return null;/);
   assert.match(viewer, /return readViewPose\(href\);/);
 
   // リンクに載せるのはworld空間の姿勢。rig移動やpanのあとでも同じ値になる。
@@ -249,7 +256,7 @@ test("restores the linked view on desktop and spawns XR from the rig", async () 
   // 公式Home Viewは `cameras.json` から組み立てる。splatと同じ変換を通すので、
   // 配置は `applyPlacement` と同じ `splatPlacement` を見る。
   assert.match(viewer, /captureHomeView\(cameras, splatPlacement\(bounds\)\)/);
-  assert.match(viewer, /const placement = splatPlacement\(bounds\);/);
+  assert.match(viewer, /const placement = splatPlacementFor\(bounds, placementTransform\);/);
   assert.match(capture, /export function captureHomeView\(/);
   assert.match(capture, /worldFromCapturePoint\(cameras\[0\]\.position, placement\)/);
   // 画角も撮影時のものへ合わせる。取れない空間では既定値のまま。
