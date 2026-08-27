@@ -14,7 +14,8 @@
     "lint": "eslint . --ignore-pattern dist --ignore-pattern dist-pages --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
     "resolver:dev": "wrangler dev --config resolver-worker/wrangler.toml",
-    "resolver:deploy": "wrangler deploy --config resolver-worker/wrangler.toml"
+    "resolver:deploy": "wrangler deploy --config resolver-worker/wrangler.toml",
+    "probe:supersplat": "node --experimental-strip-types scripts/probe-supersplat.mjs"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",
