@@ -537,6 +537,16 @@ export function readSuperSplatSceneMeta(html: string): SuperSplatSceneMeta {
     metaContent(html, ["og:image:alt"]) ||
     stripSiteName(documentTitle(html), siteName);
 
+  // 作者名。実ページ（2026-08時点）は機械可読な作者フィールドを持っておらず、
+  // ここは空のままになる。作者名らしき文字列は `description` の本文——
+  // 「# CC-BY - <名前>」「# CREDITS」——にしか出てこない。そこはベースモデルの
+  // 作者など複数の名前が並ぶ自由記述で、書式に依存した抽出をすれば別の作品で
+  // 簡単に壊れる。推測で埋めるより空のほうがよい。
+  //
+  // `collectByKey` はオブジェクトのキーしか見ないので、React Routerの
+  // loader data（devalueのフラット配列）や説明文を作者名として拾うことはない。
+  //
+  // CC BYのattributionは、Viewerが出す公開ページへのリンク（Original）で辿れる。
   const author =
     firstString(collectByKey(blocks, AUTHOR_KEYS)) ||
     metaContent(html, ["author", "og:article:author", "twitter:creator"]);

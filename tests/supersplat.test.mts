@@ -501,3 +501,20 @@ test("separates internal error codes from the Japanese wording", () => {
     /ストリーミング形式/,
   );
 });
+
+test("does not lift an author name out of the description prose", () => {
+  // 実ページで作者名らしき文字列が出てくるのは説明文の中だけ。そこには
+  // ベースモデルの作者など別人も並ぶので、書式に頼った抽出はしない。
+  const description =
+    "# Panthera spelaea, Eurasian steppe lion or cave lion.\\n" +
+    "# CC-BY - Joanna Kobierska\\n\\n# CREDITS\\n" +
+    "# Joanna Kobierska - https://joanna_kobierska.artstation.com/\\n" +
+    "# Lion base by Ken Barthelmey - https://theartofken.com/";
+  const html = `<html><head>${REAL_HEAD}</head><body>
+    <article>${description}</article>
+    <script type="application/json" id="x">${JSON.stringify(["title", "Lion", "description", description])}</script>
+  </body></html>`;
+  const meta = readSuperSplatSceneMeta(html);
+  assert.equal(meta.title, "Lion");
+  assert.equal(meta.author, "");
+});
