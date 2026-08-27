@@ -3,10 +3,13 @@ import test from "node:test";
 import {
   SUPERSPLAT_ERROR_MESSAGES,
   embeddedJsonBlocks,
+  findDownloadControl,
   findSuperSplatContentUrls,
+  findSuperSplatViewerUrl,
   isSuperSplatAssetUrl,
   isSuperSplatSceneId,
   parseSuperSplatUrl,
+  readSuperSplatDownloadPermission,
   readSuperSplatSceneMeta,
   revisionOf,
   sceneUrlFromSceneId,
@@ -18,44 +21,83 @@ const SCENE_ID = "56155c3f";
 const SCENE_URL = `https://superspl.at/scene/${SCENE_ID}`;
 const CDN = "https://d1abcxyz0000.cloudfront.net/splats/56155c3f/v3";
 
+const VIEWER_URL = `https://superspl.at/s?id=${SCENE_ID}`;
+
 /**
- * 公開ページの形を模したfixture。
+ * scene page (`/scene/{id}`) を模したfixture。
  *
- * 実ページのHTMLそのものではなく、SuperSplat側が機械可読な形で置いている
- * ものだけを写している。SuperSplat公式Viewer (`playcanvas/supersplat-viewer`)
- * が差し込む `sse-bootstrap` と、`rel="license"` の機械可読ライセンスリンク。
- * このテストは実ページへは一切アクセスしない。
+ * 実際に配信されているSSR HTMLの最小形。2026-08時点で確認した構造:
+ *
+ *   <head>
+ *     <link rel="license" href="https://creativecommons.org/licenses/by/4.0/">
+ *   <body>
+ *     <div class="flex flex-wrap items-center gap-2">
+ *       <button><svg class="lucide lucide-download ..."/>Download</button>
+ *       <span title="Attribution">CC BY 4.0</span>
+ *     </div>
+ *
+ * ライセンスはDownloadボタンの中ではなく `<head>` にある。ボタン隣の
+ * `<span title="Attribution">` は同じ値の表示用。
  */
 function scenePage(options: {
-  downloadable?: boolean | null;
+  downloadHtml?: string | null;
   licenseHref?: string | null;
-  licenseCode?: string | null;
-  contentUrl?: string | null;
+  attributionLabel?: string | null;
   title?: string;
   author?: string;
+  extraBody?: string;
 } = {}) {
   const {
-    downloadable = true,
     licenseHref = "https://creativecommons.org/licenses/by/4.0/",
-    licenseCode = null,
-    contentUrl = `${CDN}/meta.json`,
+    attributionLabel = "CC BY 4.0",
     title = "Lion",
     author = "splat-artist",
+    extraBody = "",
   } = options;
-
-  const scene: Record<string, unknown> = { id: SCENE_ID, title, author };
-  if (downloadable !== null) scene.downloadable = downloadable;
-  if (licenseCode !== null) scene.license = licenseCode;
-
-  const bootstrap = contentUrl === null ? {} : { contentUrl, contentFilename: "meta.json" };
+  const downloadHtml =
+    options.downloadHtml === undefined
+      ? `<button class="inline-flex items-center gap-1.5">` +
+        `<svg class="lucide lucide-download h-4 w-4"></svg>Download</button>`
+      : options.downloadHtml;
 
   return `<!doctype html><html><head>
     <title>${title} | SuperSplat</title>
     <meta property="og:title" content="${title}" />
-    ${licenseHref ? `<link rel="license" href="${licenseHref}" />` : ""}
+    <meta name="author" content="${author}" />
+    ${licenseHref ? `<link rel="license" href="${licenseHref}">` : ""}
+  </head><body>
+    <main><h1>${title}</h1>
+      <div class="flex flex-wrap items-center gap-2">
+        ${downloadHtml ?? ""}
+        ${attributionLabel ? `<span class="text-xs" title="Attribution">${attributionLabel}</span>` : ""}
+      </div>
+      ${extraBody}
+    </main>
+  </body></html>`;
+}
+
+/** 埋め込みJSONに真偽値を持つscene page。第一優先の経路を確かめるためのもの。 */
+function sceneWithFlag(downloadable: boolean | null, license = "CC BY 4.0") {
+  const scene: Record<string, unknown> = { id: SCENE_ID, title: "Lion", license };
+  if (downloadable !== null) scene.downloadable = downloadable;
+  return `<!doctype html><html><head><title>Lion | SuperSplat</title>
+    <script type="application/json" id="scene-state">${JSON.stringify(scene)}</script>
+  </head><body></body></html>`;
+}
+
+/**
+ * viewer page (`/s?id={id}`) を模したfixture。アセットのURLだけを持つ。
+ *
+ * `sse-bootstrap` はSuperSplat公式Viewer (`playcanvas/supersplat-viewer` の
+ * `src/module/render-html.ts`) が差し込む唯一の口。こちらは実装が公開されて
+ * いるぶん確度が高いが、実HTTP応答での確認は同じくできていない。
+ */
+function viewerPage(contentUrl: string | null = `${CDN}/meta.json`) {
+  const bootstrap =
+    contentUrl === null ? {} : { contentUrl, contentFilename: contentUrl.split("/").pop() };
+  return `<!doctype html><html><head>
     <script type="application/json" id="sse-bootstrap">${JSON.stringify(bootstrap)}</script>
-    <script>window.__SCENE__ = ${JSON.stringify(scene)};</script>
-  </head><body><div id="app"></div></body></html>`;
+  </head><body><canvas id="canvas"></canvas></body></html>`;
 }
 
 // --- URL parser ------------------------------------------------------------
@@ -149,95 +191,259 @@ test("only fetches assets from the expected public hosts", () => {
   }
 });
 
-// --- page parser -----------------------------------------------------------
+// --- scene page: permission ------------------------------------------------
 
-test("reads a downloadable scene licensed CC BY", () => {
-  const meta = readSuperSplatSceneMeta(scenePage());
-  assert.equal(meta.downloadable, true);
-  assert.deepEqual(meta.license, { code: "CC-BY-4.0", label: "CC BY 4.0" });
-  assert.equal(meta.title, "Lion");
-  assert.equal(meta.author, "splat-artist");
+test("reads permission from the real scene page shape", () => {
+  // Downloadボタンは <body>、ライセンスは <head> の rel="license"。
+  const permission = readSuperSplatDownloadPermission(scenePage());
+  assert.equal(permission.downloadable, true);
+  assert.deepEqual(permission.license, { code: "CC-BY-4.0", label: "CC BY 4.0" });
+  assert.equal(permission.reason, "download-control-with-page-license");
 });
 
 test("keeps the specific Creative Commons terms instead of flattening them", () => {
   const cases: [string, string, string][] = [
+    ["https://creativecommons.org/licenses/by/4.0/", "CC-BY-4.0", "CC BY 4.0"],
     ["https://creativecommons.org/licenses/by-nc/4.0/", "CC-BY-NC-4.0", "CC BY-NC 4.0"],
     ["https://creativecommons.org/licenses/by-sa/4.0/", "CC-BY-SA-4.0", "CC BY-SA 4.0"],
     ["https://creativecommons.org/licenses/by-nd/4.0/", "CC-BY-ND-4.0", "CC BY-ND 4.0"],
     ["https://creativecommons.org/licenses/by-nc-sa/4.0/", "CC-BY-NC-SA-4.0", "CC BY-NC-SA 4.0"],
-    ["https://creativecommons.org/licenses/by-nc-nd/4.0/", "CC-BY-NC-ND-4.0", "CC BY-NC-ND 4.0"],
     ["https://creativecommons.org/publicdomain/zero/1.0/", "CC0-1.0", "CC0 1.0"],
   ];
   for (const [href, code, label] of cases) {
-    const meta = readSuperSplatSceneMeta(scenePage({ licenseHref: href }));
-    assert.deepEqual(meta.license, { code, label }, href);
+    const permission = readSuperSplatDownloadPermission(scenePage({ licenseHref: href }));
+    assert.deepEqual(permission.license, { code, label }, href);
+    assert.equal(permission.downloadable, true, href);
   }
 });
 
-test("reads a license given as a code in the embedded scene data", () => {
-  const meta = readSuperSplatSceneMeta(
-    scenePage({ licenseHref: null, licenseCode: "CC BY-NC 4.0" }),
+test("falls back to the label beside the button when rel=license is absent", () => {
+  const permission = readSuperSplatDownloadPermission(
+    scenePage({ licenseHref: null, attributionLabel: "CC BY-NC 4.0" }),
   );
-  assert.deepEqual(meta.license, { code: "CC-BY-NC-4.0", label: "CC BY-NC 4.0" });
+  assert.equal(permission.downloadable, true);
+  assert.deepEqual(permission.license, { code: "CC-BY-NC-4.0", label: "CC BY-NC 4.0" });
+  assert.equal(permission.reason, "download-control-with-license");
 });
 
-test("reports a scene the author has not made downloadable", () => {
-  const meta = readSuperSplatSceneMeta(scenePage({ downloadable: false }));
-  assert.equal(meta.downloadable, false);
+test("prefers rel=license over the label rendered beside the button", () => {
+  // `<head>` の rel="license" がSuperSplat自身の設定値。表示用のラベルより優先。
+  const permission = readSuperSplatDownloadPermission(
+    scenePage({
+      licenseHref: "https://creativecommons.org/licenses/by/4.0/",
+      attributionLabel: "CC BY-NC 4.0",
+    }),
+  );
+  assert.deepEqual(permission.license, { code: "CC-BY-4.0", label: "CC BY 4.0" });
 });
 
-test("reports downloadable as unknown when the page says nothing", () => {
-  // 「分からない」は `false` と区別して持つ。読み込まない点は同じ。
-  const meta = readSuperSplatSceneMeta(scenePage({ downloadable: null }));
-  assert.equal(meta.downloadable, null);
+test("prefers an embedded boolean over the rendered UI", () => {
+  const yes = readSuperSplatDownloadPermission(sceneWithFlag(true));
+  assert.equal(yes.downloadable, true);
+  assert.equal(yes.reason, "downloadable-flag");
+
+  const no = readSuperSplatDownloadPermission(sceneWithFlag(false));
+  assert.equal(no.downloadable, false);
+  assert.equal(no.reason, "downloadable-flag-false");
 });
 
-test("does not treat the word Download in the markup as permission", () => {
-  const page = `<!doctype html><html><body>
-    <button>Download</button><a href="/download">Download this splat</a>
+// --- negative cases: none of these may grant permission --------------------
+
+test("refuses a page that only carries rel=license", () => {
+  // ライセンスは設定されているが、配布は許可していない状態。
+  const permission = readSuperSplatDownloadPermission(scenePage({ downloadHtml: null }));
+  assert.notEqual(permission.downloadable, true);
+  assert.equal(permission.reason, "download-control-not-found");
+  // ライセンス自体は読めているが、それは許可の根拠にしない。
+  assert.deepEqual(permission.license, { code: "CC-BY-4.0", label: "CC BY 4.0" });
+});
+
+test("refuses a download control with no license anywhere", () => {
+  const permission = readSuperSplatDownloadPermission(
+    scenePage({ licenseHref: null, attributionLabel: null }),
+  );
+  assert.notEqual(permission.downloadable, true);
+  assert.equal(permission.reason, "download-control-without-license");
+  assert.equal(permission.license, null);
+});
+
+test("ignores a CC-BY mention in the author's description", () => {
+  // 作者が説明文へ書いた文字列。SuperSplatのライセンス設定とは別物。
+  const html = `<!doctype html><html><head><title>Lion | SuperSplat</title></head><body>
+    <article><h1>Lion</h1><p># CC-BY - Joanna Kobierska</p></article>
   </body></html>`;
-  assert.equal(readSuperSplatSceneMeta(page).downloadable, null);
+  const permission = readSuperSplatDownloadPermission(html);
+  assert.notEqual(permission.downloadable, true);
+  assert.equal(permission.reason, "download-control-not-found");
+  assert.equal(permission.license, null);
 });
 
-test("reports a missing license instead of guessing one", () => {
-  const meta = readSuperSplatSceneMeta(scenePage({ licenseHref: null }));
-  assert.equal(meta.downloadable, true);
-  assert.equal(meta.license, null);
+test("does not mistake the download-count statistic for a download control", () => {
+  // 実ページにはlucideの同じアイコンを使った「27 downloads」という統計がある。
+  const stats =
+    `<div class="stats"><span class="inline-flex"><svg class="lucide lucide-download h-3 w-3"></svg>` +
+    `27 downloads</span></div>`;
+  const permission = readSuperSplatDownloadPermission(
+    scenePage({ downloadHtml: null, extraBody: stats }),
+  );
+  assert.notEqual(permission.downloadable, true);
+  assert.equal(permission.reason, "download-control-not-found");
+  assert.equal(findDownloadControl(stats), null);
+  // ボタンに入っていても、テキストが統計なら操作とは読まない。
+  assert.equal(
+    findDownloadControl(`<button><svg class="lucide lucide-download"></svg>27 downloads</button>`),
+    null,
+  );
 });
 
-test("survives a malformed page without throwing", () => {
-  for (const page of [
+test("does not mistake a bundled asset filename for a download control", () => {
+  const html = `<html><head>
+    <link rel="license" href="https://creativecommons.org/licenses/by/4.0/">
+    <script type="module" src="/assets/download-a1b2c3d4.js"></script>
+    <link rel="modulepreload" href="/assets/download-a1b2c3d4.js">
+  </head><body><div id="root"></div></body></html>`;
+  const permission = readSuperSplatDownloadPermission(html);
+  assert.notEqual(permission.downloadable, true);
+  assert.equal(permission.reason, "download-control-not-found");
+});
+
+test("does not treat the word Download in prose as permission", () => {
+  for (const body of [
+    "<p>You can Download this splat from the author's site.</p>",
+    "<h2>Download</h2><p>Coming soon</p>",
+    `<a href="/about">Read about Download options</a>`,
+  ]) {
+    const html = `<html><head><title>x</title></head><body>${body}</body></html>`;
+    const permission = readSuperSplatDownloadPermission(html);
+    assert.notEqual(permission.downloadable, true, body.slice(0, 40));
+  }
+});
+
+test("survives a malformed scene page without throwing", () => {
+  for (const html of [
     "",
     "<html",
     "<html><body>not a scene page</body></html>",
-    '<script type="application/json" id="sse-bootstrap">{not json</script>',
-    "<script>window.__SCENE__ = {broken</script>",
+    '<script type="application/json" id="scene-state">{not json</script>',
+    "<a download>",
+    "<button>Download",
   ]) {
-    const meta = readSuperSplatSceneMeta(page);
-    assert.equal(meta.downloadable, null, page.slice(0, 24));
-    assert.equal(meta.license, null, page.slice(0, 24));
+    const permission = readSuperSplatDownloadPermission(html);
+    assert.notEqual(permission.downloadable, true, html.slice(0, 24));
   }
 });
 
-test("reads structured blocks without executing the page", () => {
-  const blocks = embeddedJsonBlocks(scenePage());
-  assert.ok(blocks.some((block) => (block as { contentUrl?: string }).contentUrl));
-  assert.ok(blocks.some((block) => (block as { title?: string }).title === "Lion"));
+// --- scene page: attribution -----------------------------------------------
+
+/** 実ページの `<head>` から採った表題まわり。順序も実物どおり。 */
+const REAL_HEAD = `<title>Lion - SuperSplat</title>
+  <meta property="og:title" content="Lion - SuperSplat"/>
+  <meta property="og:site_name" content="SuperSplat"/>
+  <meta property="og:url" content="https://superspl.at/scene/56155c3f"/>
+  <meta property="og:image:alt" content="Lion"/>
+  <meta name="twitter:title" content="Lion - SuperSplat"/>`;
+
+test("reads the scene title, not the site name", () => {
+  // 実ページの区切りは "|" ではなく " - "。落とす接尾辞は og:site_name が教える。
+  assert.equal(readSuperSplatSceneMeta(`<html><head>${REAL_HEAD}</head></html>`).title, "Lion");
 });
 
-// --- asset discovery -------------------------------------------------------
+test("does not let embedded JSON site metadata win over the scene title", () => {
+  // 埋め込みJSONの title/name にはサイト名が入っていることがある。これを
+  // 優先していたため表題が "SuperSplat" になっていた。
+  const html = `<html><head>${REAL_HEAD}
+    <script type="application/json" id="x">{"title":"SuperSplat","name":"SuperSplat"}</script>
+  </head></html>`;
+  assert.equal(readSuperSplatSceneMeta(html).title, "Lion");
+});
 
-test("takes the content URL the page publishes", () => {
-  const urls = findSuperSplatContentUrls(scenePage(), SCENE_URL);
-  assert.deepEqual(urls, [`${CDN}/meta.json`]);
+test("strips the site name from every place the title can come from", () => {
+  const site = `<meta property="og:site_name" content="SuperSplat"/>`;
+  for (const head of [
+    `<meta property="og:title" content="Lion - SuperSplat"/>${site}`,
+    `<meta name="twitter:title" content="Lion - SuperSplat"/>${site}`,
+    `<title>Lion - SuperSplat</title>${site}`,
+    `<title>Lion | SuperSplat</title>${site}`,
+  ]) {
+    assert.equal(readSuperSplatSceneMeta(`<html><head>${head}</head></html>`).title, "Lion", head);
+  }
+});
+
+test("keeps a scene whose name happens to match the site", () => {
+  const html = `<html><head><meta property="og:title" content="SuperSplat"/>
+    <meta property="og:site_name" content="SuperSplat"/></head></html>`;
+  // 落とすと空になる場合は落とさない。
+  assert.equal(readSuperSplatSceneMeta(html).title, "SuperSplat");
+});
+
+test("decodes entities in the title", () => {
+  const html = `<html><head><meta property="og:title" content="Salt &amp; Pepper - SuperSplat"/>
+    <meta property="og:site_name" content="SuperSplat"/></head></html>`;
+  assert.equal(readSuperSplatSceneMeta(html).title, "Salt & Pepper");
+});
+
+test("reads an author when the page names one", () => {
+  const html = `<html><head><meta name="author" content="Joanna Kobierska"/></head></html>`;
+  assert.equal(readSuperSplatSceneMeta(html).author, "Joanna Kobierska");
+});
+
+test("reads structured blocks without executing the page", () => {
+  const blocks = embeddedJsonBlocks(viewerPage());
+  assert.ok(blocks.some((block) => (block as { contentUrl?: string }).contentUrl));
+});
+
+// --- viewer page -----------------------------------------------------------
+
+test("uses the canonical viewer URL for a scene", () => {
+  assert.equal(findSuperSplatViewerUrl(scenePage(), SCENE_ID), VIEWER_URL);
+});
+
+test("prefers a viewer URL the scene page itself points at", () => {
+  const html = `<html><body><iframe src="/s?id=${SCENE_ID}&amp;embed=1"></iframe></body></html>`;
+  const found = findSuperSplatViewerUrl(html, SCENE_ID);
+  assert.equal(new URL(found ?? "").searchParams.get("id"), SCENE_ID);
+  assert.equal(new URL(found ?? "").hostname, "superspl.at");
+});
+
+test("ignores a viewer URL pointing off-site or at another scene", () => {
+  for (const html of [
+    `<html><body><iframe src="https://evil.example/s?id=${SCENE_ID}"></iframe></body></html>`,
+    `<html><body><iframe src="/s?id=deadbeef"></iframe></body></html>`,
+    `<html><body><iframe src="http://superspl.at/s?id=${SCENE_ID}"></iframe></body></html>`,
+  ]) {
+    // 採らずに canonical へ落ちる。ページに書いてあった任意のURLは追わない。
+    assert.equal(findSuperSplatViewerUrl(html, SCENE_ID), VIEWER_URL, html.slice(0, 50));
+  }
+});
+
+test("refuses to build a viewer URL from an unsafe scene ID", () => {
+  for (const bad of ["../../admin", "a/b", "", "a".repeat(65)]) {
+    assert.equal(findSuperSplatViewerUrl(scenePage(), bad), null, bad);
+  }
+});
+
+test("takes the content URL the viewer page publishes", () => {
+  assert.deepEqual(findSuperSplatContentUrls(viewerPage(), VIEWER_URL), [`${CDN}/meta.json`]);
 });
 
 test("also reads the older inline contentUrl assignment", () => {
   const page = `<html><head><script>
     const contentUrl = '${CDN}/meta.json';
   </script></head></html>`;
-  assert.deepEqual(findSuperSplatContentUrls(page, SCENE_URL), [`${CDN}/meta.json`]);
+  assert.deepEqual(findSuperSplatContentUrls(page, VIEWER_URL), [`${CDN}/meta.json`]);
 });
+
+test("resolves a relative content URL against the viewer page URL", () => {
+  const page = viewerPage("./v3/meta.json");
+  const resolved = findSuperSplatContentUrls(page, "https://superspl.at/s/56155c3f/index.html");
+  assert.deepEqual(resolved, ["https://superspl.at/s/56155c3f/v3/meta.json"]);
+});
+
+test("reports no content URL when the viewer page has none", () => {
+  assert.deepEqual(findSuperSplatContentUrls(viewerPage(null), VIEWER_URL), []);
+});
+
+// --- asset selection -------------------------------------------------------
 
 test("selects unbundled SOG when that is what the page serves", () => {
   const asset = selectSuperSplatAsset([`${CDN}/meta.json`]);
@@ -267,7 +473,6 @@ test("prefers a directly loadable asset over the streamed one", () => {
 test("drops asset URLs pointing at hosts we do not fetch from", () => {
   assert.equal(selectSuperSplatAsset(["https://evil.example/meta.json"]), null);
   assert.equal(selectSuperSplatAsset(["http://127.0.0.1/meta.json"]), null);
-  // 許可ホストでも、読めない形式なら選ばない。
   assert.equal(selectSuperSplatAsset([`${CDN}/scene.ply`]), null);
   assert.equal(selectSuperSplatAsset([]), null);
 });
@@ -282,7 +487,6 @@ test("reads the delivery revision out of the content URL", () => {
 test("never builds a CDN URL of its own", async () => {
   const { readFile } = await import("node:fs/promises");
   const source = await readFile(new URL("../app/supersplat.ts", import.meta.url), "utf8");
-  // リビジョン探索も含め、当て推量でURLを組み立てる処理は持たない。
   assert.doesNotMatch(source, /https:\/\/[a-z0-9]+\.cloudfront\.net/i);
   assert.doesNotMatch(source, /\$\{[^}]*revision[^}]*\}/i);
 });
@@ -296,4 +500,21 @@ test("separates internal error codes from the Japanese wording", () => {
     SUPERSPLAT_ERROR_MESSAGES.SUPERSPLAT_STREAMED_SOG_UNSUPPORTED,
     /ストリーミング形式/,
   );
+});
+
+test("does not lift an author name out of the description prose", () => {
+  // 実ページで作者名らしき文字列が出てくるのは説明文の中だけ。そこには
+  // ベースモデルの作者など別人も並ぶので、書式に頼った抽出はしない。
+  const description =
+    "# Panthera spelaea, Eurasian steppe lion or cave lion.\\n" +
+    "# CC-BY - Joanna Kobierska\\n\\n# CREDITS\\n" +
+    "# Joanna Kobierska - https://joanna_kobierska.artstation.com/\\n" +
+    "# Lion base by Ken Barthelmey - https://theartofken.com/";
+  const html = `<html><head>${REAL_HEAD}</head><body>
+    <article>${description}</article>
+    <script type="application/json" id="x">${JSON.stringify(["title", "Lion", "description", description])}</script>
+  </body></html>`;
+  const meta = readSuperSplatSceneMeta(html);
+  assert.equal(meta.title, "Lion");
+  assert.equal(meta.author, "");
 });

@@ -9,8 +9,17 @@
  *
  * ## 処理順（この順序が仕様）
  *
- *   シーンURL → 公開ページ取得 → 公開メタデータ解析 → Downloadable判定
- *     → （YESのときだけ）ライセンス確認 → asset discovery
+ *   シーンURL
+ *     → scene page (/scene/{id}) 取得
+ *     → Downloadable判定         … NG/判定不能なら403でここで終了
+ *     → ライセンス確認           … 取れなければ422でここで終了
+ *     → viewer page (/s?id={id}) 取得   ← ここまで来て初めてアクセスする
+ *     → asset discovery
+ *
+ * SuperSplatは1枚のHTMLで完結していない。許可とライセンスはscene pageに、
+ * 実際に読むアセットのURLはviewer pageにある。**viewer pageへのアクセスは
+ * Downloadableを確認したあとにしか行わない。** 許可されていない作品について、
+ * 配信側へ足跡を残さないため。
  *
  * 逆順——シーンIDからCDNを叩いてデータが見つかったから読む——は禁止。作者が
  * ダウンロードを許可していない作品のデータがCDN上に存在することはあり得るが、
@@ -19,7 +28,9 @@
 import {
   SUPERSPLAT_ERROR_MESSAGES,
   findSuperSplatContentUrls,
+  findSuperSplatViewerUrl,
   parseSuperSplatUrl,
+  readSuperSplatDownloadPermission,
   readSuperSplatSceneMeta,
   selectSuperSplatAsset,
   type SuperSplatErrorCode,
@@ -72,22 +83,45 @@ function jsonResponse(body: unknown, status: number) {
   return Response.json(body, { status, headers: CORS_HEADERS });
 }
 
-/** 公開ページのHTMLを取ってくる。ページが無い／取れない場合は投げる。 */
-async function fetchScenePage(share: SuperSplatShare): Promise<string> {
+/**
+ * superspl.at のページを取ってくる。取れない場合は投げる。
+ *
+ * リダイレクトは追い、**最終URL**も返す。相対URLで書かれたcontentUrlは
+ * リダイレクト後のURLを基準に解決しないとずれるため。
+ *
+ * 取りに行く先は呼び出し側が組み立てた superspl.at のURLだけ。ページから
+ * 拾った任意のURLをここへ通すことはない。
+ */
+async function fetchSuperSplatPage(
+  url: string,
+  missingCode: SuperSplatErrorCode,
+): Promise<{ html: string; finalUrl: string }> {
   let response: Response;
   try {
-    response = await fetch(share.sceneUrl, { headers: PAGE_HEADERS, redirect: "follow" });
+    response = await fetch(url, { headers: PAGE_HEADERS, redirect: "follow" });
   } catch {
     throw new SuperSplatError("SUPERSPLAT_UNAVAILABLE");
   }
-  if (response.status === 404 || response.status === 410) {
-    throw new SuperSplatError("SUPERSPLAT_SCENE_NOT_FOUND");
-  }
+  if (response.status === 404 || response.status === 410) throw new SuperSplatError(missingCode);
   if (!response.ok) throw new SuperSplatError("SUPERSPLAT_UNAVAILABLE");
 
   const html = await response.text().catch(() => "");
   if (!html) throw new SuperSplatError("SUPERSPLAT_UNAVAILABLE");
-  return html.length > MAX_PAGE_BYTES ? html.slice(0, MAX_PAGE_BYTES) : html;
+  return {
+    html: html.length > MAX_PAGE_BYTES ? html.slice(0, MAX_PAGE_BYTES) : html,
+    finalUrl: response.url || url,
+  };
+}
+
+/**
+ * 403の切り分け用の診断ログ。
+ *
+ * ページ構造が変わるとDownloadableを読めなくなり、利用者からは「許可されて
+ * いる作品なのに403」に見える。何を根拠に落としたかだけを残す。HTML断片や
+ * 解決したURLは出さない。
+ */
+function logPermission(sceneId: string, reason: string): void {
+  console.warn("[supersplat] permission unresolved", { sceneId, reason });
 }
 
 /**
@@ -99,19 +133,33 @@ async function fetchScenePage(share: SuperSplatShare): Promise<string> {
 export async function resolveSuperSplatScene(
   share: SuperSplatShare,
 ): Promise<SuperSplatResolution> {
-  const html = await fetchScenePage(share);
-  const meta = readSuperSplatSceneMeta(html);
+  // 1. scene page。公開状態・帰属・許可はすべてここから読む。
+  const scene = await fetchSuperSplatPage(share.sceneUrl, "SUPERSPLAT_SCENE_NOT_FOUND");
+  const permission = readSuperSplatDownloadPermission(scene.html);
 
-  // 1. Downloadable。`false` も「読み取れなかった (null)」も同じく読み込まない。
-  if (meta.downloadable !== true) throw new SuperSplatError("SUPERSPLAT_NOT_DOWNLOADABLE");
+  // 2. Downloadable。`false` も「読み取れなかった (null)」も同じく読み込まない。
+  if (permission.downloadable !== true) {
+    logPermission(share.sceneId, permission.reason);
+    throw new SuperSplatError("SUPERSPLAT_NOT_DOWNLOADABLE");
+  }
 
-  // 2. ライセンス。取れなければ推測せず明示的に断る。
-  if (!meta.license) throw new SuperSplatError("SUPERSPLAT_LICENSE_NOT_FOUND");
+  // 3. ライセンス。取れなければ推測せず明示的に断る。
+  if (!permission.license) {
+    logPermission(share.sceneId, "license-not-found");
+    throw new SuperSplatError("SUPERSPLAT_LICENSE_NOT_FOUND");
+  }
 
-  // 3. ここまで通って初めてアセットを探す。
-  const asset = selectSuperSplatAsset(findSuperSplatContentUrls(html, share.sceneUrl));
+  // 4. ここまで通って初めてviewer pageを取りに行く。
+  const viewerUrl = findSuperSplatViewerUrl(scene.html, share.sceneId);
+  if (!viewerUrl) throw new SuperSplatError("SUPERSPLAT_ASSET_NOT_FOUND");
+  const viewer = await fetchSuperSplatPage(viewerUrl, "SUPERSPLAT_SCENE_NOT_FOUND");
+
+  // 5. アセットのURLはviewer pageが持っている。相対URLはリダイレクト後の
+  //    最終URLを基準に解決する。
+  const asset = selectSuperSplatAsset(findSuperSplatContentUrls(viewer.html, viewer.finalUrl));
   if (!asset) throw new SuperSplatError("SUPERSPLAT_ASSET_NOT_FOUND");
 
+  const meta = readSuperSplatSceneMeta(scene.html);
   return {
     provider: "supersplat",
     sceneId: share.sceneId,
@@ -119,7 +167,7 @@ export async function resolveSuperSplatScene(
     title: meta.title,
     author: meta.author,
     downloadable: true,
-    license: meta.license,
+    license: permission.license,
     // `streamed-sog` もそのまま返す。表示できるかどうかはViewerが決める。
     // 将来Streamed SOGへ対応するとき、resolverはこのままでよい。
     asset,

@@ -8,6 +8,19 @@
  * DOMにもWorkerランタイムにも依存しないので、ブラウザ側・Cloudflare Worker・
  * Nodeのテストのどこからでも読める。
  *
+ * ## ページの役割分担
+ *
+ * SuperSplatは1枚のHTMLで完結していない。用途の違う2つのページを使い分ける。
+ *
+ *   scene page   https://superspl.at/scene/{sceneId}
+ *     公開状態・title・author・Downloadable・licenseの確認に使う。
+ *
+ *   viewer page  https://superspl.at/s?id={sceneId}
+ *     Viewerが実際に読むアセット（contentUrl / contentFilename）の取得に使う。
+ *
+ * resolverはこの順で読む。viewer pageへはDownloadableを確認したあとにしか
+ * 行かない（`supersplat-resolver.ts` を参照）。
+ *
  * ## 参照した実装
  *
  * SuperSplatの公開ページを描いているViewer本体はオープンソースで、埋め込み
@@ -18,6 +31,38 @@
  *   `contentFilename` などを流し込む。ページ側の唯一の差し込み口。
  * - `playcanvas/supersplat` … `src/publish.ts` の `publishFormat` が
  *   `"sog"`（通常）と `"ssog"`（Streamed SOG）に分かれる。
+ *
+ * ## 実ページで確認した構造（2026-08時点）
+ *
+ * scene page (`/scene/{sceneId}`) のSSR HTML:
+ *
+ *   <head>
+ *     <link rel="license" href="https://creativecommons.org/licenses/by/4.0/">
+ *   <body>
+ *     <div class="flex flex-wrap items-center gap-2">
+ *       <button><svg class="lucide lucide-download ..."/>Download</button>
+ *       <span title="Attribution">CC BY 4.0</span>
+ *     </div>
+ *
+ * ライセンスはDownloadボタンの中ではなく `<head>` にある。両者は離れているので、
+ * 「ボタンの中にライセンスがあるはず」という読み方はしない。
+ *
+ * 同じページには紛らわしいものが同居している。いずれも許可の根拠にしない:
+ *
+ *   - 「27 downloads」という統計表示（Downloadボタンと同じlucideアイコンを使う）
+ *   - 作者が説明文に書いた `# CC-BY - ...` のような自由記述
+ *   - `download-a1b2c3d4.js` のようなビルド成果物のファイル名
+ *
+ * React Routerのloader data（devalue形式）にも `downloads` / `enabled` /
+ * `license` / `by` が入っている。将来はそちらのほうが安定した判定元になりうるが、
+ * devalueのパーサーを持ち込むだけの利点が今は無いので採っていない。
+ *
+ * ## まだ確認できていないもの
+ *
+ * viewer page (`/s?id={sceneId}`) の実HTTP応答は未確認。`contentUrl` の置き場所は
+ * SuperSplat公式Viewer (`playcanvas/supersplat-viewer`) の実装から読み取れる
+ * 契約に合わせてあるが、実物との突き合わせはできていない。
+ * `scripts/probe-supersplat.mjs --dump` で採取できる。
  */
 // 拡張子を明示しているのは、このモジュールをテストからNodeで直接importするため。
 // バンドラは付いていても解決できる。
@@ -79,10 +124,19 @@ export type SuperSplatAsset = {
   revision: string | null;
 };
 
-/** 公開ページから読み取った、アセット取得の可否を決めるためのメタデータ。 */
+/** scene pageから読み取った表示用のメタデータ。取得可否の判断には使わない。 */
 export type SuperSplatSceneMeta = {
   title: string;
   author: string;
+};
+
+/**
+ * scene pageから読み取った「取得してよいか」の判断。
+ *
+ * licenseは独立した項目ではなく、**ダウンロード操作に付随して示されている**もの。
+ * 「CC BYの表記がページのどこかにある」だけでは許可の根拠にしない。
+ */
+export type SuperSplatDownloadPermission = {
   /**
    * 作者がダウンロードを許可しているか。
    *
@@ -91,7 +145,27 @@ export type SuperSplatSceneMeta = {
    */
   downloadable: boolean | null;
   license: SuperSplatLicense | null;
+  /**
+   * 何を根拠にそう判断したか。403の切り分け用にログへ出すためのもので、
+   * APIレスポンスには載せない（ページ構造を外へ晒さない）。
+   */
+  reason: SuperSplatPermissionReason;
 };
+
+/** `SuperSplatDownloadPermission.reason` に入る値。 */
+export type SuperSplatPermissionReason =
+  /** 埋め込みJSONの真偽値が `true` だった。 */
+  | "downloadable-flag"
+  /** 埋め込みJSONの真偽値が `false` だった。作者が許可していない。 */
+  | "downloadable-flag-false"
+  /** ダウンロード操作があり、ページが機械可読なライセンスを持っていた。 */
+  | "download-control-with-page-license"
+  /** ダウンロード操作の周辺にライセンスが併記されていた。 */
+  | "download-control-with-license"
+  /** ダウンロード操作は見つかったが、ライセンスが伴っていなかった。 */
+  | "download-control-without-license"
+  /** ダウンロード操作を機械的に見つけられなかった。 */
+  | "download-control-not-found";
 
 /** resolverが返す内部エラーコード。ユーザー向け文言とは分けて扱う。 */
 export type SuperSplatErrorCode =
@@ -305,7 +379,6 @@ const collectByKey = (roots: readonly unknown[], keys: readonly string[]): unkno
 // 「作者がダウンロードを許可した」ことを表す真偽値のキー。
 const DOWNLOADABLE_KEYS = ["downloadable", "isdownloadable", "allowdownload", "allowdownloads"];
 const LICENSE_KEYS = ["license", "licence", "licenseCode", "licenseId", "usageInfo"];
-const TITLE_KEYS = ["title", "name", "sceneTitle"];
 const AUTHOR_KEYS = ["author", "username", "owner", "creator", "authorName"];
 
 /** Creative Commonsの正規URLから識別子と表記を組み立てる。 */
@@ -391,15 +464,50 @@ const licenseFromRelLink = (html: string): SuperSplatLicense | null => {
   return null;
 };
 
+/** 表示に回す文字列の実体参照をほどく。属性値に `&amp;` などが入るため。 */
+const decodeEntities = (text: string): string =>
+  text
+    .replace(/&#(\d+);/g, (_, code: string) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code: string) => String.fromCodePoint(parseInt(code, 16)))
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&nbsp;/gi, " ")
+    // `&amp;` は最後。先に戻すと `&amp;lt;` が `<` に化ける。
+    .replace(/&amp;/gi, "&");
+
 const metaContent = (html: string, names: readonly string[]): string => {
   for (const match of html.matchAll(/<meta\b([^>]*)>/gi)) {
     const attributes = match[1];
     const key = (attributeOf(attributes, "property") || attributeOf(attributes, "name")).toLowerCase();
     if (!names.includes(key)) continue;
-    const content = attributeOf(attributes, "content");
+    const content = decodeEntities(attributeOf(attributes, "content"));
     if (content) return content;
   }
   return "";
+};
+
+/** `<title>` の中身。 */
+const documentTitle = (html: string): string =>
+  decodeEntities(html.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i)?.[1] ?? "").trim();
+
+/**
+ * 表題の末尾に付くサイト名を落とす。
+ *
+ * 実ページは `<title>Lion - SuperSplat</title>` / `og:title` も同じ形。区切りは
+ * ハイフンで、`|` とは限らない。何を落とすかは `og:site_name` が教えてくれるので、
+ * 区切り文字だけを決め打ちして残りはその値で照合する。
+ *
+ * 落とした結果が空になる場合（作品名がサイト名と同じ）は元の値を返す。
+ */
+const stripSiteName = (text: string, siteName: string): string => {
+  const value = text.trim();
+  const site = siteName.trim();
+  if (!value || !site) return value;
+  const escaped = site.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const stripped = value.replace(new RegExp(`\\s*[-|｜—–]\\s*${escaped}\\s*$`, "i"), "").trim();
+  return stripped || value;
 };
 
 const firstString = (values: readonly unknown[]): string => {
@@ -410,37 +518,256 @@ const firstString = (values: readonly unknown[]): string => {
 };
 
 /**
- * 公開ページからDownloadable判定とライセンス、表示用のtitle/authorを読む。
+ * scene pageから表示用のtitle / authorを読む。
  *
- * asset discoveryより先に呼ぶこと。ここで許可を確認できなかったシーンは、
- * CDNへ一切アクセスせずに終わる。
+ * 取得してよいかの判断には関与しない。判断は
+ * `readSuperSplatDownloadPermission` が行う。
  */
 export function readSuperSplatSceneMeta(html: string): SuperSplatSceneMeta {
   const blocks = embeddedJsonBlocks(html);
+  // サイト名は `og:site_name` が持っている。表題から落とす接尾辞をこれで決める。
+  const siteName = metaContent(html, ["og:site_name"]);
 
-  // Downloadableは真偽値でしか受け取らない。「Download」という文字列が
-  // ページに出ているかどうかでは判定しない（UIの飾りと区別できないため）。
-  const flags = collectByKey(blocks, DOWNLOADABLE_KEYS).filter(
-    (value): value is boolean => typeof value === "boolean",
-  );
-  const downloadable = flags.length > 0 ? flags.some((flag) => flag) : null;
-
-  const license =
-    collectByKey(blocks, LICENSE_KEYS).map(licenseFromValue).find((value) => value !== null) ??
-    licenseFromRelLink(html) ??
-    licenseFromCode(metaContent(html, ["license", "og:license", "dcterms.license"])) ??
-    null;
-
+  // 埋め込みJSONの `title` / `name` は**見ない**。実ページではそこにサイト名
+  // （"SuperSplat"）が入っていて、シーン名より先に当たってしまう。作品名を
+  // 名指ししているのはOGPのほうなので、そちらを先に読む。
   const title =
-    firstString(collectByKey(blocks, TITLE_KEYS)) ||
-    metaContent(html, ["og:title", "twitter:title"]) ||
-    (html.match(/<title\b[^>]*>([\s\S]*?)<\/title\s*>/i)?.[1] ?? "").trim();
+    stripSiteName(metaContent(html, ["og:title", "twitter:title"]), siteName) ||
+    // プレビュー画像のalt。実ページではサイト名の付かない作品名そのもの。
+    metaContent(html, ["og:image:alt"]) ||
+    stripSiteName(documentTitle(html), siteName);
 
+  // 作者名。実ページ（2026-08時点）は機械可読な作者フィールドを持っておらず、
+  // ここは空のままになる。作者名らしき文字列は `description` の本文——
+  // 「# CC-BY - <名前>」「# CREDITS」——にしか出てこない。そこはベースモデルの
+  // 作者など複数の名前が並ぶ自由記述で、書式に依存した抽出をすれば別の作品で
+  // 簡単に壊れる。推測で埋めるより空のほうがよい。
+  //
+  // `collectByKey` はオブジェクトのキーしか見ないので、React Routerの
+  // loader data（devalueのフラット配列）や説明文を作者名として拾うことはない。
+  //
+  // CC BYのattributionは、Viewerが出す公開ページへのリンク（Original）で辿れる。
   const author =
     firstString(collectByKey(blocks, AUTHOR_KEYS)) ||
     metaContent(html, ["author", "og:article:author", "twitter:creator"]);
 
-  return { title, author, downloadable, license };
+  return { title, author };
+}
+
+// ダウンロード操作を表しうる要素。入れ子にならないタグだけを対象にするので、
+// 非貪欲マッチで要素1つ分の断片を切り出せる。
+// ダウンロード操作を表しうる要素。入れ子にならないタグだけを対象にするので、
+// 非貪欲マッチで要素1つ分の断片を切り出せる。
+const DOWNLOAD_ELEMENT = /<(a|button|form)\b([^>]*)>([\s\S]*?)<\/\1\s*>/gi;
+
+// URLがダウンロードを指していると分かる形。パスと拡張子だけを見る。
+// `download-a1b2c3.js` のようなビルド成果物のファイル名には当たらない
+// （`download` の直後が区切りであることを要求している）。
+const DOWNLOAD_HREF = /(^|\/)downloads?(\/|$|\?)|\.(sog|ply|splat|zip)($|\?)/i;
+
+/**
+ * 「ダウンロード操作」を表す語。
+ *
+ * 単数形の `Download` だけに当たり、複数形の `downloads` には**当たらない**。
+ * 実ページにはlucideのdownloadアイコンを使った「27 downloads」という統計表示が
+ * あり、これを操作と取り違えないため。`download` の直後が英字なら不一致になる。
+ */
+const DOWNLOAD_WORD = /(^|[^a-z])download([^a-z]|$)/i;
+
+const textOf = (fragment: string): string =>
+  fragment
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+/**
+ * 要素が「ダウンロード操作」だと機械的に読み取れるか。
+ *
+ * 手がかりは2種類。
+ *
+ * 1. 属性側の表明 … `<a download>`、ダウンロードを指す `href` / `action`、
+ *    `data-*` / `aria-label` / `title` に現れる `download`。
+ * 2. 表示テキストの `Download` … 実ページのボタンは
+ *    `<button><svg class="lucide lucide-download"/>Download</button>` で、
+ *    属性側に手がかりが無いためこちらで拾う。
+ *
+ * `class` は見ない。アイコン名（`lucide-download`）は装飾であって操作の表明では
+ * なく、統計表示にも同じアイコンが使われているため。
+ */
+const isDownloadControl = (attributes: string, inner: string): boolean => {
+  // `<a download>` はHTML標準の「これは保存操作である」という表明。
+  if (/\bdownload\b(?=[\s=>]|$)/i.test(attributes)) return true;
+  for (const name of ["href", "action", "formaction"]) {
+    if (DOWNLOAD_HREF.test(attributeOf(attributes, name))) return true;
+  }
+  for (const match of attributes.matchAll(/\b(data-[\w-]+|aria-label|title|id|name)\s*=\s*("([^"]*)"|'([^']*)')/gi)) {
+    const value = match[3] ?? match[4] ?? "";
+    if (DOWNLOAD_WORD.test(value)) return true;
+  }
+  return DOWNLOAD_WORD.test(textOf(inner));
+};
+
+/**
+ * ページから明示的なダウンロード操作を探す。見つかればその要素のHTML断片。
+ *
+ * 対象は `a` / `button` / `form` だけ。見出しや統計表示（`<span>27 downloads</span>`）
+ * のような、押せない要素は最初から候補に入らない。
+ */
+export function findDownloadControl(html: string): string | null {
+  for (const match of html.matchAll(DOWNLOAD_ELEMENT)) {
+    const [fragment, , attributes, inner] = match;
+    if (isDownloadControl(attributes, inner)) return fragment;
+  }
+  return null;
+}
+
+/**
+ * 断片の中からライセンスを読む。`rel="license"` → CC URL → 表示テキストの順。
+ *
+ * ページ全体の `rel="license"` が取れないときの補助。実ページでは
+ * Downloadボタンの隣に `<span title="Attribution">CC BY 4.0</span>` が並ぶ。
+ */
+const licenseWithin = (fragment: string): SuperSplatLicense | null => {
+  const fromRel = licenseFromRelLink(fragment);
+  if (fromRel) return fromRel;
+  for (const match of fragment.matchAll(/https?:\/\/(?:www\.)?creativecommons\.org\/[^\s"'<>]+/gi)) {
+    const license = licenseFromUrl(match[0]);
+    if (license) return license;
+  }
+  // 表示されている表記から起こす。`CC BY 4.0` のような並びだけを拾う。
+  const label = textOf(fragment).match(
+    /\bCC0(?:[\s-]+[\d.]+)?\b|\bCC[\s-]+(?:BY|NC|ND|SA)(?:[\s-]+(?:BY|NC|ND|SA))*[\s-]+[\d.]+\b/i,
+  );
+  return label ? licenseFromCode(label[0]) : null;
+};
+
+/**
+ * Downloadボタンの周辺に併記されたライセンスを読む。
+ *
+ * 実ページのDownload UIはこの形で、ライセンスはボタンの**兄弟**にある。
+ *
+ *   <div class="flex flex-wrap items-center gap-2">
+ *     <button><svg class="lucide lucide-download"/>Download</button>
+ *     <span title="Attribution">CC BY 4.0</span>
+ *   </div>
+ *
+ * ボタンの断片だけを見ても届かないので、ボタンの直後に続く範囲も併せて見る。
+ * ページ全体を見に行くわけではないので、離れた場所の説明文は拾わない。
+ */
+const licenseBesideControl = (html: string, control: string): SuperSplatLicense | null => {
+  const inside = licenseWithin(control);
+  if (inside) return inside;
+  const at = html.indexOf(control);
+  if (at < 0) return null;
+  // ボタンの直後の兄弟数個ぶん。囲みの `</div>` を越える前に見つかることを狙う。
+  const after = html.slice(at + control.length, at + control.length + 400);
+  return licenseWithin(after.split(/<\/div\s*>/i)[0] ?? "");
+};
+
+/**
+ * scene pageから「取得してよいか」を読む。asset discoveryより必ず先に呼ぶ。
+ *
+ * 判定は2段構え。
+ *
+ * 1. 埋め込みJSONの真偽値（`downloadable` など）。あればこれが最優先で、
+ *    ページの見た目に左右されない一番強い根拠。
+ * 2. **明示的なDownload操作**と**機械可読なライセンス**の組み合わせ。実ページは
+ *    この形で、ライセンスは `<head>` に置かれている。
+ *
+ *      <head>
+ *        <link rel="license" href="https://creativecommons.org/licenses/by/4.0/">
+ *      <body>
+ *        <button><svg class="lucide lucide-download"/>Download</button>
+ *        <span title="Attribution">CC BY 4.0</span>
+ *
+ *    ライセンスの第一の取得元は `<link rel="license">`。SuperSplat自身が設定した
+ *    値で、一番信頼できる。ボタン隣の `<span title="Attribution">` はそれが
+ *    取れないときの補助として使う。
+ *
+ * 両方が揃ったときだけ許可とみなす。片方だけでは許可しない。
+ *
+ * - `<link rel="license">` だけ … 配布を許可しているとは限らない
+ * - Downloadボタンだけ … どの条件で配っているのか分からない
+ * - `html.includes("Download")` … 論外。統計表示の「27 downloads」や、
+ *   作者が説明文に書いた `# CC-BY - ...` も許可の根拠にはしない
+ *
+ * どちらでも判定できなければ `downloadable: null` を返す。呼び出し側は
+ * `false` と同じく読み込まない。
+ */
+export function readSuperSplatDownloadPermission(html: string): SuperSplatDownloadPermission {
+  const blocks = embeddedJsonBlocks(html);
+
+  // ページが設定したライセンス。`rel="license"` が最優先。
+  // 作品説明文に書かれた `# CC-BY - ...` のような自由記述はここに入らない。
+  const pageLicense =
+    licenseFromRelLink(html) ??
+    collectByKey(blocks, LICENSE_KEYS).map(licenseFromValue).find((value) => value !== null) ??
+    licenseFromCode(metaContent(html, ["license", "og:license", "dcterms.license"])) ??
+    null;
+
+  const flags = collectByKey(blocks, DOWNLOADABLE_KEYS).filter(
+    (value): value is boolean => typeof value === "boolean",
+  );
+  if (flags.length > 0) {
+    return flags.some((flag) => flag)
+      ? { downloadable: true, license: pageLicense, reason: "downloadable-flag" }
+      : { downloadable: false, license: pageLicense, reason: "downloadable-flag-false" };
+  }
+
+  const control = findDownloadControl(html);
+  if (!control) {
+    return { downloadable: null, license: pageLicense, reason: "download-control-not-found" };
+  }
+
+  // Download操作があり、ページが機械可読なライセンスを持っている。
+  if (pageLicense) {
+    return { downloadable: true, license: pageLicense, reason: "download-control-with-page-license" };
+  }
+
+  // `rel="license"` が無いページ向けの保険。ボタンに併記された表記から起こす。
+  const beside = licenseBesideControl(html, control);
+  if (beside) {
+    return { downloadable: true, license: beside, reason: "download-control-with-license" };
+  }
+
+  return { downloadable: null, license: null, reason: "download-control-without-license" };
+}
+
+/**
+ * scene pageに対応するviewer pageのURLを決める。
+ *
+ * 原則は `https://superspl.at/s?id={sceneId}`。scene page自身がviewerを指して
+ * いる（iframeの`src`やリンク）ならそちらを優先するが、**ホストが
+ * `superspl.at`、パスが `/s`、`id` が今見ているsceneIdと一致するもの**しか
+ * 採らない。ページに書いてあった任意のURLを取りに行かないための関門。
+ */
+export function findSuperSplatViewerUrl(html: string, sceneId: string): string | null {
+  if (!isSuperSplatSceneId(sceneId)) return null;
+  const fallback = `https://${SUPERSPLAT_HOST}/s?id=${sceneId}`;
+
+  const accepts = (value: string): string | null => {
+    let url: URL;
+    try {
+      url = new URL(value, `https://${SUPERSPLAT_HOST}/scene/${sceneId}`);
+    } catch {
+      return null;
+    }
+    if (url.protocol !== "https:") return null;
+    if (url.hostname.toLowerCase() !== SUPERSPLAT_HOST) return null;
+    if (url.pathname.replace(/\/$/, "") !== "/s") return null;
+    if (url.searchParams.get("id") !== sceneId) return null;
+    return url.toString();
+  };
+
+  for (const match of html.matchAll(/<(?:iframe|a|link)\b([^>]*)>/gi)) {
+    const attributes = match[1];
+    for (const name of ["src", "href"]) {
+      const candidate = accepts(attributeOf(attributes, name));
+      if (candidate) return candidate;
+    }
+  }
+  return fallback;
 }
 
 /**
