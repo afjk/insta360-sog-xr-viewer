@@ -12,6 +12,7 @@
  * 保存する。ブラウザのDOMではなくserver-side fetchで実際に返ってくる中身が
  * 手に入るので、parserを実構造へ合わせるときはこれを基準にすること。
  */
+import { execFileSync } from "node:child_process";
 import { mkdir, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
@@ -67,6 +68,39 @@ const fail = (message) => {
   process.exit(1);
 };
 
+/**
+ * いま動いているコミット。
+ *
+ * fetchしただけでpullを忘れると古いparserで走ってしまい、出力だけを見ても
+ * 気づけない。実際にそれで1往復無駄にしたので、結果と一緒に出す。
+ */
+const git = (...args) => {
+  try {
+    return execFileSync("git", args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    // gitが無い / リポジトリ外 / upstream未設定。判定できないだけなので黙って諦める。
+    return null;
+  }
+};
+
+const revision = () => {
+  const sha = git("rev-parse", "--short", "HEAD");
+  if (!sha) return "unknown";
+  // upstreamが無いこともあるので、SHAとは別に聞く。
+  const behind = git("rev-list", "--count", "HEAD..@{u}");
+  const notes = [
+    git("status", "--porcelain") ? "uncommitted changes" : "",
+    behind && behind !== "0" ? `${behind} behind upstream — run git pull` : "",
+  ]
+    .filter(Boolean)
+    .join(", ");
+  return notes ? `${sha} (${notes})` : sha;
+};
+
+console.log(`parser revision: ${revision()}`);
 console.log(`probing ${share.sceneUrl}\n`);
 
 // 1. scene page —— 許可・ライセンス・帰属
