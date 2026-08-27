@@ -8,22 +8,30 @@ const CDN = "https://d1abcxyz0000.cloudfront.net/splats/56155c3f/v3";
 const META_URL = `${CDN}/meta.json`;
 
 /**
- * scene page を模したfixture。`tests/supersplat.test.mts` と同じ形。
+ * scene page を模したfixture。実際に配信されているSSR HTMLの最小形。
  *
- * **実ページのHTMLそのものではない。** 作業環境から `superspl.at` へ到達できず
- * 実HTTP応答を確認できていないため、parserが解釈できる形の再現に留まる。
- * 実構造は `npm run probe:supersplat -- --dump <dir>` で採取できる。
+ * ライセンスは `<head>` の `<link rel="license">`、Download操作は `<body>` の
+ * ボタン。両者は離れた場所にある（`tests/supersplat.test.mts` に構造の詳細）。
  */
 function scenePageHtml({
-  downloadHtml = `<a class="download" href="/api/splats/${SCENE_ID}/download" download>` +
-    `Download<span class="license">CC BY 4.0</span></a>`,
+  downloadHtml = `<button class="inline-flex items-center gap-1.5">` +
+    `<svg class="lucide lucide-download h-4 w-4"></svg>Download</button>`,
+  licenseHref = "https://creativecommons.org/licenses/by/4.0/",
+  attributionLabel = "CC BY 4.0",
   title = "Lion",
   author = "splat-artist",
 } = {}) {
   return `<!doctype html><html><head>
     <title>${title} | SuperSplat</title>
     <meta name="author" content="${author}" />
-  </head><body><main>${downloadHtml ?? ""}</main></body></html>`;
+    ${licenseHref ? `<link rel="license" href="${licenseHref}">` : ""}
+  </head><body><main>
+    <div class="flex flex-wrap items-center gap-2">
+      ${downloadHtml ?? ""}
+      ${attributionLabel ? `<span class="text-xs" title="Attribution">${attributionLabel}</span>` : ""}
+    </div>
+    <div class="stats"><span><svg class="lucide lucide-download"></svg>27 downloads</span></div>
+  </main></body></html>`;
 }
 
 /** viewer page を模したfixture。アセットのURLだけを持つ。 */
@@ -126,10 +134,8 @@ test("never touches the viewer page when the license cannot be read", async () =
   const seen = [];
   const restore = stubSuperSplat({
     record: seen,
-    // ダウンロード操作はあるが、ライセンスが併記されていない。
-    scene: {
-      downloadHtml: `<a class="download" href="/api/splats/${SCENE_ID}/download" download>Download</a>`,
-    },
+    // ダウンロード操作はあるが、ページのどこにもライセンスが無い。
+    scene: { licenseHref: null, attributionLabel: null },
   });
   try {
     const response = await callRoute(`url=${encodeURIComponent(SCENE_URL)}`);

@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   SUPERSPLAT_ERROR_MESSAGES,
   embeddedJsonBlocks,
+  findDownloadControl,
   findSuperSplatContentUrls,
   findSuperSplatViewerUrl,
   isSuperSplatAssetUrl,
@@ -23,40 +24,55 @@ const CDN = "https://d1abcxyz0000.cloudfront.net/splats/56155c3f/v3";
 const VIEWER_URL = `https://superspl.at/s?id=${SCENE_ID}`;
 
 /**
- * scene page (`/scene/{id}`) を模したfixture。許可・ライセンス・帰属を持つ。
+ * scene page (`/scene/{id}`) を模したfixture。
  *
- * **実ページのHTMLそのものではない。** このfixtureを書いた環境からは
- * `superspl.at` へ到達できず（egress遮断）、実際のHTTP応答を確認できていない。
- * ここで再現しているのはparserが解釈できる「形」であって、SuperSplatが本当に
- * この形で配っている確証はない。実構造は `npm run probe:supersplat -- --dump`
- * で採取し、判明し次第このfixtureを実物へ置き換えること。
+ * 実際に配信されているSSR HTMLの最小形。2026-08時点で確認した構造:
  *
- * 既定はDownload UI経由（ダウンロード操作とライセンスが同じ要素にある形）。
- * 埋め込みJSONのbooleanを持つページは `sceneWithFlag()` で別に用意する。
+ *   <head>
+ *     <link rel="license" href="https://creativecommons.org/licenses/by/4.0/">
+ *   <body>
+ *     <div class="flex flex-wrap items-center gap-2">
+ *       <button><svg class="lucide lucide-download ..."/>Download</button>
+ *       <span title="Attribution">CC BY 4.0</span>
+ *     </div>
+ *
+ * ライセンスはDownloadボタンの中ではなく `<head>` にある。ボタン隣の
+ * `<span title="Attribution">` は同じ値の表示用。
  */
 function scenePage(options: {
   downloadHtml?: string | null;
-  licenseLabel?: string;
+  licenseHref?: string | null;
+  attributionLabel?: string | null;
   title?: string;
   author?: string;
+  extraBody?: string;
 } = {}) {
   const {
-    licenseLabel = "CC BY 4.0",
+    licenseHref = "https://creativecommons.org/licenses/by/4.0/",
+    attributionLabel = "CC BY 4.0",
     title = "Lion",
     author = "splat-artist",
+    extraBody = "",
   } = options;
   const downloadHtml =
     options.downloadHtml === undefined
-      ? `<a class="download" href="/api/splats/${SCENE_ID}/download" download>` +
-        `Download<span class="license">${licenseLabel}</span></a>`
+      ? `<button class="inline-flex items-center gap-1.5">` +
+        `<svg class="lucide lucide-download h-4 w-4"></svg>Download</button>`
       : options.downloadHtml;
 
   return `<!doctype html><html><head>
     <title>${title} | SuperSplat</title>
     <meta property="og:title" content="${title}" />
     <meta name="author" content="${author}" />
+    ${licenseHref ? `<link rel="license" href="${licenseHref}">` : ""}
   </head><body>
-    <main><h1>${title}</h1>${downloadHtml ?? ""}</main>
+    <main><h1>${title}</h1>
+      <div class="flex flex-wrap items-center gap-2">
+        ${downloadHtml ?? ""}
+        ${attributionLabel ? `<span class="text-xs" title="Attribution">${attributionLabel}</span>` : ""}
+      </div>
+      ${extraBody}
+    </main>
   </body></html>`;
 }
 
@@ -177,42 +193,51 @@ test("only fetches assets from the expected public hosts", () => {
 
 // --- scene page: permission ------------------------------------------------
 
-test("reads permission from the download control and its license", () => {
+test("reads permission from the real scene page shape", () => {
+  // Downloadボタンは <body>、ライセンスは <head> の rel="license"。
   const permission = readSuperSplatDownloadPermission(scenePage());
   assert.equal(permission.downloadable, true);
   assert.deepEqual(permission.license, { code: "CC-BY-4.0", label: "CC BY 4.0" });
-  assert.equal(permission.reason, "download-control-with-license");
+  assert.equal(permission.reason, "download-control-with-page-license");
 });
 
 test("keeps the specific Creative Commons terms instead of flattening them", () => {
   const cases: [string, string, string][] = [
-    ["CC BY 4.0", "CC-BY-4.0", "CC BY 4.0"],
-    ["CC BY-NC 4.0", "CC-BY-NC-4.0", "CC BY-NC 4.0"],
-    ["CC BY-SA 4.0", "CC-BY-SA-4.0", "CC BY-SA 4.0"],
-    ["CC BY-ND 4.0", "CC-BY-ND-4.0", "CC BY-ND 4.0"],
-    ["CC BY-NC-SA 4.0", "CC-BY-NC-SA-4.0", "CC BY-NC-SA 4.0"],
-    ["CC0 1.0", "CC0-1.0", "CC0 1.0"],
+    ["https://creativecommons.org/licenses/by/4.0/", "CC-BY-4.0", "CC BY 4.0"],
+    ["https://creativecommons.org/licenses/by-nc/4.0/", "CC-BY-NC-4.0", "CC BY-NC 4.0"],
+    ["https://creativecommons.org/licenses/by-sa/4.0/", "CC-BY-SA-4.0", "CC BY-SA 4.0"],
+    ["https://creativecommons.org/licenses/by-nd/4.0/", "CC-BY-ND-4.0", "CC BY-ND 4.0"],
+    ["https://creativecommons.org/licenses/by-nc-sa/4.0/", "CC-BY-NC-SA-4.0", "CC BY-NC-SA 4.0"],
+    ["https://creativecommons.org/publicdomain/zero/1.0/", "CC0-1.0", "CC0 1.0"],
   ];
-  for (const [label, code, expected] of cases) {
-    const permission = readSuperSplatDownloadPermission(scenePage({ licenseLabel: label }));
-    assert.deepEqual(permission.license, { code, label: expected }, label);
-    assert.equal(permission.downloadable, true, label);
+  for (const [href, code, label] of cases) {
+    const permission = readSuperSplatDownloadPermission(scenePage({ licenseHref: href }));
+    assert.deepEqual(permission.license, { code, label }, href);
+    assert.equal(permission.downloadable, true, href);
   }
 });
 
-test("reads a Creative Commons link inside the download control", () => {
-  const html = scenePage({
-    downloadHtml:
-      `<a class="download" href="/api/splats/${SCENE_ID}/download" download>Download` +
-      `<a rel="license" href="https://creativecommons.org/licenses/by-nc/4.0/">CC BY-NC 4.0</a></a>`,
-  });
-  const permission = readSuperSplatDownloadPermission(html);
+test("falls back to the label beside the button when rel=license is absent", () => {
+  const permission = readSuperSplatDownloadPermission(
+    scenePage({ licenseHref: null, attributionLabel: "CC BY-NC 4.0" }),
+  );
   assert.equal(permission.downloadable, true);
   assert.deepEqual(permission.license, { code: "CC-BY-NC-4.0", label: "CC BY-NC 4.0" });
+  assert.equal(permission.reason, "download-control-with-license");
+});
+
+test("prefers rel=license over the label rendered beside the button", () => {
+  // `<head>` の rel="license" がSuperSplat自身の設定値。表示用のラベルより優先。
+  const permission = readSuperSplatDownloadPermission(
+    scenePage({
+      licenseHref: "https://creativecommons.org/licenses/by/4.0/",
+      attributionLabel: "CC BY-NC 4.0",
+    }),
+  );
+  assert.deepEqual(permission.license, { code: "CC-BY-4.0", label: "CC BY 4.0" });
 });
 
 test("prefers an embedded boolean over the rendered UI", () => {
-  // 真偽値が読めるなら、それが一番強い根拠。UIの形に左右されない。
   const yes = readSuperSplatDownloadPermission(sceneWithFlag(true));
   assert.equal(yes.downloadable, true);
   assert.equal(yes.reason, "downloadable-flag");
@@ -222,42 +247,76 @@ test("prefers an embedded boolean over the rendered UI", () => {
   assert.equal(no.reason, "downloadable-flag-false");
 });
 
-test("refuses a scene with no download control at all", () => {
+// --- negative cases: none of these may grant permission --------------------
+
+test("refuses a page that only carries rel=license", () => {
+  // ライセンスは設定されているが、配布は許可していない状態。
   const permission = readSuperSplatDownloadPermission(scenePage({ downloadHtml: null }));
-  assert.equal(permission.downloadable, null);
+  assert.notEqual(permission.downloadable, true);
+  assert.equal(permission.reason, "download-control-not-found");
+  // ライセンス自体は読めているが、それは許可の根拠にしない。
+  assert.deepEqual(permission.license, { code: "CC-BY-4.0", label: "CC BY 4.0" });
+});
+
+test("refuses a download control with no license anywhere", () => {
+  const permission = readSuperSplatDownloadPermission(
+    scenePage({ licenseHref: null, attributionLabel: null }),
+  );
+  assert.notEqual(permission.downloadable, true);
+  assert.equal(permission.reason, "download-control-without-license");
+  assert.equal(permission.license, null);
+});
+
+test("ignores a CC-BY mention in the author's description", () => {
+  // 作者が説明文へ書いた文字列。SuperSplatのライセンス設定とは別物。
+  const html = `<!doctype html><html><head><title>Lion | SuperSplat</title></head><body>
+    <article><h1>Lion</h1><p># CC-BY - Joanna Kobierska</p></article>
+  </body></html>`;
+  const permission = readSuperSplatDownloadPermission(html);
+  assert.notEqual(permission.downloadable, true);
+  assert.equal(permission.reason, "download-control-not-found");
+  assert.equal(permission.license, null);
+});
+
+test("does not mistake the download-count statistic for a download control", () => {
+  // 実ページにはlucideの同じアイコンを使った「27 downloads」という統計がある。
+  const stats =
+    `<div class="stats"><span class="inline-flex"><svg class="lucide lucide-download h-3 w-3"></svg>` +
+    `27 downloads</span></div>`;
+  const permission = readSuperSplatDownloadPermission(
+    scenePage({ downloadHtml: null, extraBody: stats }),
+  );
+  assert.notEqual(permission.downloadable, true);
+  assert.equal(permission.reason, "download-control-not-found");
+  assert.equal(findDownloadControl(stats), null);
+  // ボタンに入っていても、テキストが統計なら操作とは読まない。
+  assert.equal(
+    findDownloadControl(`<button><svg class="lucide lucide-download"></svg>27 downloads</button>`),
+    null,
+  );
+});
+
+test("does not mistake a bundled asset filename for a download control", () => {
+  const html = `<html><head>
+    <link rel="license" href="https://creativecommons.org/licenses/by/4.0/">
+    <script type="module" src="/assets/download-a1b2c3d4.js"></script>
+    <link rel="modulepreload" href="/assets/download-a1b2c3d4.js">
+  </head><body><div id="root"></div></body></html>`;
+  const permission = readSuperSplatDownloadPermission(html);
+  assert.notEqual(permission.downloadable, true);
   assert.equal(permission.reason, "download-control-not-found");
 });
 
-test("refuses a download control that carries no license", () => {
-  const html = scenePage({
-    downloadHtml: `<a class="download" href="/api/splats/${SCENE_ID}/download" download>Download</a>`,
-  });
-  const permission = readSuperSplatDownloadPermission(html);
-  assert.equal(permission.downloadable, null);
-  assert.equal(permission.reason, "download-control-without-license");
-});
-
 test("does not treat the word Download in prose as permission", () => {
-  // ここが今回の肝。文字列一致だけでtrueにしない。
-  for (const html of [
-    "<html><body><p>You can Download this splat from the author's site.</p></body></html>",
-    "<html><body><h2>Download</h2><p>Coming soon</p></body></html>",
-    `<html><body><a href="/about">Read about Download options</a></body></html>`,
+  for (const body of [
+    "<p>You can Download this splat from the author's site.</p>",
+    "<h2>Download</h2><p>Coming soon</p>",
+    `<a href="/about">Read about Download options</a>`,
   ]) {
+    const html = `<html><head><title>x</title></head><body>${body}</body></html>`;
     const permission = readSuperSplatDownloadPermission(html);
-    assert.notEqual(permission.downloadable, true, html.slice(0, 40));
+    assert.notEqual(permission.downloadable, true, body.slice(0, 40));
   }
-});
-
-test("does not treat a bare CC label as permission", () => {
-  // ライセンス表記があっても、配布が許可されているとは限らない。
-  const html = `<html><head>
-    <link rel="license" href="https://creativecommons.org/licenses/by/4.0/" />
-  </head><body><p>CC BY 4.0</p></body></html>`;
-  const permission = readSuperSplatDownloadPermission(html);
-  assert.notEqual(permission.downloadable, true);
-  // ライセンス自体は読めているが、それは許可の根拠にはしない。
-  assert.deepEqual(permission.license, { code: "CC-BY-4.0", label: "CC BY 4.0" });
 });
 
 test("survives a malformed scene page without throwing", () => {
@@ -267,6 +326,7 @@ test("survives a malformed scene page without throwing", () => {
     "<html><body>not a scene page</body></html>",
     '<script type="application/json" id="scene-state">{not json</script>',
     "<a download>",
+    "<button>Download",
   ]) {
     const permission = readSuperSplatDownloadPermission(html);
     assert.notEqual(permission.downloadable, true, html.slice(0, 24));

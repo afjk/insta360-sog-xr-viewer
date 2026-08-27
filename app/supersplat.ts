@@ -32,18 +32,37 @@
  * - `playcanvas/supersplat` … `src/publish.ts` の `publishFormat` が
  *   `"sog"`（通常）と `"ssog"`（Streamed SOG）に分かれる。
  *
- * ## 未確認の前提（重要）
+ * ## 実ページで確認した構造（2026-08時点）
  *
- * このモジュールを書いた作業環境からは `superspl.at` へ到達できず（egress
- * ポリシーによる遮断）、実ページのHTTP応答そのものは確認できていない。
- * 上記のオープンソース実装から読み取れる契約に合わせてあるが、scene page側の
- * Downloadable / licenseの表現は実物で裏を取れていない。
+ * scene page (`/scene/{sceneId}`) のSSR HTML:
  *
- * そのため判定は「見つからなければ読み込まない」に倒してあり、外し方は常に
- * 安全側（許可されていない作品を誤って取得する側ではない）になる。実ページを
- * 確認する手段として `scripts/probe-supersplat.mjs` を用意してある。
- * `--dump` を付ければ両ページの生HTMLを保存できるので、実構造が分かり次第
- * `readSuperSplatDownloadPermission` を実物へ合わせること。
+ *   <head>
+ *     <link rel="license" href="https://creativecommons.org/licenses/by/4.0/">
+ *   <body>
+ *     <div class="flex flex-wrap items-center gap-2">
+ *       <button><svg class="lucide lucide-download ..."/>Download</button>
+ *       <span title="Attribution">CC BY 4.0</span>
+ *     </div>
+ *
+ * ライセンスはDownloadボタンの中ではなく `<head>` にある。両者は離れているので、
+ * 「ボタンの中にライセンスがあるはず」という読み方はしない。
+ *
+ * 同じページには紛らわしいものが同居している。いずれも許可の根拠にしない:
+ *
+ *   - 「27 downloads」という統計表示（Downloadボタンと同じlucideアイコンを使う）
+ *   - 作者が説明文に書いた `# CC-BY - ...` のような自由記述
+ *   - `download-a1b2c3d4.js` のようなビルド成果物のファイル名
+ *
+ * React Routerのloader data（devalue形式）にも `downloads` / `enabled` /
+ * `license` / `by` が入っている。将来はそちらのほうが安定した判定元になりうるが、
+ * devalueのパーサーを持ち込むだけの利点が今は無いので採っていない。
+ *
+ * ## まだ確認できていないもの
+ *
+ * viewer page (`/s?id={sceneId}`) の実HTTP応答は未確認。`contentUrl` の置き場所は
+ * SuperSplat公式Viewer (`playcanvas/supersplat-viewer`) の実装から読み取れる
+ * 契約に合わせてあるが、実物との突き合わせはできていない。
+ * `scripts/probe-supersplat.mjs --dump` で採取できる。
  */
 // 拡張子を明示しているのは、このモジュールをテストからNodeで直接importするため。
 // バンドラは付いていても解決できる。
@@ -139,7 +158,9 @@ export type SuperSplatPermissionReason =
   | "downloadable-flag"
   /** 埋め込みJSONの真偽値が `false` だった。作者が許可していない。 */
   | "downloadable-flag-false"
-  /** ダウンロード操作とライセンスが同じ要素で示されていた。 */
+  /** ダウンロード操作があり、ページが機械可読なライセンスを持っていた。 */
+  | "download-control-with-page-license"
+  /** ダウンロード操作の周辺にライセンスが併記されていた。 */
   | "download-control-with-license"
   /** ダウンロード操作は見つかったが、ライセンスが伴っていなかった。 */
   | "download-control-without-license"
@@ -488,13 +509,23 @@ export function readSuperSplatSceneMeta(html: string): SuperSplatSceneMeta {
 
 // ダウンロード操作を表しうる要素。入れ子にならないタグだけを対象にするので、
 // 非貪欲マッチで要素1つ分の断片を切り出せる。
+// ダウンロード操作を表しうる要素。入れ子にならないタグだけを対象にするので、
+// 非貪欲マッチで要素1つ分の断片を切り出せる。
 const DOWNLOAD_ELEMENT = /<(a|button|form)\b([^>]*)>([\s\S]*?)<\/\1\s*>/gi;
 
 // URLがダウンロードを指していると分かる形。パスと拡張子だけを見る。
-const DOWNLOAD_HREF = /(^|\/)(download|downloads)(\/|$|\?)|\.(sog|ply|splat|zip)($|\?)/i;
+// `download-a1b2c3.js` のようなビルド成果物のファイル名には当たらない
+// （`download` の直後が区切りであることを要求している）。
+const DOWNLOAD_HREF = /(^|\/)downloads?(\/|$|\?)|\.(sog|ply|splat|zip)($|\?)/i;
 
-// 属性値に現れる「ダウンロード操作である」という機械可読な手がかり。
-const DOWNLOAD_HINT = /(^|[^a-z])download([^a-z]|$)/i;
+/**
+ * 「ダウンロード操作」を表す語。
+ *
+ * 単数形の `Download` だけに当たり、複数形の `downloads` には**当たらない**。
+ * 実ページにはlucideのdownloadアイコンを使った「27 downloads」という統計表示が
+ * あり、これを操作と取り違えないため。`download` の直後が英字なら不一致になる。
+ */
+const DOWNLOAD_WORD = /(^|[^a-z])download([^a-z]|$)/i;
 
 const textOf = (fragment: string): string =>
   fragment
@@ -504,29 +535,52 @@ const textOf = (fragment: string): string =>
     .trim();
 
 /**
- * 要素の属性・URLから「ダウンロード操作」だと機械的に読み取れるか。
+ * 要素が「ダウンロード操作」だと機械的に読み取れるか。
  *
- * 表示テキストの `Download` だけでは決めない（見出しやリンク文言と区別が
- * つかないため）。属性側の手がかりを先に見て、無ければテキストは
- * 「属性の裏付けがある場合の補強」としてのみ使う。
+ * 手がかりは2種類。
+ *
+ * 1. 属性側の表明 … `<a download>`、ダウンロードを指す `href` / `action`、
+ *    `data-*` / `aria-label` / `title` に現れる `download`。
+ * 2. 表示テキストの `Download` … 実ページのボタンは
+ *    `<button><svg class="lucide lucide-download"/>Download</button>` で、
+ *    属性側に手がかりが無いためこちらで拾う。
+ *
+ * `class` は見ない。アイコン名（`lucide-download`）は装飾であって操作の表明では
+ * なく、統計表示にも同じアイコンが使われているため。
  */
-const downloadAffordanceOf = (attributes: string, inner: string): boolean => {
+const isDownloadControl = (attributes: string, inner: string): boolean => {
   // `<a download>` はHTML標準の「これは保存操作である」という表明。
   if (/\bdownload\b(?=[\s=>]|$)/i.test(attributes)) return true;
   for (const name of ["href", "action", "formaction"]) {
     if (DOWNLOAD_HREF.test(attributeOf(attributes, name))) return true;
   }
-  // `data-*` / `aria-label` / `title` / `id` / `name` に現れる機械可読な手がかり。
   for (const match of attributes.matchAll(/\b(data-[\w-]+|aria-label|title|id|name)\s*=\s*("([^"]*)"|'([^']*)')/gi)) {
     const value = match[3] ?? match[4] ?? "";
-    if (DOWNLOAD_HINT.test(value)) return true;
+    if (DOWNLOAD_WORD.test(value)) return true;
   }
-  // ここまでで属性の裏付けが無い場合だけ、表示テキストを見る。単独では弱いので
-  // 呼び出し側でライセンスの同居を必ず併せて確認する。
-  return DOWNLOAD_HINT.test(textOf(inner));
+  return DOWNLOAD_WORD.test(textOf(inner));
 };
 
-/** 断片の中からライセンスを読む。`rel="license"` → CC URL → 表示テキストの順。 */
+/**
+ * ページから明示的なダウンロード操作を探す。見つかればその要素のHTML断片。
+ *
+ * 対象は `a` / `button` / `form` だけ。見出しや統計表示（`<span>27 downloads</span>`）
+ * のような、押せない要素は最初から候補に入らない。
+ */
+export function findDownloadControl(html: string): string | null {
+  for (const match of html.matchAll(DOWNLOAD_ELEMENT)) {
+    const [fragment, , attributes, inner] = match;
+    if (isDownloadControl(attributes, inner)) return fragment;
+  }
+  return null;
+}
+
+/**
+ * 断片の中からライセンスを読む。`rel="license"` → CC URL → 表示テキストの順。
+ *
+ * ページ全体の `rel="license"` が取れないときの補助。実ページでは
+ * Downloadボタンの隣に `<span title="Attribution">CC BY 4.0</span>` が並ぶ。
+ */
 const licenseWithin = (fragment: string): SuperSplatLicense | null => {
   const fromRel = licenseFromRelLink(fragment);
   if (fromRel) return fromRel;
@@ -534,11 +588,34 @@ const licenseWithin = (fragment: string): SuperSplatLicense | null => {
     const license = licenseFromUrl(match[0]);
     if (license) return license;
   }
-  // 実ページに `rel="license"` が無い場合に備え、表示されている表記から起こす。
-  // `CC BY 4.0` / `CC BY-NC 4.0` / `CC0 1.0` のような並びだけを拾う。
-  const text = textOf(fragment);
-  const label = text.match(/\bCC0(?:[\s-]+[\d.]+)?\b|\bCC[\s-]+(?:BY|NC|ND|SA)(?:[\s-]+(?:BY|NC|ND|SA))*[\s-]+[\d.]+\b/i);
+  // 表示されている表記から起こす。`CC BY 4.0` のような並びだけを拾う。
+  const label = textOf(fragment).match(
+    /\bCC0(?:[\s-]+[\d.]+)?\b|\bCC[\s-]+(?:BY|NC|ND|SA)(?:[\s-]+(?:BY|NC|ND|SA))*[\s-]+[\d.]+\b/i,
+  );
   return label ? licenseFromCode(label[0]) : null;
+};
+
+/**
+ * Downloadボタンの周辺に併記されたライセンスを読む。
+ *
+ * 実ページのDownload UIはこの形で、ライセンスはボタンの**兄弟**にある。
+ *
+ *   <div class="flex flex-wrap items-center gap-2">
+ *     <button><svg class="lucide lucide-download"/>Download</button>
+ *     <span title="Attribution">CC BY 4.0</span>
+ *   </div>
+ *
+ * ボタンの断片だけを見ても届かないので、ボタンの直後に続く範囲も併せて見る。
+ * ページ全体を見に行くわけではないので、離れた場所の説明文は拾わない。
+ */
+const licenseBesideControl = (html: string, control: string): SuperSplatLicense | null => {
+  const inside = licenseWithin(control);
+  if (inside) return inside;
+  const at = html.indexOf(control);
+  if (at < 0) return null;
+  // ボタンの直後の兄弟数個ぶん。囲みの `</div>` を越える前に見つかることを狙う。
+  const after = html.slice(at + control.length, at + control.length + 400);
+  return licenseWithin(after.split(/<\/div\s*>/i)[0] ?? "");
 };
 
 /**
@@ -548,14 +625,25 @@ const licenseWithin = (fragment: string): SuperSplatLicense | null => {
  *
  * 1. 埋め込みJSONの真偽値（`downloadable` など）。あればこれが最優先で、
  *    ページの見た目に左右されない一番強い根拠。
- * 2. 実際のDownload UI。ダウンロード操作を表す要素を機械的に拾い、**同じ要素の
- *    中にライセンスが併記されていること**まで確認できたときだけ許可とみなす。
- *    SuperSplatのDownloadボタンはライセンス表示を伴う形なので、両方が揃って
- *    初めて「作者がライセンス付きで配布を許可している」と読める。
+ * 2. **明示的なDownload操作**と**機械可読なライセンス**の組み合わせ。実ページは
+ *    この形で、ライセンスは `<head>` に置かれている。
  *
- * `html.includes("Download")` のような文字列一致だけでは絶対にtrueにしない。
- * ライセンス表記を単独で見つけても、それはDownloadableの根拠にしない
- * （ライセンスは付いているが配布は許可していない、という状態があり得るため）。
+ *      <head>
+ *        <link rel="license" href="https://creativecommons.org/licenses/by/4.0/">
+ *      <body>
+ *        <button><svg class="lucide lucide-download"/>Download</button>
+ *        <span title="Attribution">CC BY 4.0</span>
+ *
+ *    ライセンスの第一の取得元は `<link rel="license">`。SuperSplat自身が設定した
+ *    値で、一番信頼できる。ボタン隣の `<span title="Attribution">` はそれが
+ *    取れないときの補助として使う。
+ *
+ * 両方が揃ったときだけ許可とみなす。片方だけでは許可しない。
+ *
+ * - `<link rel="license">` だけ … 配布を許可しているとは限らない
+ * - Downloadボタンだけ … どの条件で配っているのか分からない
+ * - `html.includes("Download")` … 論外。統計表示の「27 downloads」や、
+ *   作者が説明文に書いた `# CC-BY - ...` も許可の根拠にはしない
  *
  * どちらでも判定できなければ `downloadable: null` を返す。呼び出し側は
  * `false` と同じく読み込まない。
@@ -563,10 +651,11 @@ const licenseWithin = (fragment: string): SuperSplatLicense | null => {
 export function readSuperSplatDownloadPermission(html: string): SuperSplatDownloadPermission {
   const blocks = embeddedJsonBlocks(html);
 
-  // ページ全体から読めるライセンス。1.の経路ではこちらを使う。
-  const declaredLicense =
-    collectByKey(blocks, LICENSE_KEYS).map(licenseFromValue).find((value) => value !== null) ??
+  // ページが設定したライセンス。`rel="license"` が最優先。
+  // 作品説明文に書かれた `# CC-BY - ...` のような自由記述はここに入らない。
+  const pageLicense =
     licenseFromRelLink(html) ??
+    collectByKey(blocks, LICENSE_KEYS).map(licenseFromValue).find((value) => value !== null) ??
     licenseFromCode(metaContent(html, ["license", "og:license", "dcterms.license"])) ??
     null;
 
@@ -575,26 +664,27 @@ export function readSuperSplatDownloadPermission(html: string): SuperSplatDownlo
   );
   if (flags.length > 0) {
     return flags.some((flag) => flag)
-      ? { downloadable: true, license: declaredLicense, reason: "downloadable-flag" }
-      : { downloadable: false, license: declaredLicense, reason: "downloadable-flag-false" };
+      ? { downloadable: true, license: pageLicense, reason: "downloadable-flag" }
+      : { downloadable: false, license: pageLicense, reason: "downloadable-flag-false" };
   }
 
-  let sawDownloadControl = false;
-  for (const match of html.matchAll(DOWNLOAD_ELEMENT)) {
-    const [fragment, , attributes, inner] = match;
-    if (!downloadAffordanceOf(attributes, inner)) continue;
-    sawDownloadControl = true;
-    const license = licenseWithin(fragment);
-    if (license) {
-      return { downloadable: true, license, reason: "download-control-with-license" };
-    }
+  const control = findDownloadControl(html);
+  if (!control) {
+    return { downloadable: null, license: pageLicense, reason: "download-control-not-found" };
   }
 
-  return {
-    downloadable: null,
-    license: declaredLicense,
-    reason: sawDownloadControl ? "download-control-without-license" : "download-control-not-found",
-  };
+  // Download操作があり、ページが機械可読なライセンスを持っている。
+  if (pageLicense) {
+    return { downloadable: true, license: pageLicense, reason: "download-control-with-page-license" };
+  }
+
+  // `rel="license"` が無いページ向けの保険。ボタンに併記された表記から起こす。
+  const beside = licenseBesideControl(html, control);
+  if (beside) {
+    return { downloadable: true, license: beside, reason: "download-control-with-license" };
+  }
+
+  return { downloadable: null, license: null, reason: "download-control-without-license" };
 }
 
 /**
