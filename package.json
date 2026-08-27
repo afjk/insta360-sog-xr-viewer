@@ -13,9 +13,10 @@
     "test": "npm run build && node --experimental-strip-types --test tests/rendered-html.test.mjs tests/insta360-route.test.mjs tests/supersplat-route.test.mjs tests/insta360.test.mts tests/supersplat.test.mts tests/permalink.test.mts tests/view-pose.test.mts tests/capture-view.test.mts tests/resolver-config.test.mts tests/sog-optimizer.test.mts",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern dist-pages --ignore-pattern .next",
     "db:generate": "drizzle-kit generate",
+    "probe:supersplat": "node --experimental-strip-types scripts/probe-supersplat.mjs",
     "resolver:dev": "wrangler dev --config resolver-worker/wrangler.toml",
-    "resolver:deploy": "wrangler deploy --config resolver-worker/wrangler.toml",
-    "probe:supersplat": "node --experimental-strip-types scripts/probe-supersplat.mjs"
+    "preresolver:deploy": "node scripts/print-revision.mjs",
+    "resolver:deploy": "wrangler deploy --config resolver-worker/wrangler.toml"
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",
