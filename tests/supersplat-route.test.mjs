@@ -20,7 +20,22 @@ function scenePageHtml({
   attributionLabel = "CC BY 4.0",
   title = "Lion",
   author = "splat-artist",
+  username = "splat-artist",
+  fullName = "Splat Artist",
 } = {}) {
+  const flattened = [
+    { _1: 2, _3: 4 },
+    "splat",
+    { _5: 6 },
+    "user",
+    { _7: 8, _9: 10 },
+    "title",
+    title,
+    "username",
+    username,
+    "fullName",
+    fullName,
+  ];
   return `<!doctype html><html><head>
     <title>${title} - SuperSplat</title>
     <meta property="og:title" content="${title} - SuperSplat"/>
@@ -28,11 +43,13 @@ function scenePageHtml({
     <meta name="author" content="${author}" />
     ${licenseHref ? `<link rel="license" href="${licenseHref}">` : ""}
   </head><body><main>
+    <a data-testid="view-user-link" href="/user/${username}">${username}</a>
     <div class="flex flex-wrap items-center gap-2">
       ${downloadHtml ?? ""}
       ${attributionLabel ? `<span class="text-xs" title="Attribution">${attributionLabel}</span>` : ""}
     </div>
     <div class="stats"><span><svg class="lucide lucide-download"></svg>27 downloads</span></div>
+    <script>window.__reactRouterContext.streamController.enqueue(${JSON.stringify(JSON.stringify(flattened))});</script>
   </main></body></html>`;
 }
 
@@ -103,7 +120,26 @@ test("resolves a downloadable scene through scene page then viewer page", async 
       title: "Lion",
       author: "splat-artist",
       downloadable: true,
-      license: { code: "CC-BY-4.0", label: "CC BY 4.0" },
+      license: {
+        code: "CC-BY-4.0",
+        label: "CC BY 4.0",
+        url: "https://creativecommons.org/licenses/by/4.0/",
+      },
+      attribution: {
+        status: "complete",
+        text:
+          `"Lion" by Splat Artist (https://superspl.at/user/splat-artist)\n` +
+          `Source: ${SCENE_URL}\n` +
+          `Licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)`,
+        sourceUrl: SCENE_URL,
+        creators: [
+          { name: "Splat Artist", url: "https://superspl.at/user/splat-artist" },
+        ],
+        publisher: {
+          name: "splat-artist",
+          url: "https://superspl.at/user/splat-artist",
+        },
+      },
       asset: { format: "sog-meta", url: META_URL, revision: "v3" },
     });
     // 処理順の固定: scene page → viewer page。この2件だけ。
@@ -340,5 +376,6 @@ test("a real smoke test against SuperSplat is available but not part of CI", asy
   // 実構造を採取できること。parserを実物へ合わせるための入口。
   assert.match(script, /--dump/);
   assert.match(script, /readSuperSplatDownloadPermission/);
+  assert.match(script, /readSuperSplatAttribution/);
   assert.match(script, /findSuperSplatViewerUrl/);
 });
