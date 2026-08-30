@@ -9,6 +9,7 @@ import {
   isSuperSplatAssetUrl,
   isSuperSplatSceneId,
   parseSuperSplatUrl,
+  readSuperSplatAttribution,
   readSuperSplatDownloadPermission,
   readSuperSplatSceneMeta,
   revisionOf,
@@ -20,6 +21,11 @@ import {
 const SCENE_ID = "56155c3f";
 const SCENE_URL = `https://superspl.at/scene/${SCENE_ID}`;
 const CDN = "https://d1abcxyz0000.cloudfront.net/splats/56155c3f/v3";
+const CC_BY_LICENSE = {
+  code: "CC-BY-4.0",
+  label: "CC BY 4.0",
+  url: "https://creativecommons.org/licenses/by/4.0/",
+};
 
 const VIEWER_URL = `https://superspl.at/s?id=${SCENE_ID}`;
 
@@ -44,7 +50,7 @@ function scenePage(options: {
   licenseHref?: string | null;
   attributionLabel?: string | null;
   title?: string;
-  author?: string;
+  author?: string | null;
   extraBody?: string;
 } = {}) {
   const {
@@ -63,7 +69,7 @@ function scenePage(options: {
   return `<!doctype html><html><head>
     <title>${title} | SuperSplat</title>
     <meta property="og:title" content="${title}" />
-    <meta name="author" content="${author}" />
+    ${author ? `<meta name="author" content="${author}" />` : ""}
     ${licenseHref ? `<link rel="license" href="${licenseHref}">` : ""}
   </head><body>
     <main><h1>${title}</h1>
@@ -197,7 +203,11 @@ test("reads permission from the real scene page shape", () => {
   // Downloadボタンは <body>、ライセンスは <head> の rel="license"。
   const permission = readSuperSplatDownloadPermission(scenePage());
   assert.equal(permission.downloadable, true);
-  assert.deepEqual(permission.license, { code: "CC-BY-4.0", label: "CC BY 4.0" });
+  assert.deepEqual(permission.license, {
+    code: "CC-BY-4.0",
+    label: "CC BY 4.0",
+    url: "https://creativecommons.org/licenses/by/4.0/",
+  });
   assert.equal(permission.reason, "download-control-with-page-license");
 });
 
@@ -212,7 +222,7 @@ test("keeps the specific Creative Commons terms instead of flattening them", () 
   ];
   for (const [href, code, label] of cases) {
     const permission = readSuperSplatDownloadPermission(scenePage({ licenseHref: href }));
-    assert.deepEqual(permission.license, { code, label }, href);
+    assert.deepEqual(permission.license, { code, label, url: href }, href);
     assert.equal(permission.downloadable, true, href);
   }
 });
@@ -222,7 +232,11 @@ test("falls back to the label beside the button when rel=license is absent", () 
     scenePage({ licenseHref: null, attributionLabel: "CC BY-NC 4.0" }),
   );
   assert.equal(permission.downloadable, true);
-  assert.deepEqual(permission.license, { code: "CC-BY-NC-4.0", label: "CC BY-NC 4.0" });
+  assert.deepEqual(permission.license, {
+    code: "CC-BY-NC-4.0",
+    label: "CC BY-NC 4.0",
+    url: "https://creativecommons.org/licenses/by-nc/4.0/",
+  });
   assert.equal(permission.reason, "download-control-with-license");
 });
 
@@ -234,7 +248,11 @@ test("prefers rel=license over the label rendered beside the button", () => {
       attributionLabel: "CC BY-NC 4.0",
     }),
   );
-  assert.deepEqual(permission.license, { code: "CC-BY-4.0", label: "CC BY 4.0" });
+  assert.deepEqual(permission.license, {
+    code: "CC-BY-4.0",
+    label: "CC BY 4.0",
+    url: "https://creativecommons.org/licenses/by/4.0/",
+  });
 });
 
 test("prefers an embedded boolean over the rendered UI", () => {
@@ -255,7 +273,11 @@ test("refuses a page that only carries rel=license", () => {
   assert.notEqual(permission.downloadable, true);
   assert.equal(permission.reason, "download-control-not-found");
   // ライセンス自体は読めているが、それは許可の根拠にしない。
-  assert.deepEqual(permission.license, { code: "CC-BY-4.0", label: "CC BY 4.0" });
+  assert.deepEqual(permission.license, {
+    code: "CC-BY-4.0",
+    label: "CC BY 4.0",
+    url: "https://creativecommons.org/licenses/by/4.0/",
+  });
 });
 
 test("refuses a download control with no license anywhere", () => {
@@ -385,6 +407,89 @@ test("decodes entities in the title", () => {
 test("reads an author when the page names one", () => {
   const html = `<html><head><meta name="author" content="Joanna Kobierska"/></head></html>`;
   assert.equal(readSuperSplatSceneMeta(html).author, "Joanna Kobierska");
+});
+
+test("returns the real 56155c3f profile and Copy Credit without repurposing legacy author", () => {
+  // 実ページはmeta authorを持たない。投稿者chipとReact Router loader dataには
+  // username=rohls / fullName=Renaud があり、公式Copy CreditはfullNameを使う。
+  const flattened = [
+    { _1: 2, _3: 4 },
+    "splat",
+    { _5: 6 },
+    "user",
+    { _7: 8, _9: 10 },
+    "title",
+    "Lion",
+    "username",
+    "rohls",
+    "fullName",
+    "Renaud",
+  ];
+  const loader = `window.__reactRouterContext.streamController.enqueue(${JSON.stringify(JSON.stringify(flattened))});`;
+  const html = scenePage({
+    author: null,
+    extraBody:
+      `<a data-testid="view-user-link" href="/user/rohls">rohls</a>` +
+      `<script>${loader}</script>`,
+  });
+
+  assert.equal(readSuperSplatSceneMeta(html).author, "");
+  assert.deepEqual(readSuperSplatAttribution(html, SCENE_URL, "Lion", CC_BY_LICENSE), {
+    status: "complete",
+    text:
+      `"Lion" by Renaud (https://superspl.at/user/rohls)\n` +
+      `Source: ${SCENE_URL}\n` +
+      `Licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)`,
+    sourceUrl: SCENE_URL,
+    creators: [{ name: "Renaud", url: "https://superspl.at/user/rohls" }],
+    publisher: { name: "rohls", url: "https://superspl.at/user/rohls" },
+  });
+});
+
+test("keeps multiple structured creators and credit lines separate from the publisher", () => {
+  const structured = {
+    "@context": "https://schema.org",
+    "@type": "3DModel",
+    creator: [
+      { "@type": "Person", name: "Joanna Kobierska", url: "https://artist.example/joanna" },
+      { "@type": "Person", name: "Ken Barthelmey", url: "https://artist.example/ken" },
+    ],
+    creditText: ["Reconstruction: Museum Lab", "<b>Scan:</b> Field Team"],
+  };
+  const html = scenePage({
+    author: null,
+    extraBody:
+      `<a href="/user/rohls" data-testid="view-user-link">rohls</a>` +
+      `<script type="application/ld+json">${JSON.stringify(structured)}</script>`,
+  });
+  const attribution = readSuperSplatAttribution(html, SCENE_URL, "Lion", CC_BY_LICENSE);
+
+  assert.equal(attribution.status, "complete");
+  assert.deepEqual(attribution.publisher, {
+    name: "rohls",
+    url: "https://superspl.at/user/rohls",
+  });
+  assert.deepEqual(attribution.creators, [
+    { name: "Joanna Kobierska", url: "https://artist.example/joanna" },
+    { name: "Ken Barthelmey", url: "https://artist.example/ken" },
+  ]);
+  assert.match(attribution.text ?? "", /Joanna Kobierska.*Ken Barthelmey/);
+  assert.match(attribution.text ?? "", /Reconstruction: Museum Lab/);
+  assert.match(attribution.text ?? "", /Scan: Field Team/);
+  assert.doesNotMatch(attribution.text ?? "", /<b>/);
+});
+
+test("reports attribution as unavailable instead of guessing names from description prose", () => {
+  const description =
+    "# CC-BY - Joanna Kobierska\\n# CREDITS\\n# Lion base by Ken Barthelmey";
+  const html = scenePage({ author: null, extraBody: `<article>${description}</article>` });
+  assert.deepEqual(readSuperSplatAttribution(html, SCENE_URL, "Lion", CC_BY_LICENSE), {
+    status: "unavailable",
+    text: null,
+    sourceUrl: SCENE_URL,
+    creators: [],
+    publisher: null,
+  });
 });
 
 test("reads structured blocks without executing the page", () => {

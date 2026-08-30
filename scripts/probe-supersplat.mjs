@@ -19,6 +19,7 @@ import {
   findSuperSplatContentUrls,
   findSuperSplatViewerUrl,
   parseSuperSplatUrl,
+  readSuperSplatAttribution,
   readSuperSplatDownloadPermission,
   readSuperSplatSceneMeta,
   selectSuperSplatAsset,
@@ -90,6 +91,12 @@ if (permission.downloadable !== true) {
 if (!permission.license) {
   fail("resolver would answer 422 SUPERSPLAT_LICENSE_NOT_FOUND");
 }
+const attribution = readSuperSplatAttribution(
+  scene.html,
+  share.sceneUrl,
+  meta.title,
+  permission.license,
+);
 
 // 2. viewer page —— アセット。許可を確認したあとにしか取りに行かない。
 console.log("\nviewer page");
@@ -107,7 +114,18 @@ console.log(`sceneId:      ${share.sceneId}`);
 console.log(`title:        ${meta.title || "(none)"}`);
 console.log(`author:       ${meta.author || "(none)"}`);
 console.log(`downloadable: true`);
-console.log(`license:      ${permission.license.label} (${permission.license.code})`);
+console.log(
+  `license:      ${permission.license.label} (${permission.license.code}) ${permission.license.url ?? "(URL unavailable)"}`,
+);
+console.log(`attribution:  ${attribution.status}`);
+console.log(
+  `publisher:    ${attribution.publisher ? `${attribution.publisher.name} (${attribution.publisher.url ?? "no URL"})` : "(unavailable)"}`,
+);
+console.log(
+  `creators:     ${attribution.creators.length ? attribution.creators.map((party) => party.name).join(", ") : "(unavailable)"}`,
+);
+console.log("credit:");
+console.log(attribution.text ?? "  (unavailable)");
 console.log(`format:       ${asset.format}`);
 console.log(`revision:     ${asset.revision ?? "(none)"}`);
 console.log(`assetUrl:     ${asset.url}`);

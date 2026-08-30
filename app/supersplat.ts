@@ -106,6 +106,35 @@ export type SuperSplatLicense = {
   code: string;
   /** 画面に出す表記。例: `CC BY 4.0`。 */
   label: string;
+  /** ライセンス本文の正規URL。URLを確認できない表記だけの場合は `null`。 */
+  url: string | null;
+};
+
+/** SuperSplatが権利・帰属情報の中で名指ししている人または団体。 */
+export type SuperSplatAttributionParty = {
+  name: string;
+  /** プロフィール等の正規URL。構造化データに無ければ `null`。 */
+  url: string | null;
+};
+
+/**
+ * GLBへ移せるよう正規化した権利・帰属情報。
+ *
+ * `publisher` はSuperSplatへ投稿したアカウント、`creators` は作品のcreatorまたは
+ * SuperSplatのCopy Creditが `by` として指定するattribution party。両者が同じ
+ * profileを指す場合でも、役割を混ぜず別フィールドに残す。
+ */
+export type SuperSplatAttribution = {
+  /** 信頼できるcreditを組み立てられたか。空文字を「取得不能」の意味にしない。 */
+  status: "complete" | "partial" | "unavailable";
+  /** そのまま表示できるcredit文。取得できなければ `null`。 */
+  text: string | null;
+  /** 元作品のcanonicalなSuperSplatシーンURL。 */
+  sourceUrl: string;
+  /** 構造化データまたはCopy Creditが指定するcreator / attribution party。 */
+  creators: SuperSplatAttributionParty[];
+  /** SuperSplatへ投稿したアカウント。creatorとは独立して扱う。 */
+  publisher: SuperSplatAttributionParty | null;
 };
 
 /**
@@ -215,6 +244,7 @@ export type SuperSplatResolution = {
   /** ここに来ている時点で必ず `true`。判定を通ったことを応答にも残す。 */
   downloadable: true;
   license: SuperSplatLicense;
+  attribution: SuperSplatAttribution;
   asset: SuperSplatAsset;
 };
 
@@ -387,12 +417,25 @@ const licenseFromUrl = (href: string): SuperSplatLicense | null => {
   if (!url || !/(^|\.)creativecommons\.org$/i.test(url.hostname)) return null;
   const path = url.pathname.toLowerCase();
   const zero = path.match(/\/publicdomain\/zero\/([\d.]+)/);
-  if (zero) return { code: `CC0-${zero[1]}`, label: `CC0 ${zero[1]}` };
-  if (path.startsWith("/publicdomain/mark")) return { code: "PDM-1.0", label: "Public Domain Mark 1.0" };
+  if (zero) return { code: `CC0-${zero[1]}`, label: `CC0 ${zero[1]}`, url: url.toString() };
+  if (path.startsWith("/publicdomain/mark")) {
+    return { code: "PDM-1.0", label: "Public Domain Mark 1.0", url: url.toString() };
+  }
   const cc = path.match(/\/licenses\/([a-z-]+)\/([\d.]+)/);
   if (!cc) return null;
   const terms = cc[1].toUpperCase();
-  return { code: `CC-${terms}-${cc[2]}`, label: `CC ${terms} ${cc[2]}` };
+  return { code: `CC-${terms}-${cc[2]}`, label: `CC ${terms} ${cc[2]}`, url: url.toString() };
+};
+
+/** コードだけからCreative Commonsのcanonical URLを組み立てられる場合に返す。 */
+const licenseUrlFromCode = (code: string): string | null => {
+  const cc0 = code.match(/^CC0-([\d.]+)$/i);
+  if (cc0) return `https://creativecommons.org/publicdomain/zero/${cc0[1]}/`;
+  if (/^PDM-1\.0$/i.test(code)) return "https://creativecommons.org/publicdomain/mark/1.0/";
+  const cc = code.match(/^CC-((?:BY|NC|ND|SA)(?:-(?:BY|NC|ND|SA))*)-([\d.]+)$/i);
+  return cc
+    ? `https://creativecommons.org/licenses/${cc[1].toLowerCase()}/${cc[2]}/`
+    : null;
 };
 
 /**
@@ -407,15 +450,23 @@ const licenseFromCode = (value: string): SuperSplatLicense | null => {
   const cc0 = text.match(/^cc[\s-]?0(?:[\s-]+([\d.]+))?$/i);
   if (cc0) {
     const version = cc0[1] ?? "1.0";
-    return { code: `CC0-${version}`, label: `CC0 ${version}` };
+    const code = `CC0-${version}`;
+    return { code, label: `CC0 ${version}`, url: licenseUrlFromCode(code) };
   }
   const cc = text.match(/^cc[\s-]+((?:by|nc|nd|sa)(?:[\s-]+(?:by|nc|nd|sa))*)[\s-]+([\d.]+)$/i);
   if (cc) {
     const terms = cc[1].replace(/[\s-]+/g, "-").toUpperCase();
-    return { code: `CC-${terms}-${cc[2]}`, label: `CC ${terms.replace(/-/g, "-")} ${cc[2]}` };
+    const code = `CC-${terms}-${cc[2]}`;
+    return {
+      code,
+      label: `CC ${terms.replace(/-/g, "-")} ${cc[2]}`,
+      url: licenseUrlFromCode(code),
+    };
   }
   // CC以外（`MIT` など）はそのまま通す。表記を作れる程度に短いものだけ。
-  if (/^[A-Za-z0-9][A-Za-z0-9.\-+ ]{0,48}$/.test(text)) return { code: text, label: text };
+  if (/^[A-Za-z0-9][A-Za-z0-9.\-+ ]{0,48}$/.test(text)) {
+    return { code: text, label: text, url: null };
+  }
   return null;
 };
 
@@ -434,13 +485,18 @@ const licenseFromValue = (value: unknown): SuperSplatLicense | null => {
       return {
         code: typeof code === "string" && code ? code : fromUrl.code,
         label: typeof label === "string" && label ? label : fromUrl.label,
+        url: fromUrl.url,
       };
     }
   }
   if (typeof code === "string" && code) {
     const normalized = licenseFromCode(code);
     if (normalized) {
-      return { code: normalized.code, label: typeof label === "string" && label ? label : normalized.label };
+      return {
+        code: normalized.code,
+        label: typeof label === "string" && label ? label : normalized.label,
+        url: normalized.url,
+      };
     }
   }
   if (typeof label === "string") return licenseFromCode(label);
@@ -552,6 +608,269 @@ export function readSuperSplatSceneMeta(html: string): SuperSplatSceneMeta {
     metaContent(html, ["author", "og:article:author", "twitter:creator"]);
 
   return { title, author };
+}
+
+const MAX_ATTRIBUTION_NAME_CHARS = 160;
+const MAX_ATTRIBUTION_TEXT_CHARS = 4_000;
+const MAX_ATTRIBUTION_URL_CHARS = 2_048;
+const PROFILE_NAME_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
+const CREATIVE_WORK_TYPES = new Set([
+  "3dmodel",
+  "creativework",
+  "dataset",
+  "imageobject",
+  "mediaobject",
+  "visualartwork",
+]);
+
+/** HTMLや制御文字を持ち越さず、表示用の短い文字列へ正規化する。 */
+const normalizedAttributionText = (
+  value: unknown,
+  maxChars: number,
+  preserveLines = false,
+): string => {
+  if (typeof value !== "string") return "";
+  const withoutMarkup = decodeEntities(value).replace(/<[^>]*>/g, " ").replace(/\r\n?/g, "\n");
+  const plain = [...withoutMarkup]
+    .filter((character) => {
+      const code = character.charCodeAt(0);
+      return character === "\n" || character === "\t" || (code >= 32 && code !== 127);
+    })
+    .join("");
+  const normalized = preserveLines
+    ? plain
+        .split("\n")
+        .map((line) => line.replace(/[\t ]+/g, " ").trim())
+        .filter(Boolean)
+        .join("\n")
+    : plain.replace(/\s+/g, " ").trim();
+  return normalized.slice(0, maxChars).trim();
+};
+
+const attributionUrl = (value: unknown, baseUrl?: string): string | null => {
+  if (typeof value !== "string" || value.length > MAX_ATTRIBUTION_URL_CHARS) return null;
+  let url: URL;
+  try {
+    url = new URL(value, baseUrl);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  if (url.username || url.password || !isPubliclyRoutableHost(url.hostname)) return null;
+  const normalized = url.toString();
+  return normalized.length <= MAX_ATTRIBUTION_URL_CHARS ? normalized : null;
+};
+
+const superSplatProfileUrl = (value: unknown): string | null => {
+  const url = attributionUrl(value, `https://${SUPERSPLAT_HOST}/`);
+  if (!url) return null;
+  const parsed = new URL(url);
+  if (parsed.hostname.toLowerCase() !== SUPERSPLAT_HOST) return null;
+  const username = parsed.pathname.match(/^\/user\/([^/]+)\/?$/)?.[1] ?? "";
+  if (!PROFILE_NAME_PATTERN.test(username)) return null;
+  return `https://${SUPERSPLAT_HOST}/user/${username}`;
+};
+
+/** SSRで表示される投稿者profile chip。コメント投稿者など別のuser linkは拾わない。 */
+const profileFromChip = (html: string): SuperSplatAttributionParty | null => {
+  for (const match of html.matchAll(/<a\b([^>]*)>([\s\S]*?)<\/a\s*>/gi)) {
+    const attributes = match[1];
+    if (attributeOf(attributes, "data-testid") !== "view-user-link") continue;
+    const url = superSplatProfileUrl(attributeOf(attributes, "href"));
+    const fromText = normalizedAttributionText(textOf(match[2]), MAX_ATTRIBUTION_NAME_CHARS);
+    const fromUrl = url ? new URL(url).pathname.split("/").pop() ?? "" : "";
+    const name = fromText || fromUrl;
+    if (name) return { name, url };
+  }
+  return null;
+};
+
+/** React Router/devalueのflattened arrayから、オブジェクトのpropertyを1段だけ読む。 */
+const flatProperty = (
+  values: readonly unknown[],
+  record: Record<string, unknown>,
+  property: string,
+): unknown => {
+  for (const [encodedKey, reference] of Object.entries(record)) {
+    const keyIndex = encodedKey.match(/^_(\d+)$/)?.[1];
+    if (keyIndex === undefined || values[Number(keyIndex)] !== property) continue;
+    return typeof reference === "number" && reference >= 0 && reference < values.length
+      ? values[reference]
+      : reference;
+  }
+  return undefined;
+};
+
+type RouterSceneUser = { username: string; fullName: string };
+
+/**
+ * SSR末尾のReact Router loader dataからシーン投稿者を読む。
+ *
+ * devalue全体を復元せず、`splat` と `user` を併せ持つscene route recordの直下だけを
+ * 読む。Promise等の特殊タグを評価せず、scriptも実行しない。
+ */
+const routerSceneUser = (html: string): RouterSceneUser | null => {
+  const enqueue = /streamController\.enqueue\(\s*("(?:\\.|[^"\\])*")\s*\)/g;
+  for (const match of html.matchAll(enqueue)) {
+    let values: unknown;
+    try {
+      const serialized = JSON.parse(match[1]);
+      values = typeof serialized === "string" ? JSON.parse(serialized) : null;
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(values) || values.length > 100_000) continue;
+    for (const candidate of values) {
+      if (!candidate || Array.isArray(candidate) || typeof candidate !== "object") continue;
+      const route = candidate as Record<string, unknown>;
+      const splat = flatProperty(values, route, "splat");
+      const user = flatProperty(values, route, "user");
+      if (!splat || typeof splat !== "object" || !user || typeof user !== "object") continue;
+      const record = user as Record<string, unknown>;
+      const username = normalizedAttributionText(
+        flatProperty(values, record, "username"),
+        MAX_ATTRIBUTION_NAME_CHARS,
+      );
+      const fullName = normalizedAttributionText(
+        flatProperty(values, record, "fullName"),
+        MAX_ATTRIBUTION_NAME_CHARS,
+      );
+      if (username || fullName) return { username, fullName };
+    }
+  }
+  return null;
+};
+
+const partyFromValue = (value: unknown): SuperSplatAttributionParty | null => {
+  if (typeof value === "string") {
+    const name = normalizedAttributionText(value, MAX_ATTRIBUTION_NAME_CHARS);
+    return name ? { name, url: null } : null;
+  }
+  if (!value || Array.isArray(value) || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const name = normalizedAttributionText(
+    record.name ?? record.fullName ?? record.username,
+    MAX_ATTRIBUTION_NAME_CHARS,
+  );
+  if (!name) return null;
+  const rawUrl = record.url ?? record["@id"] ?? record.sameAs;
+  const url = Array.isArray(rawUrl)
+    ? rawUrl.map((item) => attributionUrl(item)).find((item) => item !== null) ?? null
+    : attributionUrl(rawUrl);
+  return { name, url };
+};
+
+const partiesFromValue = (value: unknown): SuperSplatAttributionParty[] => {
+  const values = Array.isArray(value) ? value : [value];
+  return values.map(partyFromValue).filter((party): party is SuperSplatAttributionParty => !!party);
+};
+
+type StructuredAttribution = {
+  creators: SuperSplatAttributionParty[];
+  creditLines: string[];
+};
+
+/** schema.orgの作品entityだけを見る。WebSiteのpublisherや説明文は対象外。 */
+const structuredAttribution = (html: string): StructuredAttribution => {
+  const creators: SuperSplatAttributionParty[] = [];
+  const creditLines: string[] = [];
+  const seen = new Set<unknown>();
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 8 || !value || typeof value !== "object" || seen.has(value)) return;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (const item of value) visit(item, depth + 1);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    const rawTypes = Array.isArray(record["@type"]) ? record["@type"] : [record["@type"]];
+    const isCreativeWork = rawTypes.some(
+      (type) => typeof type === "string" && CREATIVE_WORK_TYPES.has(type.toLowerCase()),
+    );
+    if (isCreativeWork) {
+      creators.push(...partiesFromValue(record.creator), ...partiesFromValue(record.author));
+      for (const raw of [record.creditText, record.copyrightNotice]) {
+        const lines = Array.isArray(raw) ? raw : [raw];
+        for (const line of lines) {
+          const text = normalizedAttributionText(line, MAX_ATTRIBUTION_TEXT_CHARS, true);
+          if (text) creditLines.push(text);
+        }
+      }
+    }
+    for (const child of Object.values(record)) visit(child, depth + 1);
+  };
+  for (const block of embeddedJsonBlocks(html)) visit(block, 0);
+
+  const uniqueCreators = creators.filter(
+    (party, index, all) =>
+      all.findIndex((candidate) => candidate.name === party.name && candidate.url === party.url) === index,
+  );
+  return {
+    creators: uniqueCreators.slice(0, 32),
+    creditLines: [...new Set(creditLines)].slice(0, 32),
+  };
+};
+
+const creditPartyText = (party: SuperSplatAttributionParty): string =>
+  party.url ? `${party.name} (${party.url})` : party.name;
+
+/**
+ * scene pageから、SuperSplat公式のCopy Creditと同じ意味を持つ帰属情報を読む。
+ * 説明文の自由記述から名前やURLを推測することはしない。
+ */
+export function readSuperSplatAttribution(
+  html: string,
+  sourceUrl: string,
+  title: string,
+  license: SuperSplatLicense,
+): SuperSplatAttribution {
+  const canonicalSource = parseSuperSplatUrl(sourceUrl)?.sceneUrl ?? sourceUrl;
+  const structured = structuredAttribution(html);
+  const routerUser = routerSceneUser(html);
+  const chip = profileFromChip(html);
+
+  const username = routerUser?.username || chip?.name || "";
+  const profileUrl = username
+    ? superSplatProfileUrl(`/user/${encodeURIComponent(username)}`) ?? chip?.url ?? null
+    : chip?.url ?? null;
+  const publisher = username ? { name: username, url: profileUrl } : chip;
+
+  // 明示的な作品creatorがあればそれを優先する。無ければSuperSplat自身の
+  // Copy Creditと同じ `fullName || username` をattribution partyとして使う。
+  const copyCreditCreator = routerUser?.fullName || username;
+  const metaAuthor = readSuperSplatSceneMeta(html).author;
+  const creators = structured.creators.length
+    ? structured.creators
+    : copyCreditCreator
+      ? [{ name: copyCreditCreator, url: profileUrl }]
+      : metaAuthor
+        ? [{ name: normalizedAttributionText(metaAuthor, MAX_ATTRIBUTION_NAME_CHARS), url: null }]
+        : [];
+
+  const lines: string[] = [];
+  if (title && creators.length) {
+    lines.push(`"${normalizedAttributionText(title, MAX_ATTRIBUTION_NAME_CHARS)}" by ${creators.map(creditPartyText).join(", ")}`);
+  }
+  lines.push(...structured.creditLines);
+  if (lines.length) {
+    lines.push(`Source: ${canonicalSource}`);
+    lines.push(
+      license.url
+        ? `Licensed under ${license.label} (${license.url})`
+        : `Licensed under ${license.label}`,
+    );
+  }
+  const text = lines.length
+    ? normalizedAttributionText(lines.join("\n"), MAX_ATTRIBUTION_TEXT_CHARS, true)
+    : null;
+  const status =
+    text && creators.length && publisher && license.url
+      ? "complete"
+      : text || creators.length || publisher
+        ? "partial"
+        : "unavailable";
+
+  return { status, text, sourceUrl: canonicalSource, creators, publisher };
 }
 
 // ダウンロード操作を表しうる要素。入れ子にならないタグだけを対象にするので、

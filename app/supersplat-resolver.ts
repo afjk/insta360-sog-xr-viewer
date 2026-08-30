@@ -30,6 +30,7 @@ import {
   findSuperSplatContentUrls,
   findSuperSplatViewerUrl,
   parseSuperSplatUrl,
+  readSuperSplatAttribution,
   readSuperSplatDownloadPermission,
   readSuperSplatSceneMeta,
   selectSuperSplatAsset,
@@ -160,6 +161,12 @@ export async function resolveSuperSplatScene(
   if (!asset) throw new SuperSplatError("SUPERSPLAT_ASSET_NOT_FOUND");
 
   const meta = readSuperSplatSceneMeta(scene.html);
+  const attribution = readSuperSplatAttribution(
+    scene.html,
+    share.sceneUrl,
+    meta.title,
+    permission.license,
+  );
   return {
     provider: "supersplat",
     sceneId: share.sceneId,
@@ -168,6 +175,7 @@ export async function resolveSuperSplatScene(
     author: meta.author,
     downloadable: true,
     license: permission.license,
+    attribution,
     // `streamed-sog` もそのまま返す。表示できるかどうかはViewerが決める。
     // 将来Streamed SOGへ対応するとき、resolverはこのままでよい。
     asset,

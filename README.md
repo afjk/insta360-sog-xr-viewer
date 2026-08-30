@@ -312,7 +312,7 @@ curl "https://insta360-sog-resolver.<account>.workers.dev/api/insta360?url=https
 # => {"shareId":"GS3DG…","assetUrl":"…","camerasUrl":"…"}   camerasUrl が無ければ古い版
 
 curl "https://insta360-sog-resolver.<account>.workers.dev/api/supersplat?url=https://superspl.at/scene/56155c3f"
-# => {"provider":"supersplat","sceneId":"56155c3f","title":"…","license":{…},"asset":{…}}
+# => {"provider":"supersplat","sceneId":"56155c3f","title":"…","license":{"code":"…","label":"…","url":"…"},"attribution":{"text":"…","sourceUrl":"…","creators":[…],"publisher":{…}},"asset":{…}}
 # 404 が返るなら SuperSplat 対応前の古い版
 ```
 
