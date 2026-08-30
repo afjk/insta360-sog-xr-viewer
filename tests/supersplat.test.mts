@@ -82,6 +82,24 @@ function scenePage(options: {
   </body></html>`;
 }
 
+/** 実ページのReact Router loader dataにあるscene userの最小fixture。 */
+function routerSceneData(username: string, fullName: string, title = "Lion") {
+  const flattened = [
+    { _1: 2, _3: 4 },
+    "splat",
+    { _5: 6 },
+    "user",
+    { _7: 8, _9: 10 },
+    "title",
+    title,
+    "username",
+    username,
+    "fullName",
+    fullName,
+  ];
+  return `<script>window.__reactRouterContext.streamController.enqueue(${JSON.stringify(JSON.stringify(flattened))});</script>`;
+}
+
 /** 埋め込みJSONに真偽値を持つscene page。第一優先の経路を確かめるためのもの。 */
 function sceneWithFlag(downloadable: boolean | null, license = "CC BY 4.0") {
   const scene: Record<string, unknown> = { id: SCENE_ID, title: "Lion", license };
@@ -412,25 +430,11 @@ test("reads an author when the page names one", () => {
 test("returns the real 56155c3f profile and Copy Credit without repurposing legacy author", () => {
   // 実ページはmeta authorを持たない。投稿者chipとReact Router loader dataには
   // username=rohls / fullName=Renaud があり、公式Copy CreditはfullNameを使う。
-  const flattened = [
-    { _1: 2, _3: 4 },
-    "splat",
-    { _5: 6 },
-    "user",
-    { _7: 8, _9: 10 },
-    "title",
-    "Lion",
-    "username",
-    "rohls",
-    "fullName",
-    "Renaud",
-  ];
-  const loader = `window.__reactRouterContext.streamController.enqueue(${JSON.stringify(JSON.stringify(flattened))});`;
   const html = scenePage({
     author: null,
     extraBody:
       `<a data-testid="view-user-link" href="/user/rohls">rohls</a>` +
-      `<script>${loader}</script>`,
+      routerSceneData("rohls", "Renaud"),
   });
 
   assert.equal(readSuperSplatSceneMeta(html).author, "");
@@ -450,6 +454,7 @@ test("keeps multiple structured creators and credit lines separate from the publ
   const structured = {
     "@context": "https://schema.org",
     "@type": "3DModel",
+    url: SCENE_URL,
     creator: [
       { "@type": "Person", name: "Joanna Kobierska", url: "https://artist.example/joanna" },
       { "@type": "Person", name: "Ken Barthelmey", url: "https://artist.example/ken" },
@@ -477,6 +482,135 @@ test("keeps multiple structured creators and credit lines separate from the publ
   assert.match(attribution.text ?? "", /Reconstruction: Museum Lab/);
   assert.match(attribution.text ?? "", /Scan: Field Team/);
   assert.doesNotMatch(attribution.text ?? "", /<b>/);
+});
+
+test("ignores another scene's structured creator and keeps the current Copy Credit owner", () => {
+  const recommended = {
+    "@context": "https://schema.org",
+    "@type": "3DModel",
+    name: "Lion",
+    url: "https://superspl.at/scene/deadbeef",
+    creator: { "@type": "Person", name: "Recommended Artist" },
+  };
+  const html = scenePage({
+    author: null,
+    extraBody:
+      `<a data-testid="view-user-link" href="/user/rohls">rohls</a>` +
+      routerSceneData("rohls", "Renaud") +
+      `<script type="application/ld+json">${JSON.stringify(recommended)}</script>`,
+  });
+  const attribution = readSuperSplatAttribution(html, SCENE_URL, "Lion", CC_BY_LICENSE);
+
+  assert.deepEqual(attribution.creators, [
+    { name: "Renaud", url: "https://superspl.at/user/rohls" },
+  ]);
+  assert.doesNotMatch(attribution.text ?? "", /Recommended Artist/);
+});
+
+test("takes only the CreativeWork whose url or @id matches the current scene", () => {
+  const graph = {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "3DModel",
+        name: "Lion",
+        url: "https://superspl.at/scene/deadbeef",
+        creator: { name: "Other Scene Artist" },
+      },
+      {
+        "@type": "3DModel",
+        name: "Not used for matching",
+        "@id": `https://superspl.at/s?id=${SCENE_ID}#work`,
+        creator: { name: "Current Scene Artist" },
+      },
+    ],
+  };
+  const html = scenePage({
+    author: null,
+    extraBody: `<script type="application/ld+json">${JSON.stringify(graph)}</script>`,
+  });
+  const attribution = readSuperSplatAttribution(html, SCENE_URL, "Lion", CC_BY_LICENSE);
+
+  assert.deepEqual(attribution.creators, [{ name: "Current Scene Artist", url: null }]);
+  assert.doesNotMatch(attribution.text ?? "", /Other Scene Artist/);
+});
+
+test("does not mix another scene's creditText or copyrightNotice into the credit", () => {
+  const graph = {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "3DModel",
+        url: SCENE_URL,
+        creator: { name: "Current Scene Artist" },
+        creditText: "Current scene credit",
+      },
+      {
+        "@type": "3DModel",
+        url: "https://superspl.at/scene/deadbeef",
+        creator: { name: "Other Scene Artist" },
+        creditText: "Foreign scene credit",
+        copyrightNotice: "Foreign copyright notice",
+      },
+    ],
+  };
+  const html = scenePage({
+    author: null,
+    extraBody: `<script type="application/ld+json">${JSON.stringify(graph)}</script>`,
+  });
+  const text = readSuperSplatAttribution(html, SCENE_URL, "Lion", CC_BY_LICENSE).text ?? "";
+
+  assert.match(text, /Current scene credit/);
+  assert.doesNotMatch(text, /Foreign scene credit|Foreign copyright notice|Other Scene Artist/);
+});
+
+test("matches a CreativeWork through mainEntityOfPage @id", () => {
+  const structured = {
+    "@context": "https://schema.org",
+    "@type": "CreativeWork",
+    mainEntityOfPage: { "@id": `${SCENE_URL}#scene` },
+    creator: { name: "Linked Artist" },
+  };
+  const html = scenePage({
+    author: null,
+    extraBody: `<script type="application/ld+json">${JSON.stringify(structured)}</script>`,
+  });
+  const attribution = readSuperSplatAttribution(html, SCENE_URL, "Lion", CC_BY_LICENSE);
+
+  assert.deepEqual(attribution.creators, [{ name: "Linked Artist", url: null }]);
+  assert.match(attribution.text ?? "", /Linked Artist/);
+});
+
+test("falls back from unrelated structured data and never completes with its creator", () => {
+  const otherScene = {
+    "@context": "https://schema.org",
+    "@type": "3DModel",
+    url: "https://superspl.at/scene/deadbeef",
+    creator: { name: "Wrong Artist" },
+    creditText: "Wrong credit",
+  };
+  const script = `<script type="application/ld+json">${JSON.stringify(otherScene)}</script>`;
+  const withRouter = scenePage({
+    author: null,
+    extraBody: routerSceneData("rohls", "Renaud") + script,
+  });
+  const fallback = readSuperSplatAttribution(withRouter, SCENE_URL, "Lion", CC_BY_LICENSE);
+  assert.deepEqual(fallback.creators, [
+    { name: "Renaud", url: "https://superspl.at/user/rohls" },
+  ]);
+  assert.doesNotMatch(fallback.text ?? "", /Wrong Artist|Wrong credit/);
+
+  const withoutFallback = scenePage({ author: null, extraBody: script });
+  assert.deepEqual(
+    readSuperSplatAttribution(withoutFallback, SCENE_URL, "Lion", CC_BY_LICENSE),
+    {
+      status: "unavailable",
+      text: null,
+      sourceUrl: SCENE_URL,
+      creators: [],
+      publisher: null,
+    },
+  );
 });
 
 test("reports attribution as unavailable instead of guessing names from description prose", () => {

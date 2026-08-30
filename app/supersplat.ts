@@ -770,8 +770,44 @@ type StructuredAttribution = {
   creditLines: string[];
 };
 
-/** schema.orgの作品entityだけを見る。WebSiteのpublisherや説明文は対象外。 */
-const structuredAttribution = (html: string): StructuredAttribution => {
+/** schema.orgの識別子。オブジェクト表現では直下の `url` / `@id` を読む。 */
+const structuredIdentifierUrls = (value: unknown, depth = 0): string[] => {
+  if (depth > 4) return [];
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => structuredIdentifierUrls(item, depth + 1));
+  }
+  if (!value || typeof value !== "object") return [];
+  const record = value as Record<string, unknown>;
+  return [record.url, record["@id"]].flatMap((identifier) =>
+    typeof identifier === "string" || Array.isArray(identifier)
+      ? structuredIdentifierUrls(identifier, depth + 1)
+      : [],
+  );
+};
+
+/** CreativeWorkの識別子が、現在解決中のSuperSplat scene IDを指すか。 */
+const structuredWorkMatchesScene = (
+  record: Record<string, unknown>,
+  sourceUrl: string,
+): boolean => {
+  const current = parseSuperSplatUrl(sourceUrl);
+  if (!current) return false;
+  const identifiers = [record.url, record["@id"], record.mainEntityOfPage].flatMap(
+    structuredIdentifierUrls,
+  );
+  return identifiers.some((identifier) => {
+    const normalized = attributionUrl(identifier, current.sceneUrl);
+    const linked = normalized ? parseSuperSplatUrl(normalized) : null;
+    return linked?.sceneId === current.sceneId;
+  });
+};
+
+/**
+ * 現在のsceneに紐付くschema.org作品entityだけを見る。
+ * WebSite、別sceneのおすすめ作品、説明文は対象外。
+ */
+const structuredAttribution = (html: string, sourceUrl: string): StructuredAttribution => {
   const creators: SuperSplatAttributionParty[] = [];
   const creditLines: string[] = [];
   const seen = new Set<unknown>();
@@ -787,7 +823,7 @@ const structuredAttribution = (html: string): StructuredAttribution => {
     const isCreativeWork = rawTypes.some(
       (type) => typeof type === "string" && CREATIVE_WORK_TYPES.has(type.toLowerCase()),
     );
-    if (isCreativeWork) {
+    if (isCreativeWork && structuredWorkMatchesScene(record, sourceUrl)) {
       creators.push(...partiesFromValue(record.creator), ...partiesFromValue(record.author));
       for (const raw of [record.creditText, record.copyrightNotice]) {
         const lines = Array.isArray(raw) ? raw : [raw];
@@ -825,7 +861,7 @@ export function readSuperSplatAttribution(
   license: SuperSplatLicense,
 ): SuperSplatAttribution {
   const canonicalSource = parseSuperSplatUrl(sourceUrl)?.sceneUrl ?? sourceUrl;
-  const structured = structuredAttribution(html);
+  const structured = structuredAttribution(html, canonicalSource);
   const routerUser = routerSceneUser(html);
   const chip = profileFromChip(html);
 
