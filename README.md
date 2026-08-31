@@ -80,6 +80,11 @@ unbundled SOGも `meta.json` という名前なので、URLの形では見分け
 - コンテナの座標系はCOLMAP由来のY-downなので、SuperSplatの公開SOGと同じZ軸まわり180°で
   置いています（KISS-GS公式ビューアのシーン既定回転 `[0, 0, 1, 0]` と同じ）。公式ページが
   シーンごとに掛けている傾き補正はコンテナ側の情報ではないので、こちらでは適用しません。
+  そのぶん空間の「上」がworldの+Yからずれます（公式の値から逆算すると
+  MipNeRF360-Gardenで28.1°、ほぼX軸まわり）。見やすい位置と向きを選んだうえで
+  [視点ごと渡す](#視点ごと渡すview)と、受け取った側も同じ見え方から始められます。
+  ただしカメラのyaw/pitchでは、見る向きによってはこの傾きを水平に戻しきれません
+  （真横から見るとrollとして残ります）。空間の姿勢そのものを共有する仕組みは未実装です。
 - SOG-XTには[VR向けSOGの生成](#vr向けsogの生成)を適用できません。既存のoptimizerはSOG
   バンドルのバイト列を前提にしているためで、Originalのままの表示はDesktopでもWebXRでも
   通常どおり動きます。
@@ -88,45 +93,75 @@ unbundled SOGも `meta.json` という名前なので、URLの形では見分け
 
 ### 空間を別の端末へ渡す
 
-Insta360共有URLやSuperSplatのシーンURLから読み込むと、アドレスバーが自動で
-Viewer専用のリンクになります。載るのは提供元ごとの恒久的なIDだけです。
+URLから読み込んだ空間は、アドレスバーが自動でViewer専用のリンクになります。載るのは
+提供元ごとの恒久的なIDか、正規化したアセットのURLだけです。
 
 ```
 https://afjk.github.io/insta360-sog-xr-viewer/?id=GS3DGbfd0ddd0dd4a47ccba4d3d2c2eed8a4d
 https://afjk.github.io/insta360-sog-xr-viewer/?ss=56155c3f
+https://afjk.github.io/insta360-sog-xr-viewer/?url=https%3A%2F%2Fexample.com%2Fspaces%2Froom.sog
 ```
 
 | パラメータ | 提供元 | 値 |
 | --- | --- | --- |
 | `id` | Insta360 Spatial Capture | 共有ID (`GS3DG…`) |
 | `ss` | SuperSplat | シーンID (`56155c3f`) |
+| `url` | Viewerが直接取りに行くアセット | アセットのURL |
 
-`id` と `ss` の両方が載った異常なURLでは、**先に配ってある `id` を優先**し、`ss` は
-無視します。片方だけが有効で、`id` の形が合わなければ `ss` へは落ちずサンプルを
-表示します。
+`url` はresolverを通さない空間——`.sog` の直接URL、PlayCanvasのunbundled SOG
+（`meta.json`）、KISS-GSのSOG-XT——のためのものです。これらは提供元側にIDが無く、
+URLそのものが恒久的な識別子になります。**KISS-GS専用のリンク形式は作っていません。**
+どの形式かは開けば分かるので、リンクには載せません。
+
+KISS-GS SOG-XTでは、ディレクトリURLで開いても共有されるのは解決後の `meta.json` の
+URLです。同じ空間は常に同じリンクになります。
+
+```
+# ディレクトリURLで開いても…
+https://fraunhoferhhi.github.io/KISS-GS/viewer/scenes/index.sog-xt.assets/S/MipNeRF360-Garden
+
+# 共有されるのは meta.json のURL
+https://afjk.github.io/insta360-sog-xr-viewer/?url=https%3A%2F%2Ffraunhoferhhi.github.io%2FKISS-GS%2Fviewer%2Fscenes%2Findex.sog-xt.assets%2FS%2FMipNeRF360-Garden%2Fmeta.json
+```
+
+`http:` と `https:` だけを受け付けます。`blob:` / `data:` / `file:` は受け取った側の
+端末では開けないので、リンクを作りません。ローカルファイルとサンプルも同じ理由で
+共有できません（コピーのボタンが出ません）。
+
+複数の空間パラメータが載った異常なURLでは、**先に配ってある順に `id` → `ss` → `url`**
+の優先で読みます。先に見つかったパラメータだけを見て、その形が合わなければ後ろへは
+落ちずサンプルを表示します。
 
 このURLをQuestやPICOのブラウザで開くと、**サンプルを経由せず**その空間だけを読み込みます。
 画面右下の「この空間のリンクをコピー」で同じURLをクリップボードへ入れられます。
 
-載せるのは共有ID (`GS3DG…`) だけです。解決した署名付きSOGのURLには有効期限と
-`x-oss-signature` が付いているので、アドレスバーにも共有リンクにも出しません。開くたびに
-resolverが取り直します。
+Insta360とSuperSplatで載せるのは共有ID／シーンIDだけです。解決した署名付きSOGのURLには
+有効期限と `x-oss-signature` が付いているので、アドレスバーにも共有リンクにも出しません。
+開くたびにresolverが取り直します。
 
 URLの組み立ては `URL` / `URLSearchParams` で行うので、GitHub Pagesのサブパス配信でも
-localhostでも、開いているのと同じ配信先のリンクになります。サンプル・ローカルファイル・
-`.sog` の直接URLへ切り替えると、古い `?id=` は消えます。
+localhostでも、開いているのと同じ配信先のリンクになります。`?url=` の値のエンコードも
+`URLSearchParams` に任せます。サンプルやローカルファイルへ切り替えると、古い
+`?id=` / `?ss=` / `?url=` は消えます。
 
-`id` の形が合わない場合はネットワークへ出さず、通常どおりサンプルを表示します。実装は
+IDやURLの形が合わない場合はネットワークへ出さず、通常どおりサンプルを表示します。実装は
 `app/permalink.ts` にまとまっています。
 
 ### 視点ごと渡す（`view=`）
 
-`?id=` だけのリンクはその空間の既定視点で開きます。**いま見えている場所と向き**ごと渡したい
-ときは、画面右下の「この視点のリンクをコピー」を使います。
+空間だけのリンクはその空間の既定視点で開きます。**いま見えている場所と向き**ごと渡したい
+ときは、画面右下の「この視点のリンクをコピー」を使います。`view=` は空間の指し方に
+よらず同じ形式なので、`?id=` にも `?ss=` にも `?url=` にも同じように足せます。
 
 ```
 https://afjk.github.io/insta360-sog-xr-viewer/?id=GS3DG…&view=1_-1.234_1.62_3.5_137.5_-4.58_2.8
+https://afjk.github.io/insta360-sog-xr-viewer/?url=https%3A%2F%2F…%2Fmeta.json&view=1_-1.234_1.62_3.5_137.5_-4.58_2.8
 ```
+
+KISS-GS SOG-XTのように、こちらで正しい水平姿勢を復元できない空間では、これが
+「見やすい向きを共有する」いちばん簡単な手段になります。Viewerで見やすい位置と向きへ
+移動してから視点リンクをコピーすれば、受け取った側もDesktopでもVRでも同じ見え方から
+始められます。
 
 `view=` は版数と6つの数値です。区切りの `_` は `URLSearchParams` がエンコードしない文字なので、
 リンクはそのまま読める長さに収まります。

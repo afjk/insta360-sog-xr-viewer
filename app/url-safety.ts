@@ -45,3 +45,32 @@ export function hasHostSuffix(hostname: string, suffixes: readonly string[]): bo
   const host = hostname.toLowerCase();
   return suffixes.some((suffix) => host === suffix || host.endsWith(`.${suffix}`));
 }
+
+/**
+ * コンテナ形式（`meta.json` ＋ 画像群）のメタデータURL。
+ *
+ * PlayCanvasのunbundled SOGも、KISS-GSのSOG-XTも、ディレクトリの中に
+ * `meta.json` を置いて、その隣の画像を相対パスで参照する。Viewerはどちらの
+ * 形式でも「`meta.json` そのもののURL」と「それが置いてあるディレクトリの
+ * URL」の両方を受け付けるので、その2つを1つのURLへ寄せる規則をここに置く。
+ *
+ * 読み込みの入口（どのファイルを取りに行くか）と、パーマリンクの
+ * 正規化（同じ空間かどうか）が同じ規則を見る必要があるため、共通化してある。
+ *
+ * ディレクトリかどうかは「最後のセグメントに拡張子が無い」で決める。
+ * `.sog` のようにファイルを名指ししているURLは対象外で `null` を返す。
+ */
+export const CONTAINER_METADATA_FILENAME = "meta.json";
+
+export function containerMetadataUrl(url: URL): { metadata: URL; base: URL } | null {
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+  const last = url.pathname.split("/").pop() ?? "";
+  if (last.toLowerCase() === CONTAINER_METADATA_FILENAME) {
+    return { metadata: new URL(url.href), base: new URL(".", url) };
+  }
+  if (last === "" || !/\.[a-z0-9]+$/i.test(last)) {
+    const base = new URL(last === "" ? "./" : `${last}/`, url);
+    return { metadata: new URL(CONTAINER_METADATA_FILENAME, base), base };
+  }
+  return null;
+}
