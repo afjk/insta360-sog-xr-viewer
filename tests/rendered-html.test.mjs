@@ -119,7 +119,7 @@ test("loads arbitrary SOG sources while keeping the bundled sample as default", 
   // The bundled sample stays the auto-loaded default.
   assert.match(
     viewer,
-    /useState<ViewerSource>\(\{\s*\n\s*kind: "sample",\s*\n\s*provider: "sample",\s*\n\s*label: SAMPLE_LABEL,\s*\n\s*\}\)/,
+    /useState<ViewerSource>\(\{\s*\n\s*kind: "sample",\s*\n\s*provider: "sample",\s*\n\s*format: "sog",\s*\n\s*label: SAMPLE_LABEL,\s*\n\s*\}\)/,
   );
   assert.match(viewer, /else void loadSample\(true\);/);
 
@@ -136,9 +136,9 @@ test("loads arbitrary SOG sources while keeping the bundled sample as default", 
   assert.match(viewer, /サンプルに戻す/);
 
   // Swapping sources replaces the GSplat and reports progress and errors.
-  assert.match(viewer, /splatComponent\.asset = asset/);
+  assert.match(viewer, /splatComponent\.asset = entry\.asset/);
   assert.match(viewer, /app\.assets\.remove\(entry\.asset\)/);
-  assert.match(viewer, /releaseAsset\(previous\)/);
+  assert.match(viewer, /releaseEntry\(previous\)/);
   assert.match(viewer, /setSourceProgress/);
   assert.match(viewer, /setSourceError/);
 
@@ -173,13 +173,20 @@ test("opens a shared space straight from ?id= without touching the sample", asyn
   assert.equal(viewer.match(/downloadSog\(SAMPLE_URL/g)?.length, 1);
 
   // 出どころは表示中のソースにproviderとして残し、ラベルの読み直しでは判断しない。
-  assert.match(viewer, /type SourceProvider = "sample" \| "file" \| "direct" \| "insta360" \| "supersplat";/);
+  assert.match(
+    viewer,
+    /type SourceProvider = "sample" \| "file" \| "direct" \| "insta360" \| "supersplat" \| "kiss-gs";/,
+  );
   assert.match(viewer, /provider: SourceProvider;/);
+  // 中身の形式も同じように明示で持つ。SOGとSOG-XTはどちらも `meta.json` を
+  // 名乗るので、後からURLやラベルの文字列で見分けにいかない。
+  assert.match(viewer, /type SourceFormat = "sog" \| "sog-xt";/);
+  assert.match(viewer, /format: SourceFormat;/);
   assert.match(viewer, /const next: ViewerSource = \{\s*\n\s*kind: request\.kind === "file" \? "file" : "url",\s*\n\s*provider,/);
   // サンプルは共有IDを持たない。ローカルファイルと直接URLも shareId が undefined のまま。
   assert.match(
     viewer,
-    /showOriginal\(\{ kind: "sample", provider: "sample", label: SAMPLE_LABEL \}, buffer\)/,
+    /\{ kind: "sample", provider: "sample", format: "sog", label: SAMPLE_LABEL \},/,
   );
   assert.match(viewer, /shareId = share\.shareId/);
 
@@ -268,7 +275,89 @@ test("restores the linked view on desktop and spawns XR from the rig", async () 
   assert.match(viewer, /if \(xrDebug\) \{/);
   // 初期視点の根拠（`cameras.json` が届いたか）も同じフラグで出す。
   assert.match(viewer, /console\.info\("\[sog-xr\] initial"/);
-  assert.equal(viewer.match(/console\.info/g)?.length, 3);
+  // SOG-XTの内訳とベンチマークも同じフラグの下だけ。
+  assert.match(viewer, /console\.info\("\[sog-xr\] sog-xt"/);
+  assert.match(viewer, /console\.info\("\[sog-xr\] benchmark"/);
+  assert.equal(viewer.match(/console\.info/g)?.length, 5);
+});
+
+test("decodes KISS-GS SOG-XT in a worker and hands PlayCanvas the attributes directly", async () => {
+  const [viewer, decoder, bridge, worker, image] = await Promise.all([
+    readFile(new URL("../app/SogViewer.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/sog-xt.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/sog-xt-playcanvas.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/sog-xt.worker.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/sog-image.ts", import.meta.url), "utf8"),
+  ]);
+
+  // SOG-XT固有の処理はSogViewer.tsxの外。ここが薄いままであることを縛る。
+  assert.match(viewer, /import \{ createSogXtResource \} from "\.\/sog-xt-playcanvas"/);
+  assert.match(viewer, /await showSogXt\(\s*\n\s*next,\s*\n\s*sogXtMetadataUrl,/);
+  assert.doesNotMatch(viewer, /signedExpm1|observedRange|centroidSide/);
+
+  // 判定は取得した meta.json の `format`。URLやラベルの文字列では決めない。
+  assert.match(viewer, /const isSogXt = await probeSogXt\(metadataUrl\)|isSogXt = await probeSogXt\(metadataUrl\)/);
+  assert.match(viewer, /return isSogXtMetadata\(payload\)/);
+  assert.match(decoder, /export const SOG_XT_FORMAT = "sog-xt"/);
+  assert.match(decoder, /input\.format !== SOG_XT_FORMAT/);
+  // PlayCanvas標準のSOGは従来どおりPlayCanvasのローダーへ回す。
+  assert.match(viewer, /remote = \{ url: metadataUrl, filename: "meta\.json" \}/);
+
+  // デコードはWorkerで、画素の読み出しは既存のImageReaderを共有する。
+  assert.match(viewer, /new Worker\(new URL\("\.\/sog-xt\.worker\.ts", import\.meta\.url\)/);
+  assert.match(worker, /import \{ createImageReader, type ImageReader \} from "\.\/sog-image\.ts"/);
+  assert.match(image, /export function createImageReader\(\)/);
+  assert.match(image, /UNPACK_PREMULTIPLY_ALPHA_WEBGL, false/);
+  // 属性配列はTransferableで返す。main threadでのコピーは起きない。
+  assert.match(worker, /worker\.postMessage\(result, transferablesOf\(result\.decoded\)\)/);
+  // Workerは読み込みごとの使い捨て。使い回すと、途中で空間を切り替えたときに
+  // 前の読み込みの応答が後の読み込みのハンドラへ届く。
+  assert.match(viewer, /cancelSogXt\(new Error\(SOG_XT_SUPERSEDED\)\);\s*\n\s*const worker = new Worker/);
+  assert.match(viewer, /if \(!isCurrent\(\)\) return;\s*\n\s*onStage\("PlayCanvasへ転送中"/);
+  // デコード中は描画を止める。表示中の空間を描いているコンテキストとGPUを
+  // 取り合うと、Workerの `readPixels` が桁で遅くなる。
+  assert.match(viewer, /const wasAutoRendering = app\.autoRender;\s*\n\s*app\.autoRender = false;/);
+  assert.match(viewer, /\} finally \{\s*\n\s*app\.autoRender = wasAutoRendering;/);
+
+  // 中間PLYは作らない。GSplatData / GSplatResource をそのまま使う。
+  assert.match(bridge, /import \{ GSplatData, GSplatResource \} from "playcanvas"/);
+  assert.match(bridge, /return new GSplatResource\(device, data\)/);
+  assert.match(viewer, /splatComponent\.resource = entry\.resource/);
+  // 中間表現を作っていないことは「Blob・object URL・Assetを一切作らない」で縛る。
+  // PLYを挟むならこのどれかが必ず要る。
+  assert.doesNotMatch(bridge, /new Blob|createObjectURL|new Asset/);
+  assert.doesNotMatch(worker, /new Blob|createObjectURL|new Asset/);
+
+  // activated形式で渡す。落とすとscaleがexpで巨大になり、opacityが飽和する。
+  assert.match(bridge, /data\.activated = true/);
+  // quaternionはxyzwで持ち、PlayCanvasのwxyz（rot_0 = w）へ並べ替える。
+  assert.match(bridge, /prop\("rot_0", slice\(decoded\.rotation, 3\)\)/);
+
+  // 既存のVR optimizerはSOG-XTには掛けない。理由は画面に出す。
+  assert.match(viewer, /const SOG_XT_OPTIMIZE_REASON =/);
+  assert.match(viewer, /SOG_XT_OPTIMIZE_REASON,/);
+  // 既存のoptimizerとその経路はそのまま残っている。
+  assert.match(viewer, /new Worker\(new URL\("\.\/sog-optimizer\.worker\.ts", import\.meta\.url\)/);
+  assert.match(viewer, /chooseSplatIndices|runOptimizer/);
+
+  // エラーは段階ごとに区別する。表示は日本語、元のエラーはdebug consoleへ。
+  for (const code of [
+    "METADATA_DOWNLOAD_FAILED",
+    "METADATA_INVALID",
+    "UNSUPPORTED_VERSION",
+    "IMAGE_DOWNLOAD_FAILED",
+    "IMAGE_DECODE_FAILED",
+    "INCONSISTENT_SPLAT_COUNT",
+    "UNSUPPORTED_SH",
+    "RESOURCE_CREATION_FAILED",
+  ]) {
+    assert.match(decoder, new RegExp(`${code}:`));
+  }
+  assert.match(viewer, /console\.warn\("\[sog-xr\] sog-xt error", message\.code, message\.detail\)/);
+
+  // 計測は performance.mark / measure も併用する。
+  assert.match(viewer, /performance\.measure\?\.\("sog-xt:load"/);
+  assert.match(worker, /performance\.measure\?\.\("sog-xt:worker"/);
 });
 
 test("builds and deploys a repository-relative GitHub Pages site", async () => {
