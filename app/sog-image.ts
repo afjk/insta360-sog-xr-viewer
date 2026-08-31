@@ -24,11 +24,16 @@ export function mimeTypeFor(filename: string): string {
   return MIME_TYPES[extension] ?? "application/octet-stream";
 }
 
-/** 最適化に必要なAPIが揃っているか。足りない理由はそのままUIに出す。 */
-export function optimizationUnsupportedReason(): string | null {
+/**
+ * `createImageReader()` が使えるか。足りない理由はそのままUIに出す。
+ *
+ * 画素を壊さずに読むのに要るのは OffscreenCanvas ／ createImageBitmap ／
+ * WebGL2 の3つだけ。再エンコードを伴わない読み出し専用の用途（SOG-XT）は
+ * これで足りる。
+ */
+export function imageReaderUnsupportedReason(): string | null {
   if (typeof OffscreenCanvas === "undefined") return "このブラウザはOffscreenCanvasに対応していません。";
   if (typeof createImageBitmap === "undefined") return "このブラウザはcreateImageBitmapに対応していません。";
-  if (typeof CompressionStream === "undefined") return "このブラウザはCompressionStreamに対応していません。";
   try {
     const probe = new OffscreenCanvas(1, 1).getContext("webgl2");
     if (!probe) return "このブラウザではWebGL2を利用できません。";
@@ -37,6 +42,12 @@ export function optimizationUnsupportedReason(): string | null {
     return "このブラウザではWebGL2を利用できません。";
   }
   return null;
+}
+
+/** 最適化に必要なAPIが揃っているか。読み出しに加えてPNGの再圧縮も要る。 */
+export function optimizationUnsupportedReason(): string | null {
+  if (typeof CompressionStream === "undefined") return "このブラウザはCompressionStreamに対応していません。";
+  return imageReaderUnsupportedReason();
 }
 
 export function createImageReader(): ImageReader {

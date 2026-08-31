@@ -25,11 +25,66 @@ PlayCanvasとWebXRを使い、Insta360 Spatial CaptureのSOG形式3D Gaussian Sp
   公開シーンのみ対応**します。こちらも解決にはサーバー側のエンドポイントが必要です。
   詳しくは[SuperSplat公開シーンURLの解決について](#supersplat公開シーンurlの解決について)を
   参照してください。
+- **KISS-GS SOG-XTのURL**: コンテナの `meta.json` のURL、またはそれが置いてある
+  ディレクトリのURLを指定します。詳しくは[KISS-GS SOG-XT](#kiss-gs-sog-xt)を参照してください。
 - **`?id=` / `?ss=` 付きのViewer URL**: 一度開いた空間はリンクとして配れます。
   [空間を別の端末へ渡す](#空間を別の端末へ渡す)を参照してください。視点ごと渡したいときは
   [視点ごと渡す](#視点ごと渡すview)を参照してください。
 
 読み込んだ空間はDesktopでもWebXRでも閲覧でき、「サンプルに戻す」でいつでも元に戻せます。
+
+### KISS-GS SOG-XT
+
+[KISS-GS](https://fraunhoferhhi.github.io/KISS-GS/)（Fraunhofer HHI, ECCV 2026）が使う
+**SOG-XT** コンテナを、そのまま読み込めます。PlayCanvasのSOGとは別形式なので、専用の
+デコーダ（`app/sog-xt.ts` / `app/sog-xt.worker.ts` / `app/sog-xt-playcanvas.ts`）を通ります。
+
+入力できるURLは2通りです。
+
+```
+# コンテナの meta.json
+https://fraunhoferhhi.github.io/KISS-GS/viewer/scenes/index.sog-xt.assets/M/MipNeRF360-Garden/meta.json
+
+# 同じディレクトリを指すURL（meta.json を補って開きます）
+https://fraunhoferhhi.github.io/KISS-GS/viewer/scenes/index.sog-xt.assets/M/MipNeRF360-Garden
+```
+
+サイズ段階は `XXS` / `XS` / `S` / `M` / `L` / `XL` / `XXL` で、`M` のGardenが約26万点・約3.8 MBです。
+
+SOG-XTかどうかは、取得した `meta.json` の `format` フィールドで判定します。PlayCanvas標準の
+unbundled SOGも `meta.json` という名前なので、URLの形では見分けません。`format` が `sog-xt`
+でなければ、従来どおりPlayCanvasのSOGローダーへ渡します。
+
+#### 中身と復元の対応
+
+| コンテナ | 格納されているもの | 復元後（PlayCanvasへ渡す形） |
+| --- | --- | --- |
+| `means_bytes_0/1.webp` | signed-log空間の値を16bit量子化して上位／下位バイトに分けたもの | `x` / `y` / `z`（線形の位置） |
+| `scales.webp` | log空間のスケール | `scale_0..2`（**線形**） |
+| `quaternions.webp` | 回転を **wxyz** 順で量子化 | `rot_0..3`（PlayCanvasも wxyz、`rot_0` が w） |
+| `opacities.webp` | pre-sigmoid（logit）の不透明度 | `opacity`（**sigmoid適用済み**） |
+| `f_dc.webp` | SHのDC係数 | `f_dc_0..2`（色ではなく係数のまま） |
+| `f_rest_centroids/labels.webp` | SHのコードブックと索引 | `f_rest_0..44`（PLYと同じ `channel * 15 + coeff` の並び） |
+| `active_mask.webp` | 使うグリッドセル | 立っていないセルは出力から落とす |
+
+スケールと不透明度を**活性化済み**の値で渡すため、`GSplatData.activated = true` を立てます。
+これを落とすとPlayCanvasがlog／pre-sigmoidとして読み直し、splatが巨大になり不透明度が飽和します。
+
+各ストリームの量子化は固定の0〜255ではなく、**画像全体から観測した最小／最大**で正規化されて
+います（`meta.json` の `normalize: "observed-minmax"`）。実データでも quaternions と
+`f_rest_centroids` の観測レンジは 0〜99 でした。0〜255決め打ちで復元すると回転と視点依存の色が
+ずれます。
+
+#### 制限
+
+- コンテナの座標系はCOLMAP由来のY-downなので、SuperSplatの公開SOGと同じZ軸まわり180°で
+  置いています（KISS-GS公式ビューアのシーン既定回転 `[0, 0, 1, 0]` と同じ）。公式ページが
+  シーンごとに掛けている傾き補正はコンテナ側の情報ではないので、こちらでは適用しません。
+- SOG-XTには[VR向けSOGの生成](#vr向けsogの生成)を適用できません。既存のoptimizerはSOG
+  バンドルのバイト列を前提にしているためで、Originalのままの表示はDesktopでもWebXRでも
+  通常どおり動きます。
+- `?debug=1` を付けて開くと、splat数・取得バイト数・ダウンロード時間・画像デコード時間・
+  逆量子化時間・SH帯域・active maskで落ちた数をコンソールへ出します。
 
 ### 空間を別の端末へ渡す
 

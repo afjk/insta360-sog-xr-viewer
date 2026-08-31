@@ -9,6 +9,7 @@ import {
   Entity,
   FILLMODE_NONE,
   GSplatComponent,
+  GSplatResource,
   GSPLAT_RENDERER_RASTER_CPU_SORT,
   RESOLUTION_AUTO,
   Vec3,
@@ -66,7 +67,7 @@ import {
   type PlacementTransform,
   type SplatBounds,
 } from "./capture-view";
-import { optimizationUnsupportedReason } from "./sog-image";
+import { imageReaderUnsupportedReason, optimizationUnsupportedReason } from "./sog-image";
 import {
   DEFAULT_TARGET_SPLATS,
   OPTIMIZER_VERSION,
@@ -77,6 +78,9 @@ import {
 } from "./sog-optimizer";
 import type { OptimizeMessage, OptimizeRequest } from "./sog-optimizer.worker";
 import { readCachedOptimization, writeCachedOptimization } from "./sog-cache";
+import { SogXtError, isSogXtMetadata, parseSogXtUrl, sogXtErrorMessage } from "./sog-xt";
+import { createSogXtResource } from "./sog-xt-playcanvas";
+import type { SogXtMessage, SogXtRequest, SogXtSummary, SogXtTimings } from "./sog-xt.worker";
 
 type ViewerStatus = "loading" | "ready" | "error";
 type VrVariant = "original" | "optimized";
@@ -88,7 +92,16 @@ type SourceKind = "sample" | "url" | "file";
  * パーマリンク・ライセンス表示はすべて `provider` で決める。ラベル文字列や
  * URLの形から後で提供元を推測しない。
  */
-type SourceProvider = "sample" | "file" | "direct" | "insta360" | "supersplat";
+type SourceProvider = "sample" | "file" | "direct" | "insta360" | "supersplat" | "kiss-gs";
+/**
+ * 中身の形式。`provider` と直交する。
+ *
+ * `sog` は PlayCanvas標準のSOG（bundled `.sog` / unbundled `meta.json`）、
+ * `sog-xt` は KISS-GS の SOG-XT。どちらも `meta.json` という名前のメタデータを
+ * 持つが、schemaも量子化の仕方も別物なので、取り違えないよう明示的に持つ。
+ * 読み込み後にURLやラベルの文字列から後付けで判定しない。
+ */
+type SourceFormat = "sog" | "sog-xt";
 /** SuperSplat由来の空間に付く、公開ページから取れた情報。 */
 type SuperSplatSource = {
   sceneId: string;
@@ -100,6 +113,7 @@ type SuperSplatSource = {
 type ViewerSource = {
   kind: SourceKind;
   provider: SourceProvider;
+  format: SourceFormat;
   label: string;
   /** Insta360共有由来のときだけ入る。 */
   shareId?: string;
@@ -113,6 +127,31 @@ type Bounds = SplatBounds;
 type CopyTarget = "space" | "view";
 type CopyState = { target: CopyTarget; state: "done" | "error" } | null;
 type OptimizedInfo = { splats: number; bytes: number; fromCache: boolean; targetSplats: number };
+/**
+ * 表示できる状態になったsplatひとつ分。
+ *
+ * PlayCanvasのGSplatは2通りの入れ方がある。ひとつは `Asset`（`.sog` や
+ * `meta.json` をPlayCanvasのローダーに読ませる従来経路）、もうひとつは
+ * `GSplatComponent.resource` へ直接入れる経路（procedural splat）。SOG-XTは
+ * 自前でデコードして `GSplatResource` を作るので後者を使う。どちらの場合でも
+ * 解放の後始末はここでまとめて持つ。
+ */
+type SplatEntry = {
+  asset: Asset | null;
+  resource: GSplatResource | null;
+  /** Blobから読んだAssetのobject URL。無ければ空文字。 */
+  objectUrl: string;
+  /** VR向け軽量化に使える元のバイト列。持っていなければ `null`。 */
+  blob: Blob | null;
+  hash: string | null;
+};
+/** SOG-XTの読み込み結果。`?debug=1` とベンチマーク表示に使う。 */
+type SogXtDebugInfo = {
+  splats: number;
+  downloadedBytes: number;
+  timings: SogXtTimings;
+  summary: SogXtSummary;
+};
 
 const SAMPLE_URL = "capture.sog";
 const SAMPLE_KEY = "sample";
@@ -161,6 +200,15 @@ const SHARE_RESOLVER = resolverConfig();
 const UNBUNDLED_OPTIMIZE_REASON =
   "このSuperSplat形式（meta.json + WebP）では現在VR向け軽量化を利用できません。";
 
+// KISS-GS SOG-XTはSOGとは別の圧縮表現で、既存のoptimizerが前提にしている
+// 「splat番号＝ピクセル番号のSOGバンドル」の形をしていない。Originalのままなら
+// DesktopでもWebXRでも通常どおり表示できる。
+const SOG_XT_OPTIMIZE_REASON =
+  "KISS-GS SOG-XTでは現在VR向け軽量化を利用できません（Originalのまま表示します）。";
+const SOG_XT_LOAD_FAILED = "KISS-GS SOG-XTを読み込めませんでした。";
+// 別の空間へ切り替えられて畳んだ読み込み。画面には出さない。
+const SOG_XT_SUPERSEDED = "KISS-GS SOG-XTの読み込みを中断しました。";
+
 /**
  * 表示中の空間をパーマリンクの形で指す。載せられない出どころでは `null`。
  *
@@ -180,12 +228,16 @@ const spaceRefOf = (source: ViewerSource): SpaceRef | null => {
 /**
  * 提供元ごとの座標変換。
  *
- * SuperSplatだけ別の回転で、それ以外——サンプル・ローカルファイル・`.sog` の
- * 直接URL・Insta360共有——は従来どおりInsta360の変換のまま。既に配ってある
- * リンクの見え方を変えないため。
+ * SuperSplatとKISS-GSがZ軸まわり180°で、それ以外——サンプル・ローカルファイル・
+ * `.sog` の直接URL・Insta360共有——は従来どおりInsta360の変換のまま。既に配って
+ * あるリンクの見え方を変えないため。
+ *
+ * KISS-GSがSuperSplatと同じ側なのは、KISS-GS公式ビューアがシーンの既定回転を
+ * `[0, 0, 1, 0]`（xyzw、＝Z軸まわり180°）としているため。SOG-XTが載せている
+ * のはCOLMAP由来のY-down座標で、SuperSplatの公開SOGと同じ向きにある。
  */
 const placementTransformOf = (provider: SourceProvider): PlacementTransform =>
-  provider === "supersplat" ? SUPERSPLAT_PLACEMENT : INSTA360_PLACEMENT;
+  provider === "supersplat" || provider === "kiss-gs" ? SUPERSPLAT_PLACEMENT : INSTA360_PLACEMENT;
 
 /** resolverのエラー応答を、画面に出す日本語へ直す。 */
 const superSplatErrorMessage = (
@@ -277,6 +329,7 @@ export function SogViewer() {
   const [source, setSource] = useState<ViewerSource>({
     kind: "sample",
     provider: "sample",
+    format: "sog",
     label: SAMPLE_LABEL,
   });
   const [openOpen, setOpenOpen] = useState(false);
@@ -286,6 +339,8 @@ export function SogViewer() {
   const [pendingLabel, setPendingLabel] = useState("");
   const [copyState, setCopyState] = useState<CopyState>(null);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // SOG-XTを読んだときだけ入る内訳。他の形式へ切り替えたら消す。
+  const [sogXtInfo, setSogXtInfo] = useState<SogXtDebugInfo | null>(null);
   const [sourceStage, setSourceStage] = useState("");
   const [sourceProgress, setSourceProgress] = useState(0);
   const [sourceError, setSourceError] = useState("");
@@ -536,16 +591,22 @@ export function SogViewer() {
 
     let loadToken = 0;
     let optimizeToken = 0;
-    // 表示中のOriginal SOG。バイト列はVR最適化とハッシュ計算に使い回す。
+    // 表示中のOriginal。バイト列はVR最適化とハッシュ計算に使い回す。
     // `blob` はbundled SOG（ローカル・Insta360・直接URL）でだけ入る。unbundled
     // SOGはPlayCanvasが直接取りに行くので、Viewerの手元にバイト列が残らない。
-    let original:
-      | { asset: Asset; objectUrl: string; blob: Blob | null; hash: string | null }
-      | null = null;
-    let optimizedEntry: { asset: Asset; objectUrl: string; key: string } | null = null;
+    // SOG-XTはAssetを経由せず自分でGSplatResourceを作るので `asset` が空になる。
+    let original: SplatEntry | null = null;
+    // 表示中の空間でVR向け軽量化を出せない理由。出せるときは `null`。
+    let originalOptimizeReason: string | null = null;
+    let optimizedEntry: (SplatEntry & { key: string }) | null = null;
     let splatComponent: GSplatComponent | null = null;
     let pendingFoveation = VR_RENDER_PROFILE.original.foveation;
     let optimizeWorker: Worker | null = null;
+    // SOG-XTのWorkerは読み込みごとの使い捨て。1つのWorkerを使い回すと、
+    // 途中で空間を切り替えたときに前の読み込みの応答が後の読み込みの
+    // ハンドラへ届いてしまう。
+    let sogXtWorker: Worker | null = null;
+    let cancelSogXt: (reason: Error) => void = () => undefined;
 
     const unsupportedReason = optimizationUnsupportedReason();
     setOptimizeUnsupported(unsupportedReason);
@@ -557,27 +618,42 @@ export function SogViewer() {
           ? error
           : "SOGファイルを読み込めませんでした。";
 
-    const attachAsset = (asset: Asset) => {
-      if (splatComponent) splatComponent.asset = asset;
-      else {
-        splatComponent = splatEntity.addComponent("gsplat", {
-          asset,
-          unified: true,
-        }) as GSplatComponent;
+    /**
+     * 表示中のsplatをコンポーネントへ差し替える。
+     *
+     * `resource` を持つentry（SOG-XT）は `GSplatComponent.resource` へ、Asset
+     * 由来のentryは `asset` へ入れる。PlayCanvasは `resource` を `asset` より
+     * 優先するので、Assetへ戻すときは先に `resource` を外す必要がある。
+     */
+    const attachSplat = (entry: SplatEntry) => {
+      if (!splatComponent) {
+        splatComponent = splatEntity.addComponent("gsplat", { unified: true }) as GSplatComponent;
+      }
+      if (entry.resource) {
+        splatComponent.resource = entry.resource;
+      } else if (entry.asset) {
+        splatComponent.resource = null;
+        splatComponent.asset = entry.asset;
       }
     };
 
-    const releaseAsset = (entry: { asset: Asset; objectUrl: string } | null) => {
+    const releaseEntry = (entry: SplatEntry | null) => {
       if (!entry) return;
-      app.assets.remove(entry.asset);
-      entry.asset.off();
-      if (entry.asset.loaded) entry.asset.unload();
+      if (entry.asset) {
+        app.assets.remove(entry.asset);
+        entry.asset.off();
+        if (entry.asset.loaded) entry.asset.unload();
+      }
+      if (entry.resource) {
+        if (splatComponent?.resource === entry.resource) splatComponent.resource = null;
+        entry.resource.destroy();
+      }
       // リモートURLから直接読んだアセットにはobject URLが無い。
       if (entry.objectUrl) URL.revokeObjectURL(entry.objectUrl);
     };
 
     const releaseOptimized = () => {
-      releaseAsset(optimizedEntry);
+      releaseEntry(optimizedEntry);
       optimizedEntry = null;
       setOptimized(null);
       setVrReady(false);
@@ -676,22 +752,24 @@ export function SogViewer() {
     };
 
     /**
-     * 読み込み終わったアセットを表示中の空間として据える。
+     * 読み込み終わったsplatを表示中の空間として据える。
      *
-     * bundled SOG（バイト列を持っている）とunbundled SOG（PlayCanvasが直接
-     * 取りに行く）で共通の後始末。`bytes` が `null` の空間ではVR向け軽量化を
-     * 出さない——optimizerが元のバイト列を必要とするため。
+     * bundled SOG（バイト列を持っている）・unbundled SOG（PlayCanvasが直接
+     * 取りに行く）・SOG-XT（自前でGSplatResourceを作る）で共通の後始末。
+     * `entry.blob` が `null` の空間ではVR向け軽量化を出さない——optimizerが
+     * 元のバイト列を必要とするため。`optimizeReason` はその理由の文言。
      */
     const showSplat = async (
       next: ViewerSource,
-      loaded: { asset: Asset; objectUrl: string },
-      bytes: { blob: Blob; hash: string | null } | null,
+      entry: SplatEntry,
       cameras: CaptureCamera[] | null,
+      optimizeReason: string = UNBUNDLED_OPTIMIZE_REASON,
     ) => {
       const isSample = next.kind === "sample";
+      const resource = entry.resource ?? entry.asset?.resource ?? null;
       // 配置は提供元ごとに違うので、バウンズを測る前に切り替える。
       placementTransform = placementTransformOf(next.provider);
-      const bounds = boundsFromResource(loaded.asset.resource) ?? CAPTURE_BOUNDS;
+      const bounds = boundsFromResource(resource) ?? CAPTURE_BOUNDS;
       framedBounds = isSample ? CAPTURE_BOUNDS : bounds;
       applyPlacement(framedBounds);
       applyCaptureFov(cameras ? captureFovOf(cameras) : null);
@@ -708,6 +786,7 @@ export function SogViewer() {
       if (xrDebug) {
         console.info("[sog-xr] initial", {
           provider: next.provider,
+          format: next.format,
           bounds: { ...framedBounds },
           placement: splatPlacementFor(framedBounds, placementTransform),
           cameraCount: cameras?.length ?? null,
@@ -718,14 +797,18 @@ export function SogViewer() {
       }
       if (initialView) applyViewPose(initialView);
       else frameBounds(framedBounds);
-      attachAsset(loaded.asset);
+      attachSplat(entry);
       const previous = original;
-      original = { ...loaded, blob: bytes?.blob ?? null, hash: bytes?.hash ?? null };
-      releaseAsset(previous);
+      original = entry;
+      releaseEntry(previous);
       releaseOptimized();
-      setOriginalSplats(splatCountOf(loaded.asset.resource));
+      setOriginalSplats(splatCountOf(resource));
+      // SOG-XTの内訳は空間ごとのもの。切り替えたらいったん消し、SOG-XTなら
+      // このあと `showSogXt` が入れ直す。
+      setSogXtInfo(null);
       setSource(next);
-      setOptimizeSourceReason(bytes ? null : UNBUNDLED_OPTIMIZE_REASON);
+      originalOptimizeReason = entry.blob ? null : optimizeReason;
+      setOptimizeSourceReason(originalOptimizeReason);
       // アドレスバーへ残すのはユーザーが指定した視点だけ。こちらで決めた
       // 初期視点まで載せると、空間だけのリンクが視点付きに化けてしまう。
       syncPermalink(space, linkedView);
@@ -741,7 +824,7 @@ export function SogViewer() {
       const hash = typeof crypto?.subtle === "undefined" ? null : await sha256Hex(buffer);
       const blob = new Blob([buffer]);
       const loaded = await loadSplatAsset(next.label, blob, "space.sog");
-      await showSplat(next, loaded, { blob, hash }, cameras);
+      await showSplat(next, { ...loaded, resource: null, blob, hash }, cameras);
     };
 
     const onXrAvailability = (available: boolean) => {
@@ -757,7 +840,7 @@ export function SogViewer() {
       setInXr(false);
       pendingXrSpawn = null;
       // Desktop表示はOriginalに戻す。
-      if (original) attachAsset(original.asset);
+      if (original) attachSplat(original);
       restoreDesktopView();
     };
     const onXrError = (error: Error) => {
@@ -772,7 +855,8 @@ export function SogViewer() {
 
     const startVr = (variant: VrVariant) => {
       const entry = variant === "optimized" ? optimizedEntry : original;
-      if (disposed || !xr.isAvailable(XRTYPE_VR) || !entry?.asset.loaded) return;
+      const ready = Boolean(entry?.resource ?? entry?.asset?.loaded);
+      if (disposed || !xr.isAvailable(XRTYPE_VR) || !entry || !ready) return;
       setErrorMessage("");
       setVrOpen(false);
       pressedKeys.clear();
@@ -787,7 +871,7 @@ export function SogViewer() {
       desktopReturnView = desktopView;
       rig.setLocalPosition(0, 0, 0);
       rig.setLocalEulerAngles(0, 0, 0);
-      attachAsset(entry.asset);
+      attachSplat(entry);
       const profile = VR_RENDER_PROFILE[variant];
       pendingFoveation = profile.foveation;
       xr.start(camera, XRTYPE_VR, XRSPACE_LOCALFLOOR, {
@@ -796,7 +880,7 @@ export function SogViewer() {
         callback: (error) => {
           if (disposed || !error) return;
           pendingXrSpawn = null;
-          if (original) attachAsset(original.asset);
+          if (original) attachSplat(original);
           // 開始に失敗した場合も、rigはすでにゼロへ戻してある。
           restoreDesktopView();
           setErrorMessage(error.message);
@@ -852,10 +936,10 @@ export function SogViewer() {
         return;
       }
 
-      // unbundled SOGでは元のバイト列が手元に無い。UI側でも選べないように
-      // してあるが、ここでも念のため止める。
+      // unbundled SOGとSOG-XTでは元のバイト列が手元に無い。UI側でも選べない
+      // ようにしてあるが、ここでも念のため止める。理由は空間ごとに違う。
       if (!original.blob) {
-        setOptimizeError(UNBUNDLED_OPTIMIZE_REASON);
+        setOptimizeError(originalOptimizeReason ?? UNBUNDLED_OPTIMIZE_REASON);
         return;
       }
       const sourceBlob = original.blob;
@@ -918,12 +1002,13 @@ export function SogViewer() {
         if (disposed || token !== optimizeToken) return;
         setOptimizeStage("VR向けSOGを読み込み中");
         const loaded = await loadSplatAsset("VR optimized SOG", blob, "vr-optimized.sog");
+        const entry: SplatEntry = { ...loaded, resource: null, blob: null, hash: null };
         if (disposed || token !== optimizeToken) {
-          releaseAsset(loaded);
+          releaseEntry(entry);
           return;
         }
-        releaseAsset(optimizedEntry);
-        optimizedEntry = { ...loaded, key: key ?? `${settings.targetSplats}` };
+        releaseEntry(optimizedEntry);
+        optimizedEntry = { ...entry, key: key ?? `${settings.targetSplats}` };
         setOptimized({
           splats,
           bytes,
@@ -1010,6 +1095,151 @@ export function SogViewer() {
     };
 
     /**
+     * SOG-XTかどうかを、取得した `meta.json` の中身で判定する。
+     *
+     * PlayCanvas標準のSOGも `meta.json` という名前なので、URLの形では
+     * 見分けられない。`format` が `sog-xt` のものだけをSOG-XTとして扱い、
+     * それ以外は従来どおりPlayCanvasのSOGローダーへ回す。
+     */
+    const probeSogXt = async (metadataUrl: string): Promise<boolean> => {
+      let response: Response;
+      try {
+        response = await fetch(metadataUrl, { headers: { accept: "application/json" } });
+      } catch (error) {
+        throw new SogXtError("METADATA_DOWNLOAD_FAILED", String(error));
+      }
+      if (!response.ok) {
+        throw new SogXtError("METADATA_DOWNLOAD_FAILED", `HTTP ${response.status}`);
+      }
+      const payload = await response.json().catch(() => null);
+      return isSogXtMetadata(payload);
+    };
+
+    /**
+     * SOG-XTの取得とデコードをWorkerへ投げる。UIスレッドは進捗を受けるだけ。
+     *
+     * Workerは属性配列をTransferableで返すので、ここでのコピーは起きない。
+     */
+    const runSogXtWorker = (metadataUrl: string, onStage: (stage: string, ratio: number) => void) =>
+      new Promise<Extract<SogXtMessage, { type: "done" }>>((resolve, reject) => {
+        // 前の読み込みが残っていたら、Workerごと畳んでから始める。
+        cancelSogXt(new Error(SOG_XT_SUPERSEDED));
+        const worker = new Worker(new URL("./sog-xt.worker.ts", import.meta.url), {
+          type: "module",
+        });
+        sogXtWorker = worker;
+        const finish = (settle: () => void) => {
+          worker.onmessage = null;
+          worker.onerror = null;
+          worker.terminate();
+          if (sogXtWorker === worker) sogXtWorker = null;
+          cancelSogXt = () => undefined;
+          settle();
+        };
+        cancelSogXt = (reason) => finish(() => reject(reason));
+        worker.onmessage = (event: MessageEvent<SogXtMessage>) => {
+          const message = event.data;
+          if (message.type === "progress") {
+            onStage(message.stage, message.ratio);
+            return;
+          }
+          if (message.type === "error") {
+            if (xrDebug) console.warn("[sog-xr] sog-xt error", message.code, message.detail);
+            finish(() => reject(new Error(message.message)));
+          } else {
+            finish(() => resolve(message));
+          }
+        };
+        worker.onerror = (event) => {
+          finish(() => reject(new Error(event.message || SOG_XT_LOAD_FAILED)));
+        };
+        worker.postMessage({ metadataUrl } satisfies SogXtRequest);
+      });
+
+    /**
+     * KISS-GS SOG-XTを読み込んで表示する。
+     *
+     * Worker → TypedArray → GSplatData → GSplatResource → GSplatComponent。
+     * 中間PLYは作らない。ここでやるのはGPUリソース化と計測だけで、逆量子化の
+     * 数学は `sog-xt.ts` にしかない。
+     */
+    const showSogXt = async (
+      next: ViewerSource,
+      metadataUrl: string,
+      onStage: (stage: string, ratio: number) => void,
+      isCurrent: () => boolean,
+    ) => {
+      const startedAt = performance.now();
+      performance.mark?.("sog-xt:load:start");
+      const unsupported = imageReaderUnsupportedReason();
+      if (unsupported) throw new Error(unsupported);
+
+      // デコード中は描画を止める。WorkerのWebGL読み出し（`readPixels`）は
+      // 表示中の空間を描いているコンテキストと同じGPUを取り合うので、
+      // 止めないと読み出しが桁で遅くなる。VR向け軽量化と同じ扱い。
+      const wasAutoRendering = app.autoRender;
+      app.autoRender = false;
+      let result: Extract<SogXtMessage, { type: "done" }>;
+      try {
+        result = await runSogXtWorker(metadataUrl, onStage);
+      } finally {
+        app.autoRender = wasAutoRendering;
+      }
+      // デコードしている間に別の空間へ切り替えられていたら、GPUリソースを
+      // 作らずに捨てる。ここを抜けると古い空間が表示されてしまう。
+      if (!isCurrent()) return;
+      onStage("PlayCanvasへ転送中", 0.99);
+      const resource = createSogXtResource(app.graphicsDevice, result.decoded);
+      const totalMs = Math.round(performance.now() - startedAt);
+      performance.mark?.("sog-xt:load:end");
+      performance.measure?.("sog-xt:load", "sog-xt:load:start", "sog-xt:load:end");
+
+      await showSplat(
+        next,
+        { asset: null, resource, objectUrl: "", blob: null, hash: null },
+        null,
+        SOG_XT_OPTIMIZE_REASON,
+      );
+      const info: SogXtDebugInfo = {
+        splats: result.decoded.count,
+        downloadedBytes: result.downloadedBytes,
+        timings: { ...result.timings, totalMs },
+        summary: result.summary,
+      };
+      setSogXtInfo(info);
+      if (xrDebug) {
+        console.info("[sog-xr] sog-xt", {
+          format: next.format,
+          metadataUrl,
+          version: result.summary.version,
+          profile: result.summary.profile,
+          splats: result.decoded.count,
+          declaredCount: result.summary.declaredCount,
+          gridEntries: result.summary.gridEntries,
+          maskedOut: result.summary.maskedOut,
+          shBands: result.summary.shBands,
+          shCoeffs: result.summary.shCoeffs,
+          files: result.summary.files,
+          downloadedBytes: result.downloadedBytes,
+          downloadMs: result.timings.downloadMs,
+          imageDecodeMs: result.timings.imageDecodeMs,
+          decodeMs: result.timings.decodeMs,
+          workerMs: result.timings.totalMs,
+          totalMs,
+        });
+        // ベンチマークとして貼り付けやすい最小の形。
+        console.info("[sog-xr] benchmark", {
+          format: "sog-xt",
+          splats: result.decoded.count,
+          downloadedBytes: result.downloadedBytes,
+          downloadMs: result.timings.downloadMs,
+          decodeMs: result.timings.decodeMs + result.timings.imageDecodeMs,
+          totalMs,
+        });
+      }
+    };
+
+    /**
      * 同じ空間を二重に読み込まないための鍵。
      *
      * 共有ID・シーンID・SOGのURLが同じなら、解決もダウンロードもデコードも
@@ -1023,6 +1253,11 @@ export function SogViewer() {
       if (share) return `share:${share.shareId}`;
       const scene = parseSuperSplatUrl(input);
       if (scene) return `supersplat:${scene.sceneId}`;
+      // `meta.json` とディレクトリURLは、SOG-XTかPlayCanvas SOGかがまだ
+      // 決まっていない。解決後のmeta.jsonのURLを鍵にすれば、どちらでも
+      // 同じ入力が同じ鍵になる。
+      const container = parseSogXtUrl(input);
+      if (container) return `container:${container.metadataUrl}`;
       const direct = isSpatialAssetUrl(input) ? toAbsoluteUrl(input) : null;
       return direct ? `sog:${direct.toString()}` : "";
     };
@@ -1059,6 +1294,9 @@ export function SogViewer() {
 
       let label = "";
       let provider: SourceProvider = "direct";
+      let format: SourceFormat = "sog";
+      // SOG-XTとして読むときの `meta.json` のURL。
+      let sogXtMetadataUrl = "";
       let shareId: string | undefined;
       let supersplat: SuperSplatSource | undefined;
       let fetchUrl = "";
@@ -1082,7 +1320,11 @@ export function SogViewer() {
         const input = request.value.trim();
         const share = parseInsta360ShareUrl(input);
         const scene = share ? null : parseSuperSplatUrl(input);
-        const direct = !share && !scene && isSpatialAssetUrl(input) ? toAbsoluteUrl(input) : null;
+        // `.../meta.json` かディレクトリらしきURL。SOG-XTかもしれない候補で、
+        // 実際にどちらかは取得した `meta.json` の `format` で決める。
+        const container = !share && !scene ? parseSogXtUrl(input) : null;
+        const direct =
+          !share && !scene && !container && isSpatialAssetUrl(input) ? toAbsoluteUrl(input) : null;
         if (share) {
           const resolver = resolverConfig();
           if (!resolver.available) {
@@ -1142,12 +1384,43 @@ export function SogViewer() {
             reportFailure(error);
             return;
           }
+        } else if (container) {
+          const metadataUrl = container.metadataUrl;
+          const folder = new URL(".", metadataUrl).pathname.split("/").filter(Boolean).pop() ?? "";
+          setPendingLabel(folder || "SOG-XT");
+          setSourceStage("meta.jsonを確認中");
+          reportProgress(-1);
+          let isSogXt: boolean;
+          try {
+            isSogXt = await probeSogXt(metadataUrl);
+          } catch (error) {
+            if (disposed || token !== loadToken) return;
+            setSourceStage("");
+            setPendingLabel("");
+            loadingKey = "";
+            reportFailure(new Error(sogXtErrorMessage(error)));
+            if (xrDebug) console.warn("[sog-xr] sog-xt probe failed", error);
+            return;
+          }
+          if (disposed || token !== loadToken) return;
+          if (isSogXt) {
+            provider = "kiss-gs";
+            format = "sog-xt";
+            sogXtMetadataUrl = metadataUrl;
+            label = folder ? `KISS-GS SOG-XT ${folder}` : "KISS-GS SOG-XT";
+          } else {
+            // PlayCanvas標準のunbundled SOG。`meta.json` は同じディレクトリの
+            // WebPを相対パスで参照するので、URLのままローダーへ渡す。
+            remote = { url: metadataUrl, filename: "meta.json" };
+            label = folder || "meta.json";
+          }
         } else if (direct) {
           fetchUrl = direct.toString();
           label = direct.pathname.split("/").pop() || "space.sog";
         } else {
           setSourceError(
-            "Insta360の共有URL、SuperSplatのシーンURL、または .sog のURLを入力してください。",
+            "Insta360の共有URL、SuperSplatのシーンURL、KISS-GS SOG-XTのURL、" +
+              "または .sog のURLを入力してください。",
           );
           loadingKey = "";
           return;
@@ -1157,6 +1430,7 @@ export function SogViewer() {
       const next: ViewerSource = {
         kind: request.kind === "file" ? "file" : "url",
         provider,
+        format,
         label,
         shareId,
         supersplat,
@@ -1171,15 +1445,28 @@ export function SogViewer() {
         ? downloadCaptureCameras(camerasUrl)
         : Promise.resolve(null);
       try {
-        if (remote) {
+        if (sogXtMetadataUrl) {
+          const isCurrent = () => !disposed && token === loadToken;
+          await showSogXt(
+            next,
+            sogXtMetadataUrl,
+            (stage, ratio) => {
+              if (!isCurrent()) return;
+              setSourceStage(`KISS-GS SOG-XT: ${stage}`);
+              reportProgress(Math.min(99, Math.round(ratio * 100)));
+            },
+            isCurrent,
+          );
+          if (!isCurrent()) return;
+        } else if (remote) {
           // 取得と展開はPlayCanvasの中で進むので、こちらは進捗を出せない。
           const loaded = await loadRemoteGsplatAsset(label, remote.url, remote.filename);
           // 読み込んでいる間に別の空間へ切り替えられていたら、出さずに捨てる。
           if (disposed || token !== loadToken) {
-            releaseAsset(loaded);
+            releaseEntry({ ...loaded, resource: null, blob: null, hash: null });
             return;
           }
-          await showSplat(next, loaded, null, null);
+          await showSplat(next, { ...loaded, resource: null, blob: null, hash: null }, null);
         } else {
           const buffer = file
             ? await file.arrayBuffer()
@@ -1222,7 +1509,10 @@ export function SogViewer() {
       try {
         const buffer = await downloadSog(SAMPLE_URL, initial ? setProgress : setSourceProgress);
         if (disposed || token !== loadToken) return;
-        await showOriginal({ kind: "sample", provider: "sample", label: SAMPLE_LABEL }, buffer);
+        await showOriginal(
+          { kind: "sample", provider: "sample", format: "sog", label: SAMPLE_LABEL },
+          buffer,
+        );
         if (disposed || token !== loadToken) return;
         shownKey = SAMPLE_KEY;
         setPendingLabel("");
@@ -1598,6 +1888,8 @@ export function SogViewer() {
       window.removeEventListener("drop", onDrop);
       if (xr.active) xr.end();
       optimizeWorker?.terminate();
+      cancelSogXt(new Error(SOG_XT_SUPERSEDED));
+      sogXtWorker?.terminate();
       if (original?.objectUrl) URL.revokeObjectURL(original.objectUrl);
       if (optimizedEntry?.objectUrl) URL.revokeObjectURL(optimizedEntry.objectUrl);
       app.destroy();
@@ -1693,8 +1985,13 @@ export function SogViewer() {
           </div>
           <div className="format-pill">
             <span className="live-dot" />
-            PLAYCANVAS · SOG v2
+            {source.format === "sog-xt"
+              ? `KISS-GS · SOG-XT v${sogXtInfo?.summary.version ?? 3}`
+              : "PLAYCANVAS · SOG v2"}
             {originalSplats ? ` · ${formatSplats(originalSplats)} SPLATS` : ""}
+            {source.format === "sog-xt" && sogXtInfo
+              ? ` · SH ${sogXtInfo.summary.shBands}`
+              : ""}
           </div>
           {source.supersplat && (
             <div className="source-credit">
@@ -1815,6 +2112,10 @@ export function SogViewer() {
                 ? "Insta360 Spatial Captureの共有URL、またはSuperSplatの公開シーンURLを貼り付けるか、SOGファイルをドラッグ＆ドロップ、またはファイル選択から読み込みます。SuperSplatは作者がダウンロードを許可したシーンのみ開けます。"
                 : "SOGファイルをドラッグ＆ドロップするか、.sog のURLを指定して読み込みます。"}
             </p>
+            <p className="quality-copy">
+              KISS-GSのSOG-XTは、コンテナの meta.json のURL、またはそれが置いてある
+              ディレクトリのURLを指定すると開けます。
+            </p>
 
             <form
               className="open-url"
@@ -1831,13 +2132,13 @@ export function SogViewer() {
                 spellCheck={false}
                 placeholder={
                   SHARE_RESOLVER.available
-                    ? "https://superspl.at/scene/... または https://app.insta360.com/3dspace/detail/..."
-                    : "https://example.com/space.sog"
+                    ? "https://superspl.at/scene/... / https://app.insta360.com/3dspace/detail/... / .../SOG-XT/meta.json"
+                    : "https://example.com/space.sog または .../SOG-XT/meta.json"
                 }
                 aria-label={
                   SHARE_RESOLVER.available
-                    ? "Insta360の共有URL、SuperSplatのシーンURL、またはSOGのURL"
-                    : "SOGのURL"
+                    ? "Insta360の共有URL、SuperSplatのシーンURL、KISS-GS SOG-XTのURL、またはSOGのURL"
+                    : "SOGのURL、またはKISS-GS SOG-XTのURL"
                 }
                 value={openInput}
                 disabled={sourceBusy}
