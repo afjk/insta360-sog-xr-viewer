@@ -183,6 +183,47 @@ export function orbitTargetOf(pose: ViewPose): Vec3Like {
 }
 
 /**
+ * VR開始時に、被写体を無理なく見下ろせる角度の上限（度）。
+ *
+ * 人が楽に見られるのは水平からおよそ15〜30°下まで。その真ん中を取る。
+ * ここより浅い視点は動かさないので、部屋のキャプチャのようにほぼ水平な
+ * 既存リンクの立ち位置は1mmも変わらない。
+ */
+export const XR_SPAWN_PITCH_LIMIT = 20;
+
+/**
+ * VRで立つ位置。Desktopの視点の見下ろし角を、見られる範囲まで戻したもの。
+ *
+ * XR中のカメラのpitchはHMDが持つので、Desktopの見下ろし角は再現できない
+ * （`xrRigOffset` も位置と水平yawしか合わせない）。急な見下ろし視点の
+ * eye位置へそのまま立たせると、正面には被写体の**上**が来る。KISS-GSの
+ * ように被写体を上から覗き込んだ視点では、空しか見えないところから始まる。
+ *
+ * そこで、Desktopで見ていたもの——注視点——を基準に、orbitを
+ * `XR_SPAWN_PITCH_LIMIT` まで起こした位置へ立たせる。注視点も半径
+ * （`distance`）も水平向き（`yaw`）も変えないので、被写体は同じ距離・同じ
+ * 見かけの大きさのまま、正面からわずかに下——ちょうど自然に見下ろせる
+ * ところ——に来る。
+ *
+ * 水平まで完全に起こさないのは、そこまで下げると被写体と目線が同じ高さに
+ * なり、手前の地面や草に埋もれるため。上限までしか動かさないので、元から
+ * 浅い視点は**Desktopのeyeそのまま**で、既に配ってあるリンクは変わらない。
+ */
+export function xrSpawnPose(pose: ViewPose): HorizontalPose {
+  const pitch = clamp(pose.pitch, -XR_SPAWN_PITCH_LIMIT, XR_SPAWN_PITCH_LIMIT);
+  // 上限内ならDesktopのeyeそのもの。逆算を通さず、丸め誤差も入れない。
+  if (pitch === pose.pitch) return { x: pose.x, y: pose.y, z: pose.z, yaw: pose.yaw };
+  const target = orbitTargetOf(pose);
+  const forward = forwardFromAngles(pose.yaw, pitch);
+  return {
+    x: target.x - forward.x * pose.distance,
+    y: target.y - forward.y * pose.distance,
+    z: target.z - forward.z * pose.distance,
+    yaw: pose.yaw,
+  };
+}
+
+/**
  * eyeと注視点から視点を組み立てる。`orbitTargetOf` の逆。
  *
  * 「どこから、どこを見ているか」しか分かっていない初期視点（公式Viewerの
