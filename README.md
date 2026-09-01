@@ -682,4 +682,28 @@ npm run build:pages
 npm test
 ```
 
+### VR経路のテスト（`npm run test:xr`）
+
+`npm test` はDOMもGPUも使わないので、**VRの配線ミスは掴めません**。実際、rigの補正を
+XRのposeが入っていないフレームで掛けていたバグ（VRだと視点がまったく別の場所から始まる）は、
+ユニットテストを全部通したままQuest 3で出ました。
+
+`npm run test:xr` は、`tests/webxr-stub.js` でWebXRだけを差し替えて、**PlayCanvasは本物のまま**
+ヘッドレスChromiumで走らせます。`?view=` 付きのリンクからVRへ入り、組み上がったカメラの
+world姿勢が狙った立ち位置に乗っているかを見ます。
+
+```bash
+npx playwright install chromium   # 最初の一度だけ
+npm run test:xr                   # build:pages も一緒に走ります
+```
+
+Chromiumを自前で持っているCIイメージなど、Playwrightのrevisionと一致しない環境では
+実行ファイルのパスを渡せます。
+
+```bash
+SOG_XR_CHROMIUM=/path/to/chrome npm run test:xr
+```
+
+前提が揃っていなければ理由を出してskipします（黙って緑にはなりません）。
+
 `main` ブランチへのpushで、GitHub ActionsがGitHub Pages版を自動更新します。
