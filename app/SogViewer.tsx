@@ -34,6 +34,7 @@ import {
 } from "./supersplat";
 import { resolverConfig } from "./resolver-config";
 import {
+  canonicalSpaceUrl,
   hrefWithoutSpace,
   isSameSpace,
   permalinkFor,
@@ -115,6 +116,16 @@ type ViewerSource = {
   provider: SourceProvider;
   format: SourceFormat;
   label: string;
+  /**
+   * 別の端末で同じ空間を開き直すためのURL。
+   *
+   * URL指定で開いた空間——`.sog` の直接URL、PlayCanvasのunbundled SOG、
+   * KISS-GSのSOG-XT——でだけ入る。resolverを通す空間（Insta360・SuperSplat）は
+   * 期限つき／リビジョン込みのURLしか手に入らないので、そちらは共有IDを使い
+   * ここには入れない。SOG-XTでは入力がディレクトリURLでも、解決した
+   * `meta.json` のURLを入れる。
+   */
+  canonicalUrl?: string;
   /** Insta360共有由来のときだけ入る。 */
   shareId?: string;
   /** SuperSplat由来のときだけ入る。 */
@@ -212,8 +223,10 @@ const SOG_XT_SUPERSEDED = "KISS-GS SOG-XTの読み込みを中断しました。
 /**
  * 表示中の空間をパーマリンクの形で指す。載せられない出どころでは `null`。
  *
- * サンプル・ローカルファイル・`.sog` の直接URLは、別の端末で開き直せる
- * 恒久的な識別子を持たないのでリンクを作らない。
+ * resolverを通す空間は提供元の永続ID、URLで開いた空間は正規化したアセットの
+ * URLで指す。サンプルとローカルファイルは、受け取った側の端末から開ける
+ * 参照を作れないのでリンクにしない（`kind` で弾く。`canonicalUrl` を
+ * 持っていないので二重に弾かれる）。
  */
 const spaceRefOf = (source: ViewerSource): SpaceRef | null => {
   if (source.provider === "insta360" && source.shareId) {
@@ -221,6 +234,12 @@ const spaceRefOf = (source: ViewerSource): SpaceRef | null => {
   }
   if (source.provider === "supersplat" && source.supersplat) {
     return { provider: "supersplat", id: source.supersplat.sceneId };
+  }
+  if (source.kind === "url" && source.canonicalUrl) {
+    // `canonicalSpaceUrl` が `http:` / `https:` 以外を弾く。`blob:` や
+    // `file:` は共有できない。
+    const url = canonicalSpaceUrl(source.canonicalUrl);
+    if (url) return { provider: "url", url };
   }
   return null;
 };
@@ -235,6 +254,16 @@ const spaceRefOf = (source: ViewerSource): SpaceRef | null => {
  * KISS-GSがSuperSplatと同じ側なのは、KISS-GS公式ビューアがシーンの既定回転を
  * `[0, 0, 1, 0]`（xyzw、＝Z軸まわり180°）としているため。SOG-XTが載せている
  * のはCOLMAP由来のY-down座標で、SuperSplatの公開SOGと同じ向きにある。
+ *
+ * TODO: share scene placement / roll transform.
+ * KISS-GS公式ページは、この既定回転に加えてシーンごとの傾き補正を掛けている。
+ * その値は `meta.json` ではなくページ側の設定にあり、SOG-XTのコンテナからは
+ * 取れない。補正なしだと空間の「上」がworldの+Yからずれる——公式の値から
+ * 逆算すると MipNeRF360-Garden で28.1°、ほぼX軸まわりの傾き。カメラの
+ * yaw/pitchだけでは、見る向きによってはこの傾きを水平に戻せない（真横から
+ * 見るとrollとして残る）。`view=` で共有できるのは「ユーザーが選んだ視点」
+ * までで、空間そのものの姿勢ではない。姿勢まで配るなら、`view=` とは別に
+ * 空間の配置（少なくともroll）を載せるparameterが要る。
  */
 const placementTransformOf = (provider: SourceProvider): PlacementTransform =>
   provider === "supersplat" || provider === "kiss-gs" ? SUPERSPLAT_PLACEMENT : INSTA360_PLACEMENT;
@@ -1297,6 +1326,8 @@ export function SogViewer() {
       let format: SourceFormat = "sog";
       // SOG-XTとして読むときの `meta.json` のURL。
       let sogXtMetadataUrl = "";
+      // 別の端末で開き直すためのURL。URL指定で開いた空間でだけ入る。
+      let canonicalUrl: string | undefined;
       let shareId: string | undefined;
       let supersplat: SuperSplatSource | undefined;
       let fetchUrl = "";
@@ -1403,6 +1434,9 @@ export function SogViewer() {
             return;
           }
           if (disposed || token !== loadToken) return;
+          // 入力がディレクトリURLでも、共有するのは解決した `meta.json` の
+          // URL。同じ空間が常に同じリンクになる。
+          canonicalUrl = metadataUrl;
           if (isSogXt) {
             provider = "kiss-gs";
             format = "sog-xt";
@@ -1416,6 +1450,7 @@ export function SogViewer() {
           }
         } else if (direct) {
           fetchUrl = direct.toString();
+          canonicalUrl = fetchUrl;
           label = direct.pathname.split("/").pop() || "space.sog";
         } else {
           setSourceError(
@@ -1432,6 +1467,7 @@ export function SogViewer() {
         provider,
         format,
         label,
+        canonicalUrl,
         shareId,
         supersplat,
       };
@@ -1850,7 +1886,8 @@ export function SogViewer() {
 
     resize();
     app.start();
-    // `?id=` / `?ss=` 付きで開かれたら、サンプルには一切触れずにその空間だけを読む。
+    // `?id=` / `?ss=` / `?url=` 付きで開かれたら、サンプルには一切触れずに
+    // その空間だけを読む。
     // サンプル→本番の二重ロード（fetch・decode・GPU転送）を起こさないため、
     // ここで分岐してどちらか一方だけを呼ぶ。
     const deepLink = readSpaceRef(window.location.href);
@@ -1859,7 +1896,11 @@ export function SogViewer() {
         ? null
         : deepLink.provider === "insta360"
           ? shareUrlFromShareId(deepLink.id)
-          : sceneUrlFromSceneId(deepLink.id);
+          : deepLink.provider === "supersplat"
+            ? sceneUrlFromSceneId(deepLink.id)
+            // URL参照はそのまま `loadSource` へ。`.sog` かコンテナかの判定は
+            // 通常の読み込みと同じ経路で行う。
+            : deepLink.url;
     if (deepLinkUrl) void loadSource({ kind: "url", value: deepLinkUrl }, true);
     else void loadSample(true);
     setXrAvailable(xr.isAvailable(XRTYPE_VR));
@@ -1906,8 +1947,8 @@ export function SogViewer() {
   /**
    * 表示中の空間のViewerリンクをクリップボードへ入れる。
    *
-   * 共有ID／シーンIDから今のorigin/pathnameで組み立てるので、GitHub Pagesでも
-   * localhostでも、開いているのと同じ配信先のURLになる。
+   * 共有ID／シーンID／アセットURLから今のorigin/pathnameで組み立てるので、
+   * GitHub Pagesでもlocalhostでも、開いているのと同じ配信先のURLになる。
    *
    * `view` を選ぶと、いま見えている視点（world空間の位置・yaw・pitch）を
    * `view=` に足したリンクになる。受け取った側はDesktopでもQuestでも
@@ -1944,7 +1985,8 @@ export function SogViewer() {
         : "コピーできませんでした（アドレスバーのURLをお使いください）";
 
   const isSample = source.kind === "sample";
-  // リンクを配れる空間かどうか。ラベルではなくproviderで決まる。
+  // リンクを配れる空間かどうか。ラベルの読み直しではなく、providerと
+  // `canonicalUrl` で決まる。URL指定で開いた空間もここでリンクを持つ。
   const space = spaceRefOf(source);
   // VR向け軽量化を出せない理由。端末側の制約が先、次に表示中の空間の形。
   const optimizeBlocked = optimizeUnsupported ?? optimizeSourceReason;

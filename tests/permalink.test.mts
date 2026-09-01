@@ -5,7 +5,9 @@ import { isSuperSplatSceneId, sceneUrlFromSceneId } from "../app/supersplat.ts";
 import {
   SCENE_ID_PARAM,
   SHARE_ID_PARAM,
+  SOURCE_URL_PARAM,
   VIEW_PARAM,
+  canonicalSpaceUrl,
   hrefWithoutSpace,
   isSameSpace,
   permalinkFor,
@@ -25,6 +27,15 @@ const VIEW = formatViewPose(POSE) ?? "";
 const SCENE_ID = "56155c3f";
 const SHARE: SpaceRef = { provider: "insta360", id: SHARE_ID };
 const SCENE: SpaceRef = { provider: "supersplat", id: SCENE_ID };
+// resolverを通さない空間。`.sog` の直接URLと、KISS-GS公式のSOG-XTコンテナ。
+const SOG_URL = "https://example.com/spaces/room.sog";
+const KISS_GS_DIR =
+  "https://fraunhoferhhi.github.io/KISS-GS/viewer/scenes/index.sog-xt.assets/S/MipNeRF360-Garden";
+const KISS_GS_META = `${KISS_GS_DIR}/meta.json`;
+const SOG_SPACE: SpaceRef = { provider: "url", url: SOG_URL };
+const KISS_GS_SPACE: SpaceRef = { provider: "url", url: KISS_GS_META };
+/** `?url=` に載る値。`URLSearchParams` が掛けるエンコードと同じ形。 */
+const encoded = (value: string) => new URLSearchParams({ [SOURCE_URL_PARAM]: value }).toString();
 /** Insta360の共有IDだけを読む小道具。提供元が違うURLでは `null`。 */
 const readShareId = (href: string) => {
   const space = readSpaceRef(href);
@@ -244,4 +255,119 @@ test("carries no CDN URL or revision into a SuperSplat permalink", () => {
   for (const leak of ["cloudfront", "meta.json", ".sog", "http"]) {
     assert.doesNotMatch(link.slice(PAGES.length), new RegExp(leak, "i"), leak);
   }
+});
+
+/* -------------------------------------------------------------------------- */
+/* URL source (`?url=`)                                                        */
+/* -------------------------------------------------------------------------- */
+
+test("reads an asset URL back out of a ?url= permalink", () => {
+  // `?url=` に載るのはパーセントエンコードされたURL。読み出しは
+  // `URLSearchParams` に任せるので、こちらでdecodeしない。
+  assert.deepEqual(readSpaceRef(`${PAGES}?${encoded(SOG_URL)}`), SOG_SPACE);
+  assert.deepEqual(readSpaceRef(`${PAGES}?${encoded(KISS_GS_META)}`), KISS_GS_SPACE);
+});
+
+test("reads an asset URL and a view pose from the same permalink", () => {
+  const href = `${PAGES}?${encoded(KISS_GS_META)}&${VIEW_PARAM}=${VIEW}`;
+  assert.deepEqual(readSpaceRef(href), KISS_GS_SPACE);
+  assert.deepEqual(readViewPose(href), POSE);
+});
+
+test("builds a ?url= permalink from a URL space", () => {
+  const link = permalinkFor(PAGES, SOG_SPACE);
+  assert.equal(link, `${PAGES}?${encoded(SOG_URL)}`);
+  // 二重encodeしていないこと。読み直すと元のURLに戻る。
+  assert.equal(new URL(link ?? "").searchParams.get(SOURCE_URL_PARAM), SOG_URL);
+});
+
+test("carries a view pose on a ?url= permalink too", () => {
+  const link = permalinkFor(PAGES, KISS_GS_SPACE, POSE) ?? "";
+  const params = new URL(link).searchParams;
+  assert.equal(params.get(SOURCE_URL_PARAM), KISS_GS_META);
+  assert.equal(params.get(VIEW_PARAM), VIEW);
+  assert.deepEqual(readSpaceRef(link), KISS_GS_SPACE);
+  assert.deepEqual(readViewPose(link), POSE);
+});
+
+test("keeps the URL space link free of a stale view", () => {
+  const withView = `${PAGES}?${encoded(SOG_URL)}&${VIEW_PARAM}=${VIEW}`;
+  assert.equal(permalinkFor(withView, SOG_SPACE), `${PAGES}?${encoded(SOG_URL)}`);
+});
+
+test("drops a stale ?url= when switching to a space with no permalink", () => {
+  assert.equal(hrefWithoutSpace(`${PAGES}?${encoded(SOG_URL)}`), PAGES);
+  assert.equal(hrefWithoutSpace(`${PAGES}?${encoded(SOG_URL)}&${VIEW_PARAM}=${VIEW}`), PAGES);
+  assert.equal(hrefWithoutSpace(`${PAGES}?debug=1&${encoded(SOG_URL)}`), `${PAGES}?debug=1`);
+});
+
+test("never emits a permalink carrying an asset URL next to a provider ID", () => {
+  const all = `${PAGES}?id=${SHARE_ID}&ss=${SCENE_ID}&${encoded(SOG_URL)}`;
+  assert.equal(permalinkFor(all, SOG_SPACE), `${PAGES}?${encoded(SOG_URL)}`);
+  assert.equal(permalinkFor(all, SHARE), `${PAGES}?${SHARE_ID_PARAM}=${SHARE_ID}`);
+  assert.equal(permalinkFor(all, SCENE), `${PAGES}?${SCENE_ID_PARAM}=${SCENE_ID}`);
+});
+
+test("prefers a provider ID over ?url= when a URL carries both", () => {
+  // 異常なURL。既に配ってある `?id=` / `?ss=` のリンクを壊さないほうを採る。
+  assert.deepEqual(readSpaceRef(`${PAGES}?id=${SHARE_ID}&${encoded(SOG_URL)}`), SHARE);
+  assert.deepEqual(readSpaceRef(`${PAGES}?ss=${SCENE_ID}&${encoded(SOG_URL)}`), SCENE);
+  // `id` と `ss` の間の優先順は変わっていない。
+  assert.deepEqual(readSpaceRef(`${PAGES}?id=${SHARE_ID}&ss=${SCENE_ID}`), SHARE);
+  // 先に見つかったparameterが壊れていれば、後ろへ落ちずに不正として扱う。
+  assert.equal(readSpaceRef(`${PAGES}?id=broken&${encoded(SOG_URL)}`), null);
+});
+
+test("refuses asset URLs the receiving device could not open", () => {
+  // ローカルのファイルやこの端末限定の参照は共有できない。
+  for (const value of [
+    "blob:https://afjk.github.io/9a1f-4b2c",
+    "data:application/octet-stream;base64,AAAA",
+    "file:///Users/afjk/capture.sog",
+    "javascript:alert(1)",
+    "not a url",
+    "",
+  ]) {
+    assert.equal(canonicalSpaceUrl(value), null, value);
+    assert.equal(readSpaceRef(`${PAGES}?${encoded(value)}`), null, value);
+    assert.equal(permalinkFor(PAGES, { provider: "url", url: value }), null, value);
+  }
+});
+
+test("accepts http and https asset URLs", () => {
+  for (const value of ["http://example.com/a.sog", "https://example.com/a.sog"]) {
+    assert.equal(canonicalSpaceUrl(value), value);
+    assert.deepEqual(readSpaceRef(`${PAGES}?${encoded(value)}`), { provider: "url", url: value });
+  }
+});
+
+test("canonicalises a KISS-GS directory URL onto its meta.json", () => {
+  // 入力がディレクトリでも `meta.json` でも、共有されるのは同じ1本のURL。
+  assert.equal(canonicalSpaceUrl(KISS_GS_DIR), KISS_GS_META);
+  assert.equal(canonicalSpaceUrl(`${KISS_GS_DIR}/`), KISS_GS_META);
+  assert.equal(canonicalSpaceUrl(KISS_GS_META), KISS_GS_META);
+  assert.deepEqual(readSpaceRef(`${PAGES}?${encoded(KISS_GS_DIR)}`), KISS_GS_SPACE);
+  assert.equal(permalinkFor(PAGES, { provider: "url", url: KISS_GS_DIR }), `${PAGES}?${encoded(KISS_GS_META)}`);
+});
+
+test("canonicalisation drops the fragment but keeps a signed query", () => {
+  assert.equal(canonicalSpaceUrl(`${SOG_URL}#somewhere`), SOG_URL);
+  // 署名付きURLはqueryが無いと取得できない。一律で捨ててはいけない。
+  const signed = `${SOG_URL}?X-Amz-Signature=abc&X-Amz-Expires=900`;
+  assert.equal(canonicalSpaceUrl(signed), signed);
+  assert.equal(canonicalSpaceUrl(`${signed}#top`), signed);
+});
+
+test("tells URL spaces apart, and matches a directory against its meta.json", () => {
+  assert.ok(isSameSpace(KISS_GS_SPACE, { provider: "url", url: KISS_GS_DIR }));
+  assert.ok(isSameSpace(KISS_GS_SPACE, { provider: "url", url: `${KISS_GS_DIR}/` }));
+  assert.ok(!isSameSpace(KISS_GS_SPACE, SOG_SPACE));
+  // 提供元が違えば別の空間。URL参照とSuperSplatを取り違えない。
+  assert.ok(!isSameSpace(SOG_SPACE, SCENE));
+  assert.ok(!isSameSpace(SOG_SPACE, null));
+});
+
+test("keeps a ?url= permalink pointing at the deployment that made it", () => {
+  const subpath = "https://example.org/viewer/sub/";
+  assert.equal(permalinkFor(subpath, SOG_SPACE), `${subpath}?${encoded(SOG_URL)}`);
 });

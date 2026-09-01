@@ -166,7 +166,10 @@ test("opens a shared space straight from ?id= without touching the sample", asyn
   // fetch・decode・GPU転送が二重に走るので、そこを固定しておく。
   assert.match(viewer, /const deepLink = readSpaceRef\(window\.location\.href\);/);
   assert.match(viewer, /\? shareUrlFromShareId\(deepLink\.id\)/);
-  assert.match(viewer, /: sceneUrlFromSceneId\(deepLink\.id\);/);
+  assert.match(viewer, /\? sceneUrlFromSceneId\(deepLink\.id\)/);
+  // URL参照はそのまま `loadSource` へ渡す。`.sog` かコンテナかは通常の
+  // 読み込みと同じ経路が決める。
+  assert.match(viewer, /: deepLink\.url;/);
   assert.match(viewer, /if \(deepLinkUrl\) void loadSource\(\{ kind: "url", value: deepLinkUrl \}, true\);/);
   assert.match(viewer, /else void loadSample\(true\);/);
   // サンプルの取得はこの1箇所だけ。深いリンク経路からは辿り着けない。
@@ -190,12 +193,27 @@ test("opens a shared space straight from ?id= without touching the sample", asyn
   );
   assert.match(viewer, /shareId = share\.shareId/);
 
+  // resolverを通さない空間は、正規化したアセットURLで指す。KISS-GS専用の
+  // 分岐は増やさず、`?url=` ひとつに寄せる。
+  assert.match(viewer, /canonicalUrl\?: string;/);
+  assert.match(
+    viewer,
+    /if \(source\.kind === "url" && source\.canonicalUrl\) \{\s*\n(?:\s*\/\/.*\n)*\s*const url = canonicalSpaceUrl\(source\.canonicalUrl\);/,
+  );
+  assert.match(viewer, /if \(url\) return \{ provider: "url", url \};/);
+  // SOG-XTは入力がディレクトリでも、解決した meta.json のURLを共有する。
+  assert.match(viewer, /canonicalUrl = metadataUrl;/);
+  assert.match(viewer, /fetchUrl = direct\.toString\(\);\s*\n\s*canonicalUrl = fetchUrl;/);
+  // サンプルとローカルファイルは共有しない。どちらも canonicalUrl を持たない。
+  assert.doesNotMatch(viewer, /canonicalUrl: SAMPLE_URL|canonicalUrl = file/);
+
   // 成功したロードのたびにアドレスバーを合わせる。載せられない空間では id / ss を消す。
   assert.match(viewer, /const next = space \? permalinkFor\(href, space, pose\) : hrefWithoutSpace\(href\)/);
   assert.match(viewer, /window\.history\.replaceState\(null, "", next\)/);
   // アドレスバーへ残すのはユーザーが指定した視点だけ。公式Home Viewは載せない。
   assert.match(viewer, /syncPermalink\(space, linkedView\)/);
-  // 署名付きURLはアドレスバーへ出さない。載せるのは共有IDだけ。
+  // 署名付きURLはアドレスバーへ出さない。載せるのは共有IDか、ユーザーが
+  // 入力したアセットURLを正規化したものだけ。
   assert.doesNotMatch(viewer, /replaceState\([^)]*assetUrl/);
 
   // 同じ空間を二度読まない。共有ID・シーンID・SOGのURLで鍵を作り、表示中／読み込み中を見る。

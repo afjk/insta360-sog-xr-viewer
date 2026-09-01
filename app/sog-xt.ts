@@ -15,13 +15,14 @@
  *
  * DOMにもPlayCanvasにも依存しないので、そのままNodeでテストできる。
  */
+import { CONTAINER_METADATA_FILENAME, containerMetadataUrl } from "./url-safety.ts";
 
 /** このデコーダが読める `meta.json` の `format`。 */
 export const SOG_XT_FORMAT = "sog-xt";
 /** 読める `version`。KISS-GS公式サンプル（2026-08時点）はすべて 3。 */
 export const SOG_XT_SUPPORTED_VERSIONS = [3] as const;
 /** コンテナのメタデータのファイル名。ディレクトリURLにはこれを足す。 */
-export const SOG_XT_METADATA_FILENAME = "meta.json";
+export const SOG_XT_METADATA_FILENAME = CONTAINER_METADATA_FILENAME;
 /** 3DGSのSH第0次係数を色へ直す定数。PlayCanvasの `SH_C0` と同じ値。 */
 export const SH_C0 = 0.28209479177387814;
 /** observed-minmax の除算保護。KISS-GS側の `EPSILON` と同じ値にそろえる。 */
@@ -373,7 +374,8 @@ export function isSogXtMetadata(input: unknown): boolean {
  *  1. `.../meta.json` そのもの
  *  2. SOG-XTディレクトリ（`.../M/MipNeRF360-Garden` か、末尾スラッシュ付き）
  *
- * 2は「最後のセグメントに拡張子が無い」ことで見分ける。ここで返るのは
+ * どちらを同じ場所へ寄せるかの規則は `url-safety.ts` と共有している。
+ * パーマリンクの正規化が同じ規則を見る必要があるため。ここで返るのは
  * 「SOG-XTかもしれないURL」でしかなく、SOG-XTかどうかは取得した
  * `meta.json` の `format` で決める。URL文字列から提供元を推測しない。
  */
@@ -386,23 +388,10 @@ export function parseSogXtUrl(input: string): { metadataUrl: string; baseUrl: st
   } catch {
     return null;
   }
-  if (url.protocol !== "https:" && url.protocol !== "http:") return null;
-
-  const segments = url.pathname.split("/");
-  const last = segments[segments.length - 1];
-
-  if (last.toLowerCase() === SOG_XT_METADATA_FILENAME) {
-    return { metadataUrl: url.toString(), baseUrl: new URL(".", url).toString() };
-  }
-  // ディレクトリらしきURL。末尾スラッシュか、拡張子を持たない最後のセグメント。
-  if (last === "" || !/\.[a-z0-9]+$/i.test(last)) {
-    const base = new URL(last === "" ? "./" : `${last}/`, url);
-    return {
-      metadataUrl: new URL(SOG_XT_METADATA_FILENAME, base).toString(),
-      baseUrl: base.toString(),
-    };
-  }
-  return null;
+  const container = containerMetadataUrl(url);
+  return container
+    ? { metadataUrl: container.metadata.toString(), baseUrl: container.base.toString() }
+    : null;
 }
 
 /** `meta.json` の相対ファイル名を、取得に使える絶対URLへ直す。 */
