@@ -202,10 +202,18 @@ rig * HMD pose = 目的の視点
 1. `xr.start(...)` の直前に、いまDesktopに見えている視点を控える
 2. rigは一度identityへ戻す
 3. XRセッション開始後、**最初にHMDのposeが入ったフレーム**でrigを1回だけ補正する
-   （PlayCanvasはviewer poseを取れなかったフレームでは `app.update` ごと飛ばすので、
-   `app.on("update")` が呼ばれた時点でカメラには有効なposeが入っています）
+   （フックは `app.on("update")` ではなく **`xr.on("update")`**。詳しくは下記）
 4. 補正は水平回転 `yawOffset = desiredYaw - currentHeadYaw` をrigのY回転に入れ、
    rigの位置は `desiredPosition - R * currentHeadPosition` にする
+
+補正を `xr.on("update")` に掛けるのは、`app.on("update")` が**XRのposeが入っていない
+フレームでも走る**ためです。PlayCanvasがHMDのposeをカメラへ書くのは `xrFrame` を伴う
+フレームだけですが、`xr.start()` の時点で予約済みだったブラウザの `requestAnimationFrame`
+は `xrFrame` を持たないまま発火します。そのフレームでは `xr.active` はもう真なのにカメラ
+にはDesktopの姿勢が残っていて、それをHMD poseだと思って補正すると、次のフレームで本物の
+poseが加算され、**まるで見当違いの場所（だいたい原点付近）**から始まります。
+`xr.on("update")` はカメラへposeを書いた直後に発火するので、そこで読む
+`getLocalPosition()` は必ずHMDのものになります。
 
 `XRSPACE_LOCALFLOOR` のposeには、ユーザーの実際の頭の高さとroom-space原点からのずれが
 すでに入っています。そのため `rig.position = desiredPosition` のような単純代入はしません。

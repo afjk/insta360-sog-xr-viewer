@@ -256,6 +256,18 @@ test("restores the linked view on desktop and spawns XR from the rig", async () 
   assert.match(viewer, /const desktopView = currentViewPose\(\);\s*\n\s*pendingXrSpawn = desktopView;/);
   // HMD poseが入ったフレームで1回だけrigを補正する。camera へは書かない。
   assert.match(viewer, /logXrSpawn\(\);\s*\n\s*applyXrSpawn\(\);/);
+  // 補正を掛けるのは `xr.on("update")`。`app.on("update")` はXRのposeが
+  // 入っていないフレームでも走る——`xr.start()` の時点で予約済みだった
+  // ブラウザの rAF は `xrFrame` を持たず、そこでは `xr.active` が真なのに
+  // カメラにはDesktopの姿勢が残っている。それをHMD poseとして補正すると、
+  // 次のフレームで本物のposeが足されて原点付近へ飛ぶ。
+  assert.match(viewer, /const onXrFrame = \(\) => \{\s*\n\s*logXrSpawn\(\);\s*\n\s*applyXrSpawn\(\);\s*\n\s*\};/);
+  assert.match(viewer, /xr\.on\("update", onXrFrame\);/);
+  // フレーム毎のlocomotionだけが `app.on("update")` に残る。
+  assert.match(
+    viewer,
+    /const onUpdate = \(deltaSeconds: number\) => \{\s*\n\s*if \(xr\.active\) \{\s*\n\s*updateXrMovement\(/,
+  );
   assert.match(viewer, /const head = cameraEntity\.getLocalPosition\(\)/);
   // 立たせる先はDesktopのeyeそのものではなく、見下ろし角を見られる範囲まで
   // 戻した位置。pitchはHMDが持つので再現できず、急な見下ろし視点をeyeへ

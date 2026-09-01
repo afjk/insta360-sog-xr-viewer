@@ -1740,9 +1740,18 @@ export function SogViewer() {
      * 上を通り越してしまうので、注視点のほうを正面へ合わせる。水平に近い
      * 視点では両者は一致する。
      *
-     * PlayCanvasはviewer poseを取れなかったフレームでは `app.update` ごと
-     * 飛ばすので、このハンドラが呼ばれた時点でカメラには有効なposeが
-     * 入っている。適用は1回だけで、あとは通常のlocomotionがrigを動かす。
+     * 呼ぶのは `app.on("update")` ではなく **`xr.on("update")`**。前者は
+     * XRのposeが入っていないフレームでも走る。`app.tick` がHMDのposeを
+     * カメラへ書くのは `xrFrame` を伴うフレームだけだが、`xr.start()` の
+     * 時点で予約済みだったブラウザの `requestAnimationFrame` は `xrFrame`
+     * を持たないまま発火する。そのフレームでは `xr.active` はもう真なのに
+     * カメラにはDesktopの姿勢が残っていて、それをHMD poseだと思って補正
+     * すると、次のフレームで本物のposeが加算され、まるで見当違いの場所
+     * （だいたい原点付近＝「VRだと視点が移動していない」）へ飛ぶ。
+     * `xr.on("update")` はカメラへposeを書いた直後に発火するので、
+     * ここで読む `getLocalPosition()` は必ずHMDのものになる。
+     *
+     * 適用は1回だけで、あとは通常のlocomotionがrigを動かす。
      */
     const applyXrSpawn = () => {
       if (!pendingXrSpawn) return;
@@ -1848,12 +1857,20 @@ export function SogViewer() {
       }
     };
 
+    /**
+     * HMDのposeがカメラへ入った直後に呼ばれる。ここでだけrigを補正する。
+     *
+     * 突き合わせは補正の次のフレーム。実際のHMD poseで組み上がった
+     * world姿勢を見たいので、適用より先に置く。
+     */
+    const onXrFrame = () => {
+      logXrSpawn();
+      applyXrSpawn();
+    };
+    xr.on("update", onXrFrame);
+
     const onUpdate = (deltaSeconds: number) => {
       if (xr.active) {
-        // 突き合わせは補正の次のフレーム。実際のHMD poseで組み上がった
-        // world姿勢を見たいので、適用より先に置く。
-        logXrSpawn();
-        applyXrSpawn();
         updateXrMovement(Math.min(deltaSeconds, 0.05));
       } else {
         updateDesktopMovement(Math.min(deltaSeconds, 0.05));
