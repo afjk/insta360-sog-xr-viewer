@@ -47,6 +47,7 @@ import {
   orbitTargetOf,
   pitchDegreesFromForward,
   xrRigOffset,
+  xrSpawnPose,
   yawDegreesFromBasis,
   type HorizontalPose,
   type ViewPose,
@@ -613,7 +614,7 @@ export function SogViewer() {
     // `?debug=1` で開いたときだけ、spawn結果をconsoleへ出す。実機でDesktopと
     // Questの視点を突き合わせるための確認用で、既定では何も出さない。
     const xrDebug = new URLSearchParams(window.location.search).get("debug") === "1";
-    let xrSpawnDebug: ViewPose | null = null;
+    let xrSpawnDebug: HorizontalPose | null = null;
 
     applyPlacement(framedBounds);
     frameBounds(framedBounds);
@@ -1734,6 +1735,11 @@ export function SogViewer() {
      * そのままrigへ入れる。合わせるのは位置と水平yawだけで、pitch / rollは
      * HMDのものを尊重する（VRではユーザー本人が頭を動かしている）。
      *
+     * 立たせる先はDesktopのeyeそのものではなく `xrSpawnPose` が返す位置。
+     * pitchを再現できない以上、eyeへ立たせると見下ろしていた分だけ被写体の
+     * 上を通り越してしまうので、注視点のほうを正面へ合わせる。水平に近い
+     * 視点では両者は一致する。
+     *
      * PlayCanvasはviewer poseを取れなかったフレームでは `app.update` ごと
      * 飛ばすので、このハンドラが呼ばれた時点でカメラには有効なposeが
      * 入っている。適用は1回だけで、あとは通常のlocomotionがrigを動かす。
@@ -1745,12 +1751,7 @@ export function SogViewer() {
       const rotation = cameraEntity.getLocalRotation();
       rotation.transformVector(LOCAL_FORWARD, headForward);
       rotation.transformVector(LOCAL_UP, headUp);
-      const desired: HorizontalPose = {
-        x: pendingXrSpawn.x,
-        y: pendingXrSpawn.y,
-        z: pendingXrSpawn.z,
-        yaw: pendingXrSpawn.yaw,
-      };
+      const desired = xrSpawnPose(pendingXrSpawn);
       const rigPose = xrRigOffset(desired, {
         x: head.x,
         y: head.y,
@@ -1760,9 +1761,10 @@ export function SogViewer() {
       rig.setLocalPosition(rigPose.x, rigPose.y, rigPose.z);
       rig.setLocalEulerAngles(0, rigPose.yaw, 0);
       if (xrDebug) {
-        xrSpawnDebug = pendingXrSpawn;
+        xrSpawnDebug = desired;
         console.info("[sog-xr] spawn", {
-          desired: desired,
+          view: pendingXrSpawn,
+          desired,
           head: { x: head.x, y: head.y, z: head.z, yaw: yawDegreesFromBasis(headForward, headUp) },
           rig: rigPose,
         });
@@ -1773,9 +1775,10 @@ export function SogViewer() {
     /**
      * 補正の結果を、次のフレームの実際のカメラworld姿勢と突き合わせて出す。
      *
-     * 見るのは `view=` に入っている値との差。位置で数cm〜10cm、yawで数度に
-     * 収まっていれば実機でも合っている。大きくずれるときは、local-floorの
-     * HMD poseをrigへ単純加算していないかを疑う。
+     * 見るのは `xrSpawnPose` が出した目的の立ち位置との差。位置で数cm〜10cm、
+     * yawで数度に収まっていれば実機でも合っている。大きくずれるときは、
+     * local-floorのHMD poseをrigへ単純加算していないかを疑う。pitchは
+     * 合わせていないので比べない。
      */
     const logXrSpawn = () => {
       if (!xrSpawnDebug) return;

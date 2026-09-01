@@ -257,7 +257,17 @@ test("restores the linked view on desktop and spawns XR from the rig", async () 
   // HMD poseが入ったフレームで1回だけrigを補正する。camera へは書かない。
   assert.match(viewer, /logXrSpawn\(\);\s*\n\s*applyXrSpawn\(\);/);
   assert.match(viewer, /const head = cameraEntity\.getLocalPosition\(\)/);
+  // 立たせる先はDesktopのeyeそのものではなく、見下ろし角を見られる範囲まで
+  // 戻した位置。pitchはHMDが持つので再現できず、急な見下ろし視点をeyeへ
+  // そのまま置くと被写体の上を通り越してしまう。
+  assert.match(viewer, /const desired = xrSpawnPose\(pendingXrSpawn\);/);
   assert.match(viewer, /const rigPose = xrRigOffset\(desired, \{/);
+  // 上限内の視点はeyeのまま返す。既に配ってあるリンクの立ち位置は変わらない。
+  assert.match(pose, /export const XR_SPAWN_PITCH_LIMIT = \d+;/);
+  assert.match(
+    pose,
+    /if \(pitch === pose\.pitch\) return \{ x: pose\.x, y: pose\.y, z: pose\.z, yaw: pose\.yaw \};/,
+  );
   assert.match(viewer, /rig\.setLocalPosition\(rigPose\.x, rigPose\.y, rigPose\.z\)/);
   assert.match(viewer, /rig\.setLocalEulerAngles\(0, rigPose\.yaw, 0\)/);
   assert.match(viewer, /pendingXrSpawn = null;/);

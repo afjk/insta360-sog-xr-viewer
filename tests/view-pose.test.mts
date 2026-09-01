@@ -11,6 +11,8 @@ import {
   poseFromEyeAndTarget,
   pitchDegreesFromForward,
   xrRigOffset,
+  XR_SPAWN_PITCH_LIMIT,
+  xrSpawnPose,
   yawDegreesFromBasis,
   type HorizontalPose,
   type ViewPose,
@@ -247,6 +249,7 @@ test("restores the same camera after a pan and after WASD movement", () => {
 
 test("spawns XR at the same place and heading as the restored desktop view", () => {
   // Desktopで復元した視点と、Quest側でrig補正したあとのHMD world poseを突き合わせる。
+  // pitch 6.2度は見下ろしの上限内なので、立ち位置はDesktopのeyeのまま。
   const desktop = simulateDesktopCamera({
     target: { x: 1.2, y: 1.4, z: -0.6 },
     rig: { x: -3.1, y: 0.4, z: 2.7 },
@@ -267,7 +270,7 @@ test("spawns XR at the same place and heading as the restored desktop view", () 
 
   // local-floorで立ち上がったQuest。原点からずれた場所で、少し下を向いている。
   const head: HorizontalPose = { x: 0.62, y: 1.71, z: -1.35, yaw: -47.5 };
-  const rig = xrRigOffset({ x: pose.x, y: pose.y, z: pose.z, yaw: pose.yaw }, head);
+  const rig = xrRigOffset(xrSpawnPose(pose), head);
   const spawned = applyRigPose(rig, head);
 
   // 実機の許容誤差（位置10cm・yaw数度）よりはるかに小さいこと。
@@ -347,4 +350,79 @@ test("looks straight down without losing the pose", () => {
   close(pose.pitch, 90, 1e-9, "pitch");
   close(pose.distance, 2, 1e-12, "distance");
   assert.equal(pose.yaw, 0);
+});
+
+/* -------------------------------------------------------------------------- */
+/* VRの立ち位置（xrSpawnPose）                                                 */
+/* -------------------------------------------------------------------------- */
+
+test("leaves a view within the downward limit exactly where it is", () => {
+  // 上限内の視点は1mmも動かさない。既に配ってあるリンクの立ち位置を
+  // 変えないための境界で、丸め誤差も入れない。
+  for (const pitch of [0, 4.58, -4.58, 12, -19.9, XR_SPAWN_PITCH_LIMIT, -XR_SPAWN_PITCH_LIMIT]) {
+    const view: ViewPose = { ...POSE, pitch };
+    const spawn = xrSpawnPose(view);
+    assert.deepEqual(spawn, { x: view.x, y: view.y, z: view.z, yaw: view.yaw }, `pitch ${pitch}`);
+  }
+});
+
+test("keeps the room capture's default view untouched", () => {
+  // 部屋のキャプチャの既定視点はほぼ水平。Insta360の既存リンクがここに入る。
+  const spawn = xrSpawnPose(POSE);
+  assert.deepEqual(spawn, { x: POSE.x, y: POSE.y, z: POSE.z, yaw: POSE.yaw });
+});
+
+test("brings a steep look-down back to the limit, keeping target and distance", () => {
+  // afjkさんが共有したKISS-GS Gardenの視点。42.2度見下ろしている。
+  const steep: ViewPose = { x: 0.586, y: 7.959, z: 4.154, yaw: -5.54, pitch: 42.2, distance: 3.351 };
+  const target = orbitTargetOf(steep);
+  const spawn = xrSpawnPose(steep);
+
+  // 注視点は動かさない。同じものを見る。
+  const capped = orbitTargetOf({ ...steep, ...spawn, pitch: XR_SPAWN_PITCH_LIMIT });
+  close(capped.x, target.x, 1e-6, "target x");
+  close(capped.y, target.y, 1e-6, "target y");
+  close(capped.z, target.z, 1e-6, "target z");
+
+  // 距離もそのまま。被写体の見かけの大きさが変わらない。
+  close(
+    Math.hypot(spawn.x - target.x, spawn.y - target.y, spawn.z - target.z),
+    steep.distance,
+    1e-6,
+    "distance",
+  );
+  close(spawn.yaw, steep.yaw, 1e-9, "yaw");
+
+  // 見下ろす分だけ下がるが、注視点と同じ高さまでは落とさない。
+  // ここまで下げると被写体と目線が並び、手前の地面や草に埋もれる。
+  assert.ok(spawn.y < steep.y, `lowered from ${steep.y} to ${spawn.y}`);
+  assert.ok(spawn.y > target.y, `stays above the target ${target.y}, got ${spawn.y}`);
+});
+
+test("puts the target within a comfortable downward glance on a real headset", () => {
+  // rig補正まで通したうえで、正面（HMDが水平）から注視点までの角度を見る。
+  const steep: ViewPose = { x: 0.586, y: 7.959, z: 4.154, yaw: -5.54, pitch: 42.2, distance: 3.351 };
+  const target = orbitTargetOf(steep);
+  const head: HorizontalPose = { x: 0.62, y: 1.71, z: -1.35, yaw: -47.5 };
+  const spawned = applyRigPose(xrRigOffset(xrSpawnPose(steep), head), head);
+  const toTarget = poseFromEyeAndTarget(spawned, target);
+  assert.ok(toTarget);
+  close(toTarget.pitch, XR_SPAWN_PITCH_LIMIT, 0.05, "downward angle");
+  close(normalizeYawDegrees(toTarget.yaw - spawned.yaw), 0, 0.05, "centred horizontally");
+  close(toTarget.distance, steep.distance, 2e-3, "distance");
+});
+
+test("looking straight down still yields a usable spawn", () => {
+  // 真下を向いた視点でも有限で、注視点より上に立つ。
+  const down: ViewPose = { x: 1, y: 10, z: 2, yaw: 30, pitch: 89, distance: 4 };
+  const target = orbitTargetOf(down);
+  const spawn = xrSpawnPose(down);
+  assert.ok(Number.isFinite(spawn.x) && Number.isFinite(spawn.y) && Number.isFinite(spawn.z));
+  assert.ok(spawn.y > target.y, "stays above the target");
+  close(
+    Math.hypot(spawn.x - target.x, spawn.y - target.y, spawn.z - target.z),
+    down.distance,
+    1e-6,
+    "distance",
+  );
 });
