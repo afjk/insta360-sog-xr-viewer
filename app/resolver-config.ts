@@ -5,6 +5,10 @@
  * 解決はサーバー側でしかできない。どこにそのサーバーがあるかは配信先によって
  * 違うため、コードに直接書かず `VITE_SOG_RESOLVER_ORIGIN` で渡す。
  *
+ * Lumaはここに入らない。公開キャプチャのAPIとartifactは第三者のページから
+ * 直接fetchできるので、解決エンドポイントを持たない配信でも開ける
+ * （`app/luma.ts` 冒頭を参照）。
+ *
  * - 未設定 … 同一オリジンの `/api/...` を使う（Cloudflare Worker版）
  * - `"none"` … 解決エンドポイントを持たない配信。共有URLの入力を無効化する
  * - URL … そのオリジンの `/api/...` を使う（専用Workerなど）
@@ -37,7 +41,7 @@ export type ResolverConfig =
   | { available: false; reason: string };
 
 const UNAVAILABLE_REASON =
-  "この配信にはInsta360共有URL・SuperSplatシーンURLを解決するエンドポイントがありません。SOGファイルを直接ドロップするか、.sog のURLを指定してください。";
+  "この配信にはInsta360共有URL・SuperSplatシーンURLを解決するエンドポイントがありません。LumaのキャプチャURLは解決サーバーを使わないのでそのまま開けます。ほかにSOGファイルを直接ドロップするか、.sog のURLを指定してください。";
 
 // Viteの `define` が差し込む。差し込まれていないビルドでは未定義のままなので、
 // `typeof` で触る（未宣言の識別子でも例外にならない）。

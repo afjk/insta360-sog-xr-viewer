@@ -94,6 +94,24 @@ export const SUPERSPLAT_PLACEMENT: PlacementTransform = {
 };
 
 /**
+ * Lumaの公開キャプチャの配置。回転しない（identity）。
+ *
+ * Lumaが公式に出しているthree.js向けのラッパー `LumaSplatsThree` は、
+ * キャプチャを `scene.add(splats)` するだけで、回転もスケールも掛けない
+ * （`lumalabs/luma-web-examples` の `src/DemoVR.ts` / `src/DemoHelloWorld.ts`）。
+ * three.jsもPlayCanvasも右手系のY-upなので、Lumaのキャプチャ座標はそのままで
+ * 上下前後が合う。
+ *
+ * 他の提供元と違って符号反転が要らないのは、Lumaが配っているのが
+ * 「ビューアへそのまま渡す向き」のデータだから。Insta360（Y-down）や
+ * SuperSplat（Y-downで書き出したSOG）とは前提が違う。
+ */
+export const LUMA_PLACEMENT: PlacementTransform = {
+  eulerAngles: { x: 0, y: 0, z: 0 },
+  signs: { x: 1, y: 1, z: 1 },
+};
+
+/**
  * splatをworldへ置くときのローカル位置。
  *
  * Viewerはsplatへ `transform` の回転を掛けてから、この位置を足している。

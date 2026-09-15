@@ -176,14 +176,22 @@ test("opens a shared space straight from ?id= without touching the sample", asyn
   assert.equal(viewer.match(/downloadSog\(SAMPLE_URL/g)?.length, 1);
 
   // 出どころは表示中のソースにproviderとして残し、ラベルの読み直しでは判断しない。
-  assert.match(
-    viewer,
-    /type SourceProvider = "sample" \| "file" \| "direct" \| "insta360" \| "supersplat" \| "kiss-gs";/,
-  );
+  for (const provider of [
+    "sample",
+    "file",
+    "direct",
+    "insta360",
+    "supersplat",
+    "kiss-gs",
+    "luma",
+  ]) {
+    assert.match(viewer, new RegExp(`type SourceProvider =[\\s\\S]*?\\| "${provider}"`));
+  }
   assert.match(viewer, /provider: SourceProvider;/);
-  // 中身の形式も同じように明示で持つ。SOGとSOG-XTはどちらも `meta.json` を
-  // 名乗るので、後からURLやラベルの文字列で見分けにいかない。
-  assert.match(viewer, /type SourceFormat = "sog" \| "sog-xt";/);
+  // 中身の形式も同じように明示で持つ。SOG・SOG-XT・Lumaはメタデータの名前が
+  // 重なる（どれも `meta.json` を名乗りうる）ので、後からURLやラベルの文字列で
+  // 見分けにいかない。
+  assert.match(viewer, /type SourceFormat = "sog" \| "sog-xt" \| "luma";/);
   assert.match(viewer, /format: SourceFormat;/);
   assert.match(viewer, /const next: ViewerSource = \{\s*\n\s*kind: request\.kind === "file" \? "file" : "url",\s*\n\s*provider,/);
   // サンプルは共有IDを持たない。ローカルファイルと直接URLも shareId が undefined のまま。
@@ -219,6 +227,7 @@ test("opens a shared space straight from ?id= without touching the sample", asyn
   // 同じ空間を二度読まない。共有ID・シーンID・SOGのURLで鍵を作り、表示中／読み込み中を見る。
   assert.match(viewer, /return `share:\$\{share\.shareId\}`/);
   assert.match(viewer, /return `supersplat:\$\{scene\.sceneId\}`/);
+  assert.match(viewer, /return `luma:\$\{capture\.uuid\}`/);
   assert.match(viewer, /if \(key && \(key === loadingKey \|\| key === shownKey\)\)/);
 
   // 共有由来のときだけリンクのコピーを出す。空間そのものと、いまの視点の2種類。
@@ -315,17 +324,19 @@ test("restores the linked view on desktop and spawns XR from the rig", async () 
   assert.match(viewer, /if \(xrDebug\) \{/);
   // 初期視点の根拠（`cameras.json` が届いたか）も同じフラグで出す。
   assert.match(viewer, /console\.info\("\[sog-xr\] initial"/);
-  // SOG-XTの内訳とベンチマークも同じフラグの下だけ。
+  // SOG-XT・Lumaの内訳とベンチマークも同じフラグの下だけ。
   assert.match(viewer, /console\.info\("\[sog-xr\] sog-xt"/);
+  assert.match(viewer, /console\.info\("\[sog-xr\] luma"/);
   assert.match(viewer, /console\.info\("\[sog-xr\] benchmark"/);
-  assert.equal(viewer.match(/console\.info/g)?.length, 5);
+  assert.equal(viewer.match(/console\.info/g)?.length, 7);
 });
 
 test("decodes KISS-GS SOG-XT in a worker and hands PlayCanvas the attributes directly", async () => {
-  const [viewer, decoder, bridge, worker, image] = await Promise.all([
+  const [viewer, decoder, bridge, sharedBridge, worker, image] = await Promise.all([
     readFile(new URL("../app/SogViewer.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/sog-xt.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/sog-xt-playcanvas.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/splat-playcanvas.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/sog-xt.worker.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/sog-image.ts", import.meta.url), "utf8"),
   ]);
@@ -359,19 +370,26 @@ test("decodes KISS-GS SOG-XT in a worker and hands PlayCanvas the attributes dir
   assert.match(viewer, /const wasAutoRendering = app\.autoRender;\s*\n\s*app\.autoRender = false;/);
   assert.match(viewer, /\} finally \{\s*\n\s*app\.autoRender = wasAutoRendering;/);
 
+  // TypedArray → GSplatData の変換は提供元に依らないので共有の層にある。
+  // SOG-XT側はそこへ委譲して、自分のエラーコードへ翻訳するだけ。
+  assert.match(bridge, /from "\.\/splat-playcanvas\.ts"/);
+  assert.match(bridge, /return createSplatResource\(device, decoded, SOG_XT_COMMENT\)/);
+  assert.match(bridge, /RESOURCE_CREATION_FAILED/);
+
   // 中間PLYは作らない。GSplatData / GSplatResource をそのまま使う。
-  assert.match(bridge, /import \{ GSplatData, GSplatResource \} from "playcanvas"/);
-  assert.match(bridge, /return new GSplatResource\(device, data\)/);
+  assert.match(sharedBridge, /import \{ GSplatData, GSplatResource \} from "playcanvas"/);
+  assert.match(sharedBridge, /return new GSplatResource\(device, data\)/);
   assert.match(viewer, /splatComponent\.resource = entry\.resource/);
   // 中間表現を作っていないことは「Blob・object URL・Assetを一切作らない」で縛る。
   // PLYを挟むならこのどれかが必ず要る。
   assert.doesNotMatch(bridge, /new Blob|createObjectURL|new Asset/);
+  assert.doesNotMatch(sharedBridge, /new Blob|createObjectURL|new Asset/);
   assert.doesNotMatch(worker, /new Blob|createObjectURL|new Asset/);
 
   // activated形式で渡す。落とすとscaleがexpで巨大になり、opacityが飽和する。
-  assert.match(bridge, /data\.activated = true/);
+  assert.match(sharedBridge, /data\.activated = true/);
   // quaternionはxyzwで持ち、PlayCanvasのwxyz（rot_0 = w）へ並べ替える。
-  assert.match(bridge, /prop\("rot_0", slice\(decoded\.rotation, 3\)\)/);
+  assert.match(sharedBridge, /prop\("rot_0", slice\(decoded\.rotation, 3\)\)/);
 
   // 既存のVR optimizerはSOG-XTには掛けない。理由は画面に出す。
   assert.match(viewer, /const SOG_XT_OPTIMIZE_REASON =/);
@@ -398,6 +416,85 @@ test("decodes KISS-GS SOG-XT in a worker and hands PlayCanvas the attributes dir
   // 計測は performance.mark / measure も併用する。
   assert.match(viewer, /performance\.measure\?\.\("sog-xt:load"/);
   assert.match(worker, /performance\.measure\?\.\("sog-xt:worker"/);
+});
+
+test("reads a Luma capture in a worker, with no resolver in the path", async () => {
+  const [viewer, decoder, bridge, worker, placement, resolver] = await Promise.all([
+    readFile(new URL("../app/SogViewer.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/luma.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/luma-playcanvas.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/luma.worker.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/capture-view.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/resolver-config.ts", import.meta.url), "utf8"),
+  ]);
+
+  // Luma固有の処理はSogViewer.tsxの外。ここが薄いままであることを縛る。
+  assert.match(viewer, /import \{ createLumaResource \} from "\.\/luma-playcanvas"/);
+  assert.match(viewer, /await showLuma\(\s*\n\s*next,\s*\n\s*lumaUuid,/);
+  // ビット並びと共分散の数学はデコーダの中だけ。Viewerには漏らさない。
+  assert.doesNotMatch(
+    viewer,
+    /halfToFloat|splatFromCovariance|eigenDecomposeSymmetric3|gs_web_gauss|unpackHalf/,
+  );
+
+  // 取得もデコードもWorkerの中。属性配列はTransferableで返す。
+  assert.match(viewer, /new Worker\(new URL\("\.\/luma\.worker\.ts", import\.meta\.url\)/);
+  assert.match(worker, /worker\.postMessage\(result, transferablesOf\(result\.decoded\)\)/);
+  // Workerは読み込みごとの使い捨て。使い回すと、途中で空間を切り替えたときに
+  // 前の読み込みの応答が後の読み込みのハンドラへ届く。
+  assert.match(viewer, /cancelLuma\(new Error\(LUMA_SUPERSEDED\)\);\s*\n\s*const worker = new Worker/);
+
+  // resolverは経路に入らない。公開APIとartifactはブラウザから直接取れるので、
+  // 解決エンドポイントを持たない配信（GitHub Pages）でも開ける。
+  assert.doesNotMatch(decoder, /resolver-config|RESOLVER_PATHS/);
+  assert.doesNotMatch(worker, /resolver-config|RESOLVER_PATHS/);
+  // 解決エンドポイントを持つ提供元にLumaは入れない。
+  assert.doesNotMatch(resolver, /ResolverProvider =[^;]*"luma"/);
+  assert.doesNotMatch(resolver, /luma: "\/api\/luma"/);
+  assert.match(worker, /lumaCaptureApiUrl\(uuid\)/);
+  assert.match(decoder, /const LUMA_CAPTURE_API_ORIGIN = "https:\/\/webapp\.engineeringlumalabs\.com"/);
+
+  // 中間PLYは作らない。共有の層へ委譲して、自分のエラーコードへ翻訳するだけ。
+  assert.match(bridge, /return createSplatResource\(device, decoded, LUMA_COMMENT\)/);
+  assert.doesNotMatch(bridge, /new Blob|createObjectURL|new Asset/);
+  assert.doesNotMatch(worker, /new Blob|createObjectURL|new Asset/);
+
+  // Lumaのキャプチャは既にY-up。他の提供元と違って回転を掛けない。
+  assert.match(placement, /export const LUMA_PLACEMENT: PlacementTransform = \{\s*\n\s*eulerAngles: \{ x: 0, y: 0, z: 0 \},\s*\n\s*signs: \{ x: 1, y: 1, z: 1 \},/);
+  assert.match(viewer, /provider === "luma"\s*\n?\s*\? LUMA_PLACEMENT/);
+
+  // 既存のVR optimizerはLumaには掛けない。理由は画面に出す。
+  assert.match(viewer, /const LUMA_OPTIMIZE_REASON =/);
+  assert.match(viewer, /LUMA_OPTIMIZE_REASON,/);
+
+  // 一覧ページ（`/featured`）は空間ひとつを指していない。何を貼ればよいかだけ伝える。
+  assert.match(viewer, /isLumaGalleryUrl\(input\)/);
+  assert.match(viewer, /LUMA_ERROR_MESSAGES\.LUMA_GALLERY_URL/);
+
+  // Luma独自の圧縮ストリームは読まない。読めないものを推測で開けにいかない。
+  assert.match(worker, /LUMA_COMPRESSED_UNSUPPORTED/);
+  assert.doesNotMatch(decoder, /gs_compressed_meta:|decodeCore|obfuscat/);
+
+  // エラーは段階ごとに区別する。表示は日本語、元のエラーはdebug consoleへ。
+  for (const code of [
+    "INVALID_LUMA_URL",
+    "LUMA_GALLERY_URL",
+    "LUMA_CAPTURE_NOT_FOUND",
+    "LUMA_UNAVAILABLE",
+    "LUMA_ARTIFACTS_NOT_FOUND",
+    "LUMA_COMPRESSED_UNSUPPORTED",
+    "LUMA_META_INVALID",
+    "LUMA_GAUSS_DOWNLOAD_FAILED",
+    "LUMA_GAUSS_INVALID",
+    "LUMA_RESOURCE_CREATION_FAILED",
+  ]) {
+    assert.match(decoder, new RegExp(`${code}:`));
+  }
+  assert.match(viewer, /console\.warn\("\[sog-xr\] luma error", message\.code, message\.detail\)/);
+
+  // 計測は performance.mark / measure も併用する。
+  assert.match(viewer, /performance\.measure\?\.\("luma:load"/);
+  assert.match(worker, /performance\.measure\?\.\("luma:worker"/);
 });
 
 test("builds and deploys a repository-relative GitHub Pages site", async () => {

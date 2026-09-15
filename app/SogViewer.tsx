@@ -32,6 +32,16 @@ import {
   type SuperSplatLicense,
   type SuperSplatResolution,
 } from "./supersplat";
+import {
+  captureUrlFromUuid,
+  isLumaGalleryUrl,
+  LUMA_ERROR_MESSAGES,
+  LumaError,
+  lumaErrorMessage,
+  parseLumaCaptureUrl,
+} from "./luma";
+import { createLumaResource } from "./luma-playcanvas";
+import type { LumaMessage, LumaRequest, LumaSummary, LumaTimings } from "./luma.worker";
 import { resolverConfig } from "./resolver-config";
 import {
   canonicalSpaceUrl,
@@ -54,6 +64,7 @@ import {
 } from "./view-pose";
 import {
   INSTA360_PLACEMENT,
+  LUMA_PLACEMENT,
   SUPERSPLAT_PLACEMENT,
   boxCentre,
   captureFovOf,
@@ -94,16 +105,24 @@ type SourceKind = "sample" | "url" | "file";
  * パーマリンク・ライセンス表示はすべて `provider` で決める。ラベル文字列や
  * URLの形から後で提供元を推測しない。
  */
-type SourceProvider = "sample" | "file" | "direct" | "insta360" | "supersplat" | "kiss-gs";
+type SourceProvider =
+  | "sample"
+  | "file"
+  | "direct"
+  | "insta360"
+  | "supersplat"
+  | "kiss-gs"
+  | "luma";
 /**
  * 中身の形式。`provider` と直交する。
  *
  * `sog` は PlayCanvas標準のSOG（bundled `.sog` / unbundled `meta.json`）、
  * `sog-xt` は KISS-GS の SOG-XT。どちらも `meta.json` という名前のメタデータを
  * 持つが、schemaも量子化の仕方も別物なので、取り違えないよう明示的に持つ。
+ * `luma` はLumaの公開キャプチャのgaussianテクスチャで、SOGとは何も共有しない。
  * 読み込み後にURLやラベルの文字列から後付けで判定しない。
  */
-type SourceFormat = "sog" | "sog-xt";
+type SourceFormat = "sog" | "sog-xt" | "luma";
 /** SuperSplat由来の空間に付く、公開ページから取れた情報。 */
 type SuperSplatSource = {
   sceneId: string;
@@ -111,6 +130,12 @@ type SuperSplatSource = {
   title: string;
   author: string;
   license: SuperSplatLicense | null;
+};
+/** Luma由来の空間に付く、公開APIから取れた情報。 */
+type LumaSource = {
+  uuid: string;
+  pageUrl: string;
+  title: string | null;
 };
 type ViewerSource = {
   kind: SourceKind;
@@ -131,6 +156,8 @@ type ViewerSource = {
   shareId?: string;
   /** SuperSplat由来のときだけ入る。 */
   supersplat?: SuperSplatSource;
+  /** Luma由来のときだけ入る。 */
+  luma?: LumaSource;
 };
 type LoadRequest = { kind: "url"; value: string } | { kind: "file"; file: File };
 type Bounds = SplatBounds;
@@ -156,6 +183,13 @@ type SplatEntry = {
   /** VR向け軽量化に使える元のバイト列。持っていなければ `null`。 */
   blob: Blob | null;
   hash: string | null;
+};
+/** Lumaの読み込み結果。`?debug=1` とベンチマーク表示に使う。 */
+type LumaDebugInfo = {
+  splats: number;
+  downloadedBytes: number;
+  timings: LumaTimings;
+  summary: LumaSummary;
 };
 /** SOG-XTの読み込み結果。`?debug=1` とベンチマーク表示に使う。 */
 type SogXtDebugInfo = {
@@ -221,6 +255,13 @@ const SOG_XT_LOAD_FAILED = "KISS-GS SOG-XTを読み込めませんでした。";
 // 別の空間へ切り替えられて畳んだ読み込み。画面には出さない。
 const SOG_XT_SUPERSEDED = "KISS-GS SOG-XTの読み込みを中断しました。";
 
+// Lumaのキャプチャも、SOGバンドルの形（splat番号＝ピクセル番号）をしていないので
+// 既存のoptimizerに通せない。Originalのままなら通常どおり表示できる。
+const LUMA_OPTIMIZE_REASON =
+  "Lumaのキャプチャでは現在VR向け軽量化を利用できません（Originalのまま表示します）。";
+const LUMA_LOAD_FAILED = "Lumaのキャプチャを読み込めませんでした。";
+const LUMA_SUPERSEDED = "Lumaのキャプチャの読み込みを中断しました。";
+
 /**
  * 表示中の空間をパーマリンクの形で指す。載せられない出どころでは `null`。
  *
@@ -236,6 +277,9 @@ const spaceRefOf = (source: ViewerSource): SpaceRef | null => {
   if (source.provider === "supersplat" && source.supersplat) {
     return { provider: "supersplat", id: source.supersplat.sceneId };
   }
+  if (source.provider === "luma" && source.luma) {
+    return { provider: "luma", id: source.luma.uuid };
+  }
   if (source.kind === "url" && source.canonicalUrl) {
     // `canonicalSpaceUrl` が `http:` / `https:` 以外を弾く。`blob:` や
     // `file:` は共有できない。
@@ -248,9 +292,10 @@ const spaceRefOf = (source: ViewerSource): SpaceRef | null => {
 /**
  * 提供元ごとの座標変換。
  *
- * SuperSplatとKISS-GSがZ軸まわり180°で、それ以外——サンプル・ローカルファイル・
- * `.sog` の直接URL・Insta360共有——は従来どおりInsta360の変換のまま。既に配って
- * あるリンクの見え方を変えないため。
+ * SuperSplatとKISS-GSがZ軸まわり180°、Lumaは回転なし（Lumaが配っているのが
+ * 既にY-upの向きのため。`LUMA_PLACEMENT` を参照）。それ以外——サンプル・
+ * ローカルファイル・`.sog` の直接URL・Insta360共有——は従来どおりInsta360の
+ * 変換のまま。既に配ってあるリンクの見え方を変えないため。
  *
  * KISS-GSがSuperSplatと同じ側なのは、KISS-GS公式ビューアがシーンの既定回転を
  * `[0, 0, 1, 0]`（xyzw、＝Z軸まわり180°）としているため。SOG-XTが載せている
@@ -267,7 +312,11 @@ const spaceRefOf = (source: ViewerSource): SpaceRef | null => {
  * 空間の配置（少なくともroll）を載せるparameterが要る。
  */
 const placementTransformOf = (provider: SourceProvider): PlacementTransform =>
-  provider === "supersplat" || provider === "kiss-gs" ? SUPERSPLAT_PLACEMENT : INSTA360_PLACEMENT;
+  provider === "luma"
+    ? LUMA_PLACEMENT
+    : provider === "supersplat" || provider === "kiss-gs"
+      ? SUPERSPLAT_PLACEMENT
+      : INSTA360_PLACEMENT;
 
 /** resolverのエラー応答を、画面に出す日本語へ直す。 */
 const superSplatErrorMessage = (
@@ -371,6 +420,8 @@ export function SogViewer() {
   const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // SOG-XTを読んだときだけ入る内訳。他の形式へ切り替えたら消す。
   const [sogXtInfo, setSogXtInfo] = useState<SogXtDebugInfo | null>(null);
+  // Lumaを読んだときだけ入る内訳。こちらも他の形式へ切り替えたら消す。
+  const [lumaInfo, setLumaInfo] = useState<LumaDebugInfo | null>(null);
   const [sourceStage, setSourceStage] = useState("");
   const [sourceProgress, setSourceProgress] = useState(0);
   const [sourceError, setSourceError] = useState("");
@@ -637,16 +688,23 @@ export function SogViewer() {
     // ハンドラへ届いてしまう。
     let sogXtWorker: Worker | null = null;
     let cancelSogXt: (reason: Error) => void = () => undefined;
+    // Lumaも同じ理由で読み込みごとの使い捨て。
+    let lumaWorker: Worker | null = null;
+    let cancelLuma: (reason: Error) => void = () => undefined;
 
     const unsupportedReason = optimizationUnsupportedReason();
     setOptimizeUnsupported(unsupportedReason);
 
     const assetErrorMessage = (error: unknown) =>
-      error instanceof Error
-        ? error.message
-        : typeof error === "string"
-          ? error
-          : "SOGファイルを読み込めませんでした。";
+      // `LumaError` の `message` は開発者向け（コード＋詳細）なので、
+      // 画面には日本語の文言を出す。Workerから返る失敗は既に文言になっている。
+      error instanceof LumaError
+        ? lumaErrorMessage(error)
+        : error instanceof Error
+          ? error.message
+          : typeof error === "string"
+            ? error
+            : "SOGファイルを読み込めませんでした。";
 
     /**
      * 表示中のsplatをコンポーネントへ差し替える。
@@ -833,9 +891,10 @@ export function SogViewer() {
       releaseEntry(previous);
       releaseOptimized();
       setOriginalSplats(splatCountOf(resource));
-      // SOG-XTの内訳は空間ごとのもの。切り替えたらいったん消し、SOG-XTなら
-      // このあと `showSogXt` が入れ直す。
+      // SOG-XT／Lumaの内訳は空間ごとのもの。切り替えたらいったん消し、
+      // その形式ならこのあと `showSogXt` / `showLuma` が入れ直す。
       setSogXtInfo(null);
+      setLumaInfo(null);
       setSource(next);
       originalOptimizeReason = entry.blob ? null : optimizeReason;
       setOptimizeSourceReason(originalOptimizeReason);
@@ -1270,6 +1329,125 @@ export function SogViewer() {
     };
 
     /**
+     * Lumaのキャプチャの取得とデコードをWorkerへ投げる。UIスレッドは進捗を受けるだけ。
+     *
+     * Workerは属性配列をTransferableで返すので、ここでのコピーは起きない。
+     * SOG-XTと違って描画を止めないのは、Lumaのデコードが素のバイナリ演算で、
+     * WebGLの読み出し（`readPixels`）を使わないため——表示中の空間を描いて
+     * いるGPUと取り合わない。
+     */
+    const runLumaWorker = (uuid: string, onStage: (stage: string, ratio: number) => void) =>
+      new Promise<Extract<LumaMessage, { type: "done" }>>((resolve, reject) => {
+        // 前の読み込みが残っていたら、Workerごと畳んでから始める。
+        cancelLuma(new Error(LUMA_SUPERSEDED));
+        const worker = new Worker(new URL("./luma.worker.ts", import.meta.url), {
+          type: "module",
+        });
+        lumaWorker = worker;
+        const finish = (settle: () => void) => {
+          worker.onmessage = null;
+          worker.onerror = null;
+          worker.terminate();
+          if (lumaWorker === worker) lumaWorker = null;
+          cancelLuma = () => undefined;
+          settle();
+        };
+        cancelLuma = (reason) => finish(() => reject(reason));
+        worker.onmessage = (event: MessageEvent<LumaMessage>) => {
+          const message = event.data;
+          if (message.type === "progress") {
+            onStage(message.stage, message.ratio);
+            return;
+          }
+          if (message.type === "error") {
+            if (xrDebug) console.warn("[sog-xr] luma error", message.code, message.detail);
+            finish(() => reject(new Error(message.message)));
+          } else {
+            finish(() => resolve(message));
+          }
+        };
+        worker.onerror = (event) => {
+          finish(() => reject(new Error(event.message || LUMA_LOAD_FAILED)));
+        };
+        worker.postMessage({ uuid } satisfies LumaRequest);
+      });
+
+    /**
+     * Lumaの公開キャプチャを読み込んで表示する。
+     *
+     * Worker → TypedArray → GSplatData → GSplatResource → GSplatComponent。
+     * 中間PLYは作らない。ここでやるのはGPUリソース化と計測だけで、共分散から
+     * スケールと姿勢を出す数学は `luma.ts` にしかない。
+     *
+     * 題名は読み込みが終わってから分かる（公開APIの応答に入っている）ので、
+     * ラベルとクレジットはここで組み直して `showSplat` へ渡す。
+     */
+    const showLuma = async (
+      next: ViewerSource,
+      uuid: string,
+      onStage: (stage: string, ratio: number) => void,
+      isCurrent: () => boolean,
+    ) => {
+      const startedAt = performance.now();
+      performance.mark?.("luma:load:start");
+      const result = await runLumaWorker(uuid, onStage);
+      // デコードしている間に別の空間へ切り替えられていたら、GPUリソースを
+      // 作らずに捨てる。ここを抜けると古い空間が表示されてしまう。
+      if (!isCurrent()) return;
+      onStage("PlayCanvasへ転送中", 0.99);
+      const resource = createLumaResource(app.graphicsDevice, result.decoded);
+      const totalMs = Math.round(performance.now() - startedAt);
+      performance.mark?.("luma:load:end");
+      performance.measure?.("luma:load", "luma:load:start", "luma:load:end");
+
+      const title = result.summary.title;
+      const withTitle: ViewerSource = {
+        ...next,
+        label: title ? `Luma ${title}` : next.label,
+        luma: next.luma ? { ...next.luma, title } : next.luma,
+      };
+      await showSplat(
+        withTitle,
+        { asset: null, resource, objectUrl: "", blob: null, hash: null },
+        null,
+        LUMA_OPTIMIZE_REASON,
+      );
+      const info: LumaDebugInfo = {
+        splats: result.decoded.count,
+        downloadedBytes: result.downloadedBytes,
+        timings: { ...result.timings, totalMs },
+        summary: result.summary,
+      };
+      setLumaInfo(info);
+      if (xrDebug) {
+        console.info("[sog-xr] luma", {
+          uuid,
+          format: result.summary.format,
+          title: result.summary.title,
+          splats: result.decoded.count,
+          declaredCount: result.summary.declaredCount,
+          textureHeight: result.summary.textureHeight,
+          degenerate: result.summary.degenerate,
+          haveSh: result.summary.haveSh,
+          downloadedBytes: result.downloadedBytes,
+          downloadMs: result.timings.downloadMs,
+          decodeMs: result.timings.decodeMs,
+          workerMs: result.timings.totalMs,
+          totalMs,
+        });
+        // ベンチマークとして貼り付けやすい最小の形。
+        console.info("[sog-xr] benchmark", {
+          format: "luma",
+          splats: result.decoded.count,
+          downloadedBytes: result.downloadedBytes,
+          downloadMs: result.timings.downloadMs,
+          decodeMs: result.timings.decodeMs,
+          totalMs,
+        });
+      }
+    };
+
+    /**
      * 同じ空間を二重に読み込まないための鍵。
      *
      * 共有ID・シーンID・SOGのURLが同じなら、解決もダウンロードもデコードも
@@ -1283,6 +1461,8 @@ export function SogViewer() {
       if (share) return `share:${share.shareId}`;
       const scene = parseSuperSplatUrl(input);
       if (scene) return `supersplat:${scene.sceneId}`;
+      const capture = parseLumaCaptureUrl(input);
+      if (capture) return `luma:${capture.uuid}`;
       // `meta.json` とディレクトリURLは、SOG-XTかPlayCanvas SOGかがまだ
       // 決まっていない。解決後のmeta.jsonのURLを鍵にすれば、どちらでも
       // 同じ入力が同じ鍵になる。
@@ -1331,6 +1511,9 @@ export function SogViewer() {
       let canonicalUrl: string | undefined;
       let shareId: string | undefined;
       let supersplat: SuperSplatSource | undefined;
+      let luma: LumaSource | undefined;
+      // Lumaとして読むときのキャプチャUUID。
+      let lumaUuid = "";
       let fetchUrl = "";
       // PlayCanvasに直接読ませるアセット。unbundled SOGのときだけ入る。
       let remote: { url: string; filename: string } | null = null;
@@ -1348,15 +1531,19 @@ export function SogViewer() {
         provider = "file";
         label = request.file.name;
       } else {
-        // 判定の順番は Insta360共有URL → SuperSplatシーンURL → 直接URL。
+        // 判定の順番は Insta360共有URL → SuperSplatシーンURL →
+        // LumaキャプチャURL → コンテナ（meta.json）→ 直接URL。
         const input = request.value.trim();
         const share = parseInsta360ShareUrl(input);
         const scene = share ? null : parseSuperSplatUrl(input);
+        const capture = !share && !scene ? parseLumaCaptureUrl(input) : null;
         // `.../meta.json` かディレクトリらしきURL。SOG-XTかもしれない候補で、
         // 実際にどちらかは取得した `meta.json` の `format` で決める。
-        const container = !share && !scene ? parseSogXtUrl(input) : null;
+        const container = !share && !scene && !capture ? parseSogXtUrl(input) : null;
         const direct =
-          !share && !scene && !container && isSpatialAssetUrl(input) ? toAbsoluteUrl(input) : null;
+          !share && !scene && !capture && !container && isSpatialAssetUrl(input)
+            ? toAbsoluteUrl(input)
+            : null;
         if (share) {
           const resolver = resolverConfig();
           if (!resolver.available) {
@@ -1416,6 +1603,14 @@ export function SogViewer() {
             reportFailure(error);
             return;
           }
+        } else if (capture) {
+          // 公開APIとartifactはブラウザから直接取れる（`luma.ts` 冒頭を参照）。
+          // resolverエンドポイントの有無に関係なく開ける。
+          provider = "luma";
+          format = "luma";
+          lumaUuid = capture.uuid;
+          luma = { uuid: capture.uuid, pageUrl: capture.captureUrl, title: null };
+          label = `Luma ${capture.uuid.slice(0, 8)}`;
         } else if (container) {
           const metadataUrl = container.metadataUrl;
           const folder = new URL(".", metadataUrl).pathname.split("/").filter(Boolean).pop() ?? "";
@@ -1453,10 +1648,16 @@ export function SogViewer() {
           fetchUrl = direct.toString();
           canonicalUrl = fetchUrl;
           label = direct.pathname.split("/").pop() || "space.sog";
+        } else if (isLumaGalleryUrl(input)) {
+          // `https://lumalabs.ai/featured` のような一覧ページ。どの空間を
+          // 指しているか決まらないので、何を貼ればよいかだけ伝えて止める。
+          setSourceError(LUMA_ERROR_MESSAGES.LUMA_GALLERY_URL);
+          loadingKey = "";
+          return;
         } else {
           setSourceError(
-            "Insta360の共有URL、SuperSplatのシーンURL、KISS-GS SOG-XTのURL、" +
-              "または .sog のURLを入力してください。",
+            "Insta360の共有URL、SuperSplatのシーンURL、LumaのキャプチャURL、" +
+              "KISS-GS SOG-XTのURL、または .sog のURLを入力してください。",
           );
           loadingKey = "";
           return;
@@ -1471,6 +1672,7 @@ export function SogViewer() {
         canonicalUrl,
         shareId,
         supersplat,
+        luma,
       };
 
       setPendingLabel(label);
@@ -1482,7 +1684,20 @@ export function SogViewer() {
         ? downloadCaptureCameras(camerasUrl)
         : Promise.resolve(null);
       try {
-        if (sogXtMetadataUrl) {
+        if (lumaUuid) {
+          const isCurrent = () => !disposed && token === loadToken;
+          await showLuma(
+            next,
+            lumaUuid,
+            (stage, ratio) => {
+              if (!isCurrent()) return;
+              setSourceStage(`Luma: ${stage}`);
+              reportProgress(Math.min(99, Math.round(ratio * 100)));
+            },
+            isCurrent,
+          );
+          if (!isCurrent()) return;
+        } else if (sogXtMetadataUrl) {
           const isCurrent = () => !disposed && token === loadToken;
           await showSogXt(
             next,
@@ -1906,7 +2121,7 @@ export function SogViewer() {
 
     resize();
     app.start();
-    // `?id=` / `?ss=` / `?url=` 付きで開かれたら、サンプルには一切触れずに
+    // `?id=` / `?ss=` / `?luma=` / `?url=` 付きで開かれたら、サンプルには一切触れずに
     // その空間だけを読む。
     // サンプル→本番の二重ロード（fetch・decode・GPU転送）を起こさないため、
     // ここで分岐してどちらか一方だけを呼ぶ。
@@ -1918,9 +2133,11 @@ export function SogViewer() {
           ? shareUrlFromShareId(deepLink.id)
           : deepLink.provider === "supersplat"
             ? sceneUrlFromSceneId(deepLink.id)
-            // URL参照はそのまま `loadSource` へ。`.sog` かコンテナかの判定は
-            // 通常の読み込みと同じ経路で行う。
-            : deepLink.url;
+            : deepLink.provider === "luma"
+              ? captureUrlFromUuid(deepLink.id)
+              // URL参照はそのまま `loadSource` へ。`.sog` かコンテナかの判定は
+              // 通常の読み込みと同じ経路で行う。
+              : deepLink.url;
     if (deepLinkUrl) void loadSource({ kind: "url", value: deepLinkUrl }, true);
     else void loadSample(true);
     setXrAvailable(xr.isAvailable(XRTYPE_VR));
@@ -1951,6 +2168,8 @@ export function SogViewer() {
       optimizeWorker?.terminate();
       cancelSogXt(new Error(SOG_XT_SUPERSEDED));
       sogXtWorker?.terminate();
+      cancelLuma(new Error(LUMA_SUPERSEDED));
+      lumaWorker?.terminate();
       if (original?.objectUrl) URL.revokeObjectURL(original.objectUrl);
       if (optimizedEntry?.objectUrl) URL.revokeObjectURL(optimizedEntry.objectUrl);
       app.destroy();
@@ -2049,7 +2268,9 @@ export function SogViewer() {
             <span className="live-dot" />
             {source.format === "sog-xt"
               ? `KISS-GS · SOG-XT v${sogXtInfo?.summary.version ?? 3}`
-              : "PLAYCANVAS · SOG v2"}
+              : source.format === "luma"
+                ? `LUMA · ${(lumaInfo?.summary.format ?? "web-v1").toUpperCase()}`
+                : "PLAYCANVAS · SOG v2"}
             {originalSplats ? ` · ${formatSplats(originalSplats)} SPLATS` : ""}
             {source.format === "sog-xt" && sogXtInfo
               ? ` · SH ${sogXtInfo.summary.shBands}`
@@ -2070,6 +2291,22 @@ export function SogViewer() {
               <a
                 className="source-credit-link"
                 href={source.supersplat.pageUrl}
+                target="_blank"
+                rel="noreferrer noopener"
+              >
+                Original ↗
+              </a>
+            </div>
+          )}
+          {source.luma && (
+            <div className="source-credit">
+              <span className="source-provider">LUMA</span>
+              {source.luma.title && (
+                <span className="source-credit-title">{source.luma.title}</span>
+              )}
+              <a
+                className="source-credit-link"
+                href={source.luma.pageUrl}
                 target="_blank"
                 rel="noreferrer noopener"
               >
@@ -2178,6 +2415,11 @@ export function SogViewer() {
               KISS-GSのSOG-XTは、コンテナの meta.json のURL、またはそれが置いてある
               ディレクトリのURLを指定すると開けます。
             </p>
+            <p className="quality-copy">
+              Lumaの公開キャプチャは、キャプチャページのURL（https://lumalabs.ai/capture/…）を
+              貼り付けると開けます。一覧ページではなく、開きたい作品のページのURLを指定して
+              ください。解決サーバーは不要です。
+            </p>
 
             <form
               className="open-url"
@@ -2194,13 +2436,13 @@ export function SogViewer() {
                 spellCheck={false}
                 placeholder={
                   SHARE_RESOLVER.available
-                    ? "https://superspl.at/scene/... / https://app.insta360.com/3dspace/detail/... / .../SOG-XT/meta.json"
-                    : "https://example.com/space.sog または .../SOG-XT/meta.json"
+                    ? "https://superspl.at/scene/... / https://lumalabs.ai/capture/... / https://app.insta360.com/3dspace/detail/..."
+                    : "https://lumalabs.ai/capture/... / https://example.com/space.sog"
                 }
                 aria-label={
                   SHARE_RESOLVER.available
-                    ? "Insta360の共有URL、SuperSplatのシーンURL、KISS-GS SOG-XTのURL、またはSOGのURL"
-                    : "SOGのURL、またはKISS-GS SOG-XTのURL"
+                    ? "Insta360の共有URL、SuperSplatのシーンURL、LumaのキャプチャURL、KISS-GS SOG-XTのURL、またはSOGのURL"
+                    : "LumaのキャプチャURL、SOGのURL、またはKISS-GS SOG-XTのURL"
                 }
                 value={openInput}
                 disabled={sourceBusy}

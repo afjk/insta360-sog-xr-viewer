@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { isInsta360ShareId, shareUrlFromShareId } from "../app/insta360.ts";
 import { isSuperSplatSceneId, sceneUrlFromSceneId } from "../app/supersplat.ts";
+import { captureUrlFromUuid, isLumaCaptureUuid } from "../app/luma.ts";
 import {
+  LUMA_UUID_PARAM,
   SCENE_ID_PARAM,
   SHARE_ID_PARAM,
   SOURCE_URL_PARAM,
@@ -25,8 +27,12 @@ const POSE: ViewPose = { x: -1.234, y: 1.62, z: 3.5, yaw: 137.5, pitch: -4.58, d
 const VIEW = formatViewPose(POSE) ?? "";
 // 実データのSuperSplatシーンID。公開ページは https://superspl.at/scene/56155c3f 。
 const SCENE_ID = "56155c3f";
+// 実データのLumaキャプチャUUID。公開ページは
+// https://lumalabs.ai/capture/83e9aae8-7023-448e-83a6-53ccb377ec86 。
+const LUMA_UUID = "83e9aae8-7023-448e-83a6-53ccb377ec86";
 const SHARE: SpaceRef = { provider: "insta360", id: SHARE_ID };
 const SCENE: SpaceRef = { provider: "supersplat", id: SCENE_ID };
+const LUMA: SpaceRef = { provider: "luma", id: LUMA_UUID };
 // resolverを通さない空間。`.sog` の直接URLと、KISS-GS公式のSOG-XTコンテナ。
 const SOG_URL = "https://example.com/spaces/room.sog";
 const KISS_GS_DIR =
@@ -241,9 +247,71 @@ test("drops a stale scene ID when switching to a space with no permalink", () =>
   assert.equal(hrefWithoutSpace(`${PAGES}?debug=1&ss=${SCENE_ID}`), `${PAGES}?debug=1`);
 });
 
+// --- Luma (`?luma=`) --------------------------------------------------------
+
+test("builds a viewer permalink from a Luma capture UUID", () => {
+  assert.equal(permalinkFor(PAGES, LUMA), `${PAGES}?${LUMA_UUID_PARAM}=${LUMA_UUID}`);
+});
+
+test("reads the capture UUID back out of a Luma permalink", () => {
+  assert.deepEqual(readSpaceRef(`${PAGES}?luma=${LUMA_UUID}`), LUMA);
+  assert.deepEqual(readSpaceRef(`${PAGES}?debug=1&luma=${LUMA_UUID}#x`), LUMA);
+  assert.deepEqual(readSpaceRef(`${PAGES}?luma=%20${LUMA_UUID}%20`), LUMA);
+  // 大文字で来ても同じ空間を指す。リンクには小文字で載せる。
+  assert.deepEqual(readSpaceRef(`${PAGES}?luma=${LUMA_UUID.toUpperCase()}`), LUMA);
+  assert.equal(
+    permalinkFor(PAGES, { provider: "luma", id: LUMA_UUID.toUpperCase() }),
+    `${PAGES}?${LUMA_UUID_PARAM}=${LUMA_UUID}`,
+  );
+});
+
+test("carries a view pose on a Luma permalink too", () => {
+  const link = permalinkFor(PAGES, LUMA, POSE);
+  assert.equal(link, `${PAGES}?${LUMA_UUID_PARAM}=${LUMA_UUID}&${VIEW_PARAM}=${VIEW}`);
+  assert.deepEqual(readSpaceRef(link ?? ""), LUMA);
+  assert.deepEqual(readViewPose(link ?? ""), POSE);
+});
+
+test("rejects capture UUIDs that could escape the capture path", () => {
+  // `?luma=` は外から任意の文字列で来る。ここを通った値だけが
+  // https://lumalabs.ai/capture/<uuid> に組み立てられる。
+  for (const bad of [
+    "",
+    "   ",
+    "../../etc/passwd",
+    `${LUMA_UUID}/../../admin`,
+    `${LUMA_UUID}%2f..`,
+    `${LUMA_UUID}.json`,
+    "83e9aae8-7023-448e-83a6",
+    "gggggggg-7023-448e-83a6-53ccb377ec86",
+    `https://evil.example/capture/${LUMA_UUID}`,
+  ]) {
+    assert.equal(isLumaCaptureUuid(bad), false, bad);
+    assert.equal(readSpaceRef(`${PAGES}?luma=${encodeURIComponent(bad)}`), null, bad);
+    assert.equal(permalinkFor(PAGES, { provider: "luma", id: bad }), null, bad);
+    assert.equal(captureUrlFromUuid(bad), null, bad);
+  }
+});
+
+test("never emits a permalink carrying Luma next to another provider", () => {
+  const both = `${PAGES}?ss=${SCENE_ID}&luma=${LUMA_UUID}`;
+  assert.equal(permalinkFor(both, LUMA), `${PAGES}?${LUMA_UUID_PARAM}=${LUMA_UUID}`);
+  assert.equal(permalinkFor(both, SCENE), `${PAGES}?${SCENE_ID_PARAM}=${SCENE_ID}`);
+  // 既に配ってある `?id=` / `?ss=` のリンクが優先される。
+  assert.deepEqual(readSpaceRef(both), SCENE);
+  assert.deepEqual(readSpaceRef(`${PAGES}?id=${SHARE_ID}&luma=${LUMA_UUID}`), SHARE);
+});
+
+test("drops a stale capture UUID when switching to a space with no permalink", () => {
+  assert.equal(hrefWithoutSpace(`${PAGES}?luma=${LUMA_UUID}`), PAGES);
+  assert.equal(hrefWithoutSpace(`${PAGES}?luma=${LUMA_UUID}&view=${VIEW}`), PAGES);
+});
+
 test("tells spaces apart by provider, not by ID alone", () => {
   assert.ok(isSameSpace(SCENE, { provider: "supersplat", id: SCENE_ID }));
   assert.ok(!isSameSpace(SCENE, { provider: "insta360", id: SCENE_ID }));
+  assert.ok(isSameSpace(LUMA, { provider: "luma", id: LUMA_UUID }));
+  assert.ok(!isSameSpace(LUMA, { provider: "supersplat", id: LUMA_UUID }));
   assert.ok(!isSameSpace(SCENE, null));
   assert.ok(!isSameSpace(null, null));
 });

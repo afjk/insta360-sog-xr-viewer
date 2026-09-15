@@ -27,6 +27,9 @@ PlayCanvasとWebXRを使い、Insta360 Spatial CaptureのSOG形式3D Gaussian Sp
   参照してください。
 - **KISS-GS SOG-XTのURL**: コンテナの `meta.json` のURL、またはそれが置いてある
   ディレクトリのURLを指定します。詳しくは[KISS-GS SOG-XT](#kiss-gs-sog-xt)を参照してください。
+- **Lumaの公開キャプチャURL**: `https://lumalabs.ai/capture/83e9aae8-7023-448e-83a6-53ccb377ec86`
+  のようなキャプチャページのURLを貼り付けます。**解決サーバーは要りません**（ブラウザから
+  直接読めます）。詳しくは[Lumaの公開キャプチャ](#lumaの公開キャプチャ)を参照してください。
 - **`?id=` / `?ss=` 付きのViewer URL**: 一度開いた空間はリンクとして配れます。
   [空間を別の端末へ渡す](#空間を別の端末へ渡す)を参照してください。視点ごと渡したいときは
   [視点ごと渡す](#視点ごと渡すview)を参照してください。
@@ -91,6 +94,112 @@ unbundled SOGも `meta.json` という名前なので、URLの形では見分け
 - `?debug=1` を付けて開くと、splat数・取得バイト数・ダウンロード時間・画像デコード時間・
   逆量子化時間・SH帯域・active maskで落ちた数をコンソールへ出します。
 
+### Lumaの公開キャプチャ
+
+[Luma AI](https://lumalabs.ai) の公開キャプチャ（Interactive Scene）を、キャプチャページの
+URLから直接開けます。
+
+```
+https://lumalabs.ai/capture/83e9aae8-7023-448e-83a6-53ccb377ec86
+https://lumalabs.ai/embed/83e9aae8-7023-448e-83a6-53ccb377ec86?mode=sparkles
+```
+
+`https://lumalabs.ai/featured` のような**一覧ページのURLは開けません**（どの空間を指して
+いるか決まらないため）。一覧から作品のページを開いて、そのURLを貼り付けてください。一覧の
+URLを入れたときは、その旨だけを表示して読み込みません。
+
+#### 解決サーバーが要らない
+
+Insta360とSuperSplatは共有ページがCORSを許可していないので、
+[Insta360共有URLの解決について](#insta360共有urlの解決について)と
+[SuperSplat公開シーンURLの解決について](#supersplat公開シーンurlの解決について)のように
+サーバー側の解決エンドポイントを通します。**Lumaは通しません。**
+
+Lumaは公式のWebGLライブラリ [`@lumaai/luma-web`](https://www.npmjs.com/package/@lumaai/luma-web)
+（MIT, Luma AI）を出していて、その使い方が
+
+```js
+new LumaSplatsThree({ source: 'https://lumalabs.ai/capture/<uuid>' })
+```
+
+——任意のオリジンのページから、キャプチャのURLだけを渡してブラウザで取得する——というもの
+です（公式サンプル `lumalabs/luma-web-examples` の `src/DemoVR.ts` など）。公開キャプチャの
+APIとartifactは第三者のページから直接fetchできる前提で配られているので、こちらのブラウザ
+から同じ取得をするだけで済みます。**GitHub Pages版（`VITE_SOG_RESOLVER_ORIGIN=none`）でも
+Lumaは開けます。**
+
+```
+GET https://webapp.engineeringlumalabs.com/api/v3/captures/<uuid>/public
+→ { response | latestRun: { artifacts: [ { type, url }, … ] } }
+```
+
+#### 中身と復元の対応
+
+読むのは、この3点が揃っているキャプチャです。
+
+| artifact | 中身 |
+| --- | --- |
+| `gs_web_webmeta` | `version` / `num_splats` / `scene_center` などのJSON |
+| `gs_web_gauss1` | uint32×4のヘッダ `[1, 2048, height, 2]` ＋ RG32UI相当のテクスチャ |
+| `gs_web_gauss2` | 同じヘッダ（channels=4）＋ RGBA32UI相当のテクスチャ |
+
+splatは4×4のタイルに詰められていて、splat番号 `D` のテクセルは
+`(4 * ((D >> 4) & 0x1ff) + (D & 3), 4 * (D >> 13) + ((D >> 2) & 3))` です。1テクセルに
+1splatが入ります。
+
+| テクスチャの位置 | 格納されているもの | 復元後（PlayCanvasへ渡す形） |
+| --- | --- | --- |
+| gauss1 half[0..2] | 位置（half float） | `x` / `y` / `z` |
+| gauss1 half[3] ＋ gauss2 half[0..4] | **3D共分散 Σ** の6成分（Σxx, Σyy, Σzz, Σxy, Σxz, Σyz） | `scale_0..2`（**線形**）＋ `rot_0..3`（wxyz） |
+| gauss2 uint32[2] の上位16bit | SHテクスチャの索引 | 使いません（下記の制限） |
+| gauss2 uint32[3] | R / G / B / A の各1バイト | `f_dc_0..2`（SHのDC係数へ戻す）＋ `opacity` |
+
+Lumaはスケールと姿勢に分けず**共分散そのもの**を持っているので、Jacobi回転で固有値分解して
+3DGSの形（Σ = R diag(scale²) Rᵀ）へ戻します。固有値の平方根がスケール、固有ベクトルが姿勢
+です。固有ベクトルを並べた行列が鏡映（det = -1）になったときは1軸を反転して右手系へ揃えます
+（ガウシアンは原点対称なので、軸の向きを反転しても表す楕円体は変わりません）。
+
+色はRGBA8で**評価済みの色**として入っているので、`f_dc = (color - 0.5) / SH_C0` でDC係数へ
+戻してから渡します。不透明度はそのまま0〜1です。スケールと不透明度が活性化済みなので、
+SOG-XTと同じく `GSplatData.activated = true` を立てます（変換そのものは
+`app/splat-playcanvas.ts` で両者が共有しています）。
+
+Lumaのキャプチャは**回転を掛けずに置きます**。公式の `LumaSplatsThree` がキャプチャを
+`scene.add(splats)` するだけで回転もスケールも掛けておらず、three.jsもPlayCanvasも右手系の
+Y-upなので、そのままで上下前後が合います。Insta360（Y-down）やSuperSplat（Y-downで
+書き出したSOG）とは前提が違います。
+
+#### 制限
+
+- **Luma独自の圧縮形式（`gs_compressed`）でのみ配信されているキャプチャは開けません。**
+  ブロックごとに難読化された圧縮ストリームで、復元手段は公式ライブラリが同梱するWASM
+  デコーダにしかありません。推測でこじ開けず、SuperSplatのStreamed SOGと同じように
+  「未対応」と表示して読み込みません。上の3点が揃っているキャプチャは開けます。
+- 視点依存の色（SH）は読みません。`gs_web_sh` はsplatごとの索引でパレットを引く形式で、
+  RGBA8のDC色だけでも見た目は成立するため、いまは使っていません。
+- Lumaが持っている「おすすめの初期視点」（`gs_web_meta` の `initial_pose`）も使っていません。
+  初期視点は[初期視点の優先順位](#初期視点の優先順位)のとおり、`view=` か空間の広がりから
+  決めます。
+- Lumaのキャプチャには[VR向けSOGの生成](#vr向けsogの生成)を適用できません。SOG-XTと同じ
+  理由（既存のoptimizerがSOGバンドルのバイト列を前提にしている）で、Originalのままの表示は
+  DesktopでもWebXRでも通常どおり動きます。
+- `?debug=1` を付けて開くと、splat数・宣言splat数・取得バイト数・ダウンロード時間・
+  デコード時間・共分散が壊れていたsplat数をコンソールへ出します。
+
+#### 形式の出どころ
+
+APIのパス・artifactの種類・テクスチャのバイト並びは、すべて公式ライブラリ
+`@lumaai/luma-web` 0.2.2 の配布物（MIT）から読んだものです。`LumaSplatsLoader` の
+`getArtifacts` / `downloadGauss1` / `downloadGauss2` / `extractCpuPoints` と、splatの
+vertex shaderがテクセルをどう読んでいるかが根拠です。ライブラリ自体には依存していません
+（three.jsを必要とするため）。デコーダは `app/luma.ts`、取得は `app/luma.worker.ts` です。
+
+実装時の作業環境から `lumalabs.ai` と `webapp.engineeringlumalabs.com` へ到達できなかったため、
+**公開APIの応答の実物とは突き合わせていません。** artifactの並び（`response` / `latestRun` /
+`artifacts` / `type` / `url`）は公式ライブラリが読んでいるものをそのまま使い、題名のような
+表示用の項目は「あれば使う」形にしてあります。テクスチャの復元は合成データで
+（PlayCanvasのiteratorで読み戻すところまで）`tests/luma.test.mts` が確かめています。
+
 ### 空間を別の端末へ渡す
 
 URLから読み込んだ空間は、アドレスバーが自動でViewer専用のリンクになります。載るのは
@@ -99,6 +208,7 @@ URLから読み込んだ空間は、アドレスバーが自動でViewer専用�
 ```
 https://afjk.github.io/insta360-sog-xr-viewer/?id=GS3DGbfd0ddd0dd4a47ccba4d3d2c2eed8a4d
 https://afjk.github.io/insta360-sog-xr-viewer/?ss=56155c3f
+https://afjk.github.io/insta360-sog-xr-viewer/?luma=83e9aae8-7023-448e-83a6-53ccb377ec86
 https://afjk.github.io/insta360-sog-xr-viewer/?url=https%3A%2F%2Fexample.com%2Fspaces%2Froom.sog
 ```
 
@@ -106,6 +216,7 @@ https://afjk.github.io/insta360-sog-xr-viewer/?url=https%3A%2F%2Fexample.com%2Fs
 | --- | --- | --- |
 | `id` | Insta360 Spatial Capture | 共有ID (`GS3DG…`) |
 | `ss` | SuperSplat | シーンID (`56155c3f`) |
+| `luma` | Luma | キャプチャUUID (`83e9aae8-…`) |
 | `url` | Viewerが直接取りに行くアセット | アセットのURL |
 
 `url` はresolverを通さない空間——`.sog` の直接URL、PlayCanvasのunbundled SOG
@@ -128,8 +239,8 @@ https://afjk.github.io/insta360-sog-xr-viewer/?url=https%3A%2F%2Ffraunhoferhhi.g
 端末では開けないので、リンクを作りません。ローカルファイルとサンプルも同じ理由で
 共有できません（コピーのボタンが出ません）。
 
-複数の空間パラメータが載った異常なURLでは、**先に配ってある順に `id` → `ss` → `url`**
-の優先で読みます。先に見つかったパラメータだけを見て、その形が合わなければ後ろへは
+複数の空間パラメータが載った異常なURLでは、**先に配ってある順に `id` → `ss` → `luma`
+→ `url`** の優先で読みます。先に見つかったパラメータだけを見て、その形が合わなければ後ろへは
 落ちずサンプルを表示します。
 
 このURLをQuestやPICOのブラウザで開くと、**サンプルを経由せず**その空間だけを読み込みます。
@@ -137,12 +248,13 @@ https://afjk.github.io/insta360-sog-xr-viewer/?url=https%3A%2F%2Ffraunhoferhhi.g
 
 Insta360とSuperSplatで載せるのは共有ID／シーンIDだけです。解決した署名付きSOGのURLには
 有効期限と `x-oss-signature` が付いているので、アドレスバーにも共有リンクにも出しません。
-開くたびにresolverが取り直します。
+開くたびにresolverが取り直します。LumaもキャプチャUUIDだけを載せます（artifactのURLは
+配信リビジョン込みで恒久的ではないので、開くたびに公開APIから取り直します）。
 
 URLの組み立ては `URL` / `URLSearchParams` で行うので、GitHub Pagesのサブパス配信でも
 localhostでも、開いているのと同じ配信先のリンクになります。`?url=` の値のエンコードも
 `URLSearchParams` に任せます。サンプルやローカルファイルへ切り替えると、古い
-`?id=` / `?ss=` / `?url=` は消えます。
+`?id=` / `?ss=` / `?luma=` / `?url=` は消えます。
 
 IDやURLの形が合わない場合はネットワークへ出さず、通常どおりサンプルを表示します。実装は
 `app/permalink.ts` にまとまっています。
