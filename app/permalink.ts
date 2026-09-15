@@ -1,13 +1,15 @@
 /**
- * Viewer専用パーマリンク (`?id=` / `?ss=` / `?url=`、任意で `&view=`) の読み書き。
+ * Viewer専用パーマリンク (`?id=` / `?ss=` / `?luma=` / `?url=`、任意で `&view=`) の読み書き。
  *
- * 一度開いた空間を別の端末へ渡せるようにするための仕組み。resolverが返す
+ * 一度開いた空間を別の端末へ渡せるようにするための仕組み。提供元が返す
  * アセットのURLは、Insta360なら有効期限つきの署名付きURL、SuperSplatなら
- * リビジョン込みのCDN URLで、どちらも恒久的な識別子ではない。アドレスバーに
- * 残すのは提供元ごとの永続IDだけにして、開くたびにresolverで取り直す。
+ * リビジョン込みのCDN URL、Lumaなら配信リビジョン込みのCDN URLで、どれも
+ * 恒久的な識別子ではない。アドレスバーに残すのは提供元ごとの永続IDだけに
+ * して、開くたびに取り直す。
  *
  *   ?id=GS3DG…   Insta360 Spatial Captureの共有ID
  *   ?ss=56155c3f SuperSplatのシーンID
+ *   ?luma=83e9…  LumaのキャプチャUUID
  *   ?url=https…  Viewerが直接取りに行けるアセットのURL
  *
  * `?url=` はresolverを通さない空間——`.sog` の直接URL、PlayCanvasの
@@ -29,6 +31,7 @@
 // 拡張子を明示しているのは、このモジュールをテストからNodeで直接importするため。
 // バンドラは付いていても解決できる。
 import { isInsta360ShareId } from "./insta360.ts";
+import { isLumaCaptureUuid } from "./luma.ts";
 import { isSuperSplatSceneId } from "./supersplat.ts";
 import { containerMetadataUrl } from "./url-safety.ts";
 import { formatViewPose, parseViewPose, type ViewPose } from "./view-pose.ts";
@@ -39,6 +42,9 @@ export const SHARE_ID_PARAM = "id";
 /** パーマリンクがSuperSplatのシーンIDを載せるquery parameter名。 */
 export const SCENE_ID_PARAM = "ss";
 
+/** パーマリンクがLumaのキャプチャUUIDを載せるquery parameter名。 */
+export const LUMA_UUID_PARAM = "luma";
+
 /** パーマリンクがアセットのURLを載せるquery parameter名。 */
 export const SOURCE_URL_PARAM = "url";
 
@@ -46,7 +52,12 @@ export const SOURCE_URL_PARAM = "url";
 export const VIEW_PARAM = "view";
 
 /** 空間を指すparameterを、読むときの優先順で並べたもの。 */
-const SPACE_PARAMS = [SHARE_ID_PARAM, SCENE_ID_PARAM, SOURCE_URL_PARAM] as const;
+const SPACE_PARAMS = [
+  SHARE_ID_PARAM,
+  SCENE_ID_PARAM,
+  LUMA_UUID_PARAM,
+  SOURCE_URL_PARAM,
+] as const;
 
 /**
  * パーマリンクが指している空間。
@@ -61,6 +72,7 @@ const SPACE_PARAMS = [SHARE_ID_PARAM, SCENE_ID_PARAM, SOURCE_URL_PARAM] as const
 export type SpaceRef =
   | { provider: "insta360"; id: string }
   | { provider: "supersplat"; id: string }
+  | { provider: "luma"; id: string }
   | { provider: "url"; url: string };
 
 const parseHref = (href: string): URL | null => {
@@ -99,8 +111,8 @@ export function canonicalSpaceUrl(input: string): string | null {
  * 取得先に組み立てるので、不正な値がネットワークへ出ることはない。
  *
  * 空間のparameterが複数あるURLは異常だが、既存のリンクを壊さないほうを採る。
- * 優先順は先に配ってあった順で **`id` → `ss` → `url`**。先に見つかった
- * parameterだけを見て、残りは無視する。
+ * 優先順は先に配ってあった順で **`id` → `ss` → `luma` → `url`**。先に
+ * 見つかったparameterだけを見て、残りは無視する。
  */
 export function readSpaceRef(href: string): SpaceRef | null {
   const url = parseHref(href);
@@ -113,6 +125,9 @@ export function readSpaceRef(href: string): SpaceRef | null {
     }
     if (param === SCENE_ID_PARAM) {
       return isSuperSplatSceneId(value) ? { provider: "supersplat", id: value } : null;
+    }
+    if (param === LUMA_UUID_PARAM) {
+      return isLumaCaptureUuid(value) ? { provider: "luma", id: value.toLowerCase() } : null;
     }
     const canonical = canonicalSpaceUrl(value);
     return canonical ? { provider: "url", url: canonical } : null;
@@ -162,6 +177,10 @@ const spaceParamOf = (space: SpaceRef): { name: string; value: string } | null =
     const id = space.id.trim();
     return isSuperSplatSceneId(id) ? { name: SCENE_ID_PARAM, value: id } : null;
   }
+  if (space.provider === "luma") {
+    const id = space.id.trim().toLowerCase();
+    return isLumaCaptureUuid(id) ? { name: LUMA_UUID_PARAM, value: id } : null;
+  }
   // 正規化した形を載せる。受け取った側の `readSpaceRef` と同じ文字列になる。
   const url = canonicalSpaceUrl(space.url);
   return url ? { name: SOURCE_URL_PARAM, value: url } : null;
@@ -174,7 +193,7 @@ const spaceParamOf = (space: SpaceRef): { name: string; value: string } | null =
  * 「この空間のリンク」になる。後者では残っている `view` を落とす。
  * 空間のリンクに前の視点が紛れ込むと、受け取った側が別の場所から始まってしまう。
  *
- * 提供元が違うパラメータ（`id` / `ss` / `url` のうち残り2つ）は必ず落とす。
+ * 提供元が違うパラメータ（`id` / `ss` / `luma` / `url` のうち残り3つ）は必ず落とす。
  * 複数が載ったリンクをこちらから配らないため。それ以外のquery parameterは
  * 将来使う可能性があるので触らない。hashは共有先に持って行く意味がないので落とす。
  *
@@ -202,7 +221,7 @@ export function permalinkFor(
 }
 
 /**
- * リンクを配れない空間へ切り替えたときに、古い `id` / `ss` / `url` を落とす。
+ * リンクを配れない空間へ切り替えたときに、古い `id` / `ss` / `luma` / `url` を落とす。
  *
  * 視点は空間に紐づくので `view` も一緒に落とす。
  */
